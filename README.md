@@ -1,4 +1,30 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Zed
+
+## Local fork
+
+Branch `decay/local` starts at official tag `v1.21.0` (33c95853ed2b6956f339733c63a8220964ecbeb6).
+`upstream` points to the official repository; pushes to it are disabled locally.
+`upstream/main` is tracked for inspection, but stable releases are the default merge candidates.
+There is no automatic merge, installation, or background Windows service.
+
+Build with `script/local-build.ps1`; generated artifacts and the Cargo cache stay in
+`D:/Build/zed-local`. Run only with `script/local-run.ps1`, which requires an explicit
+isolated user-data directory and refuses the official Zed profile. The official installation
+and its settings/databases must not be overwritten. Do not copy live databases as ordinary
+files: migrate using a consistent backup only after the user agrees to switch.
+
+Update workflow: fetch upstream, inspect the stable release changes, create a candidate
+branch from our last tested commit, merge the chosen release, run relevant tests/build,
+then switch only after a functional check. Keep the preceding tested build for rollback.
+Source availability, compilation, and a successful UI test are distinct verification stages.
+
+Initial backlog: notification-only stable-release checks; mouse-driven sent-message editing;
+forking a conversation at a selected turn; preservation of the bounded restored UI history
+and weekly usage indicator provided by `codex-acp-modern`. Chat forks share history up to
+the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
