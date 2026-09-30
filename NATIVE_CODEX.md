@@ -14,6 +14,24 @@ chat database, installed editor, or adapter bundle is changed by these sources.
 
 ## Structure
 
+Deployment clarification (2026-09-30): the user approved using the Zed fork before
+native connector parity. Deploy the editor with the existing ACP connector while
+continuing the Rust rewrite; the native routing gate above remains unchanged.
+Upstream 1.22.0 is being integrated before profile migration. Keep the production
+editor and profile intact until the candidate build and tests pass and the user
+can close the running editor for a consistent profile backup.
+
+Profile cutover checklist: use a fresh explicit `--user-data-dir`; copy the closed
+official `%LOCALAPPDATA%/Zed` data and `%APPDATA%/Zed` configuration into that
+directory and its `config` subdirectory, respectively. Never overwrite the source.
+The 1.22.0 candidate's `crates/zed/RELEASE_CHANNEL` is `stable`, so retain the
+`db/0-stable` and `db/0-global` scopes (do not rename them to dev). Preserve all
+chat stores and settings; verify copied file hashes and SQLite integrity before
+launch. Keep the existing configured Codex runtime/account environment; do not
+print or transplant auth secrets. Adapter candidate source and production bundle
+must be distinguished when validating message forks. Do not claim successful
+cutover until restored projects/chats and a fresh adapter connection are checked.
+
 - `codex_native/transport.rs`: one configured `codex.exe app-server --listen stdio://`
   child; bidirectional JSONL requests/responses/notifications. No Node or shell.
   Uses the explicit executable/environment, preserves the runtime-owned account.

@@ -894,18 +894,14 @@ fn collect_markdowns(
             for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
                 match chunk {
                     AssistantMessageChunk::Message { block, .. } => {
-                        if let Some(md) = block.markdown() {
-                            out.push(md.clone());
-                        }
+                        out.extend(block.markdowns().cloned());
                     }
                     AssistantMessageChunk::Thought { block, .. }
                         if entry_view_state
                             .thinking_block_state((entry_ix, chunk_ix), cx)
                             .0 =>
                     {
-                        if let Some(md) = block.markdown() {
-                            out.push(md.clone());
-                        }
+                        out.extend(block.markdowns().cloned());
                     }
                     AssistantMessageChunk::Thought { .. } => {}
                 }
@@ -977,7 +973,6 @@ mod tests {
                     )),
                     markdown: unsupported.clone(),
                 },
-                ContentBlock::Empty,
             ],
             error: Some(error.clone()),
         };
