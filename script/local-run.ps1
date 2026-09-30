@@ -20,6 +20,8 @@ foreach ($forbidden in $forbiddenDirectories) {
 }
 $executable = Join-Path $BuildRoot "target\$Profile\zedlocal.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Build Zed Local first.' }
+$cliExecutable = Join-Path $BuildRoot "target\$Profile\cli.exe"
+if (-not (Test-Path -LiteralPath $cliExecutable -PathType Leaf)) { throw 'Build the companion CLI with script/local-build.ps1 first.' }
 New-Item -ItemType Directory -Path $profileDirectory -Force | Out-Null
 # Also protect a stock baseline binary if the fork has not been built yet.
 $previousExplanation = $env:ZED_UPDATE_EXPLANATION
