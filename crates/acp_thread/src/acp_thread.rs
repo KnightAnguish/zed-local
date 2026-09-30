@@ -2375,6 +2375,11 @@ pub enum AcpThreadEvent {
     EntriesRemoved(Range<usize>),
     HistoryPrepended(usize),
     HistoryTrimmed(usize),
+    HistorySpliced {
+        index: usize,
+        removed: usize,
+        inserted: usize,
+    },
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
     ElicitationRequested(ElicitationEntryId),
@@ -2513,6 +2518,7 @@ impl AcpThread {
                 | AcpThreadEvent::NewEntry
                 | AcpThreadEvent::HistoryPrepended(_)
                 | AcpThreadEvent::HistoryTrimmed(_)
+                | AcpThreadEvent::HistorySpliced { .. }
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::TokenUsageUpdated
                 | AcpThreadEvent::EntryUpdated(_)
@@ -2651,6 +2657,34 @@ impl AcpThread {
         require_overlap: bool,
         cx: &mut Context<Self>,
     ) -> Result<usize> {
+        self.insert_history(messages, require_overlap, 0, false, cx)
+    }
+
+    pub fn history_prefix_len(&self) -> usize {
+        self.history_prefix_len
+    }
+
+    pub fn append_history_at(
+        &mut self,
+        index: usize,
+        messages: Vec<HistoryMessage>,
+        cx: &mut Context<Self>,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            index <= self.history_prefix_len && self.status() == ThreadStatus::Idle,
+            "Cannot restore history here"
+        );
+        self.insert_history(messages, false, index, true, cx)
+    }
+
+    fn insert_history(
+        &mut self,
+        messages: Vec<HistoryMessage>,
+        require_overlap: bool,
+        index: usize,
+        strict: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<usize> {
         let mut known = HashSet::default();
         for entry in &self.entries {
             match entry {
@@ -2684,6 +2718,10 @@ impl AcpThread {
         let mut entries = Vec::new();
         for message in messages {
             if !known.insert(message.id.clone()) {
+                anyhow::ensure!(
+                    !strict,
+                    "Restored history overlaps changed messages; reopen chat"
+                );
                 break;
             }
             if message.is_user {
@@ -2717,27 +2755,54 @@ impl AcpThread {
         }
         let count = entries.len();
         if count > 0 {
-            self.entries.splice(0..0, entries);
+            self.entries.splice(index..index, entries);
             self.history_prefix_len += count;
-            cx.emit(AcpThreadEvent::HistoryPrepended(count));
+            if index == 0 {
+                cx.emit(AcpThreadEvent::HistoryPrepended(count));
+            } else {
+                cx.emit(AcpThreadEvent::HistorySpliced {
+                    index,
+                    removed: 0,
+                    inserted: count,
+                });
+            }
             cx.notify();
         }
         Ok(count)
     }
 
     pub fn trim_history_prefix(&mut self, count: usize, cx: &mut Context<Self>) -> Result<()> {
+        self.trim_history_range(0, count, cx)
+    }
+
+    pub fn trim_history_range(
+        &mut self,
+        index: usize,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.status() == ThreadStatus::Idle,
             "Cannot evict history while the agent is running"
         );
         anyhow::ensure!(
-            count <= self.history_prefix_len && count <= self.entries.len(),
+            index <= self.history_prefix_len
+                && count <= self.history_prefix_len - index
+                && self.history_prefix_len <= self.entries.len(),
             "Cannot evict live chat entries"
         );
         if count > 0 {
-            self.entries.drain(..count);
+            self.entries.drain(index..index + count);
             self.history_prefix_len -= count;
-            cx.emit(AcpThreadEvent::HistoryTrimmed(count));
+            if index == 0 {
+                cx.emit(AcpThreadEvent::HistoryTrimmed(count));
+            } else {
+                cx.emit(AcpThreadEvent::HistorySpliced {
+                    index,
+                    removed: count,
+                    inserted: 0,
+                });
+            }
             cx.notify();
         }
         Ok(())
@@ -5976,6 +6041,22 @@ mod tests {
                 1
             );
             assert!(thread.token_usage().is_none());
+            thread
+                .append_history_at(1, vec![message("middle", false)], cx)
+                .expect("restore middle");
+            assert_eq!(thread.history_prefix_len(), 2);
+            assert_eq!(thread.entries().len(), 3);
+            let before = thread.to_markdown(cx);
+            assert!(
+                thread
+                    .append_history_at(2, vec![message("new", true), message("tail", true)], cx)
+                    .is_err()
+            );
+            assert_eq!(thread.to_markdown(cx), before);
+            thread.trim_history_range(1, 1, cx).expect("evict middle");
+            assert_eq!(thread.history_prefix_len(), 1);
+            assert!(!thread.to_markdown(cx).contains("middle"));
+            assert!(thread.to_markdown(cx).contains("tail"));
         });
     }
 

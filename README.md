@@ -71,7 +71,7 @@ preservation of the bounded restored UI history and weekly usage indicator provi
 `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
-Native integration, stages 1–2 (`decay/native-history`): a local `codex-acp` connection with
+Native integration, stages 1–3 (`decay/native-history`): a local `codex-acp` connection with
 an explicit absolute executable in `CODEX_PATH` can now read older history directly from
 Codex, without asking the ACP adapter to replay it. Scrolling near the top or clicking
 **Load earlier messages** requests `thread/turns/list` pages of 20 turns. The reader uses
@@ -86,14 +86,23 @@ without changing the context meter or stored Codex history. UI editors are rebou
 their new indices and the previous scroll anchor is restored. Loading/rebinding is
 deferred while the thread is generating or a message is being edited. The initial tail,
 prompts, tools, permissions and skill profiles still use the existing adapter.
-This is NOT yet a replacement for that adapter. Older attachments currently have text
-placeholders; generated-image tool results are filtered with other historical tool steps.
-When scrolling back toward newer messages, whole loaded pages more than 40 entries above
-the viewport are released, with the request cursor retained for reloading. Live entries,
-agent context and stored history are never evicted. This is one-sided reclamation, NOT a
-fully bounded bidirectional window: deep upward browsing and a long live session can still
-grow memory; recreating a view over a retained thread loses its page bookkeeping.
-Lazy attachment previews and native live-session integration remain unfinished.
+This is NOT yet a replacement for that adapter. Historical browsing now retains at most
+three pages of decoded messages. Loading older pages releases the newer side; request
+cursors and boundary IDs allow reloading toward the recent tail, with an explicit gap
+button and automatic loading near that boundary. Restored pages are checked for changed
+boundaries before insertion. Whole pages over 40 entries above the viewport are also
+released when scrolling down. Live entries, agent context and stored history are untouched.
+This bounds the browsing cache, not a long-running live session or total process RSS.
+Recreating an idle view discards the old historical prefix before starting new bookkeeping.
+
+Local PNG/JPEG/WebP/GIF attachments and image-generation `savedPath` artifacts have lazy
+file previews and file links. Generated artifacts attach to the final reply with its ID,
+not a fabricated tool-message boundary. Per-rendered-element GPUI image caches release
+their image resources when dropped. Network/relative/device/UNC references are not used
+for previews; embedded data-URL images remain placeholders. Missing files keep their link.
+Editing native historical messages containing these image references is disabled until
+original image inputs can be restored into the composer without degrading them to links.
+Native live-session integration and embedded-image retrieval remain unfinished.
 
 Weekly usage is now read and formatted in Rust via `account/rateLimits/read`, replacing the
 adapter's `weekly-usage` config option in the existing percentage/arrow UI. Only the account
@@ -103,11 +112,12 @@ Refresh occurs at connection/config access/prompt start (60-second throttle), or
 via Refresh (2-second throttle); there is no background periodic timer. No model prompt is
 submitted. The adapter may still perform its own legacy usage reads until it is replaced.
 
-Validation: final dev build, 150 acp_thread tests, 39 ordinary agent_servers tests and
-449 agent_ui tests pass. The final parallel UI run had one nonreproducing workspace-DB
-backfill failure; that test alone and all 449 tests run sequentially pass. An explicitly
-selected real diagnostic session read plus account-limits read pass against Codex 0.159.2,
-with zero model prompts. Mouse scrolling,
+Validation for stage 3: 150 acp_thread tests, 40 ordinary agent_servers tests and
+451 agent_ui tests pass (UI sequential). Includes a 100-page bounded-cache test and a GPUI
+controller round trip checking tail, draft and list count. Stage 2 had one nonreproducing
+parallel workspace-DB backfill test failure; production metadata source was not changed.
+A stage-2 explicitly selected real diagnostic session and account-limits read passed
+against Codex 0.159.2 with zero model prompts. Mouse scrolling,
 long-chat memory measurements and production-profile integration are still unverified.
 The official editor, its profile and production adapter bundle remain unchanged.
 

@@ -808,6 +808,7 @@ mod test_support {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
+        history_pages: Arc<Mutex<HashMap<Option<String>, HistoryPage>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
@@ -829,6 +830,7 @@ mod test_support {
         pub fn new() -> Self {
             Self {
                 next_prompt_updates: Default::default(),
+                history_pages: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
                 supports_load_session: false,
@@ -840,6 +842,10 @@ mod test_support {
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
             *self.next_prompt_updates.lock() = updates;
+        }
+
+        pub fn set_history_page(&self, cursor: Option<String>, page: HistoryPage) {
+            self.history_pages.lock().insert(cursor, page);
         }
 
         pub fn with_permission_requests(
@@ -946,6 +952,25 @@ mod test_support {
     }
 
     impl AgentConnection for StubAgentConnection {
+        fn supports_history_pages(&self) -> bool {
+            !self.history_pages.lock().is_empty()
+        }
+
+        fn history_page(
+            &self,
+            _session_id: acp::SessionId,
+            cursor: Option<String>,
+            _cx: &mut App,
+        ) -> Task<Result<HistoryPage>> {
+            Task::ready(
+                self.history_pages
+                    .lock()
+                    .get(&cursor)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Missing test history page")),
+            )
+        }
+
         fn agent_id(&self) -> AgentId {
             self.agent_id.clone()
         }

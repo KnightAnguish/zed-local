@@ -9847,6 +9847,102 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn native_history_window_reloads_newer_pages_without_losing_tail_or_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        let root = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_conversation_view()
+                .unwrap()
+                .read(cx)
+                .root_thread_view()
+                .unwrap()
+        });
+        let thread = root.read_with(&cx, |root, _| root.thread.clone());
+        thread.update(&mut cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Live tail".into()).message_id("tail"),
+                    ),
+                    cx,
+                )
+                .expect("tail")
+        });
+        let message = |id: String| acp_thread::HistoryMessage {
+            id: acp::MessageId::new(id.clone()),
+            is_user: true,
+            content: vec![id.into()],
+        };
+        for index in 0..10 {
+            let mut messages = vec![message(format!("page-{index}"))];
+            if index == 0 {
+                messages.push(message("tail".into()));
+            }
+            connection.set_history_page(
+                if index == 0 {
+                    None
+                } else {
+                    Some(index.to_string())
+                },
+                acp_thread::HistoryPage {
+                    messages,
+                    next_cursor: (index < 9).then(|| (index + 1).to_string()),
+                },
+            );
+        }
+        let editor = root.read_with(&cx, |root, _| root.message_editor.clone());
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_message(vec!["Keep this draft".into()], window, cx)
+        });
+        cx.run_until_parked();
+        for _ in 0..10 {
+            root.update(&mut cx, |root, cx| root.test_load_history(false, cx));
+            cx.run_until_parked();
+            root.read_with(&cx, |root, cx| {
+                assert!(
+                    root.test_history_error().is_none(),
+                    "{:?}",
+                    root.test_history_error()
+                );
+                assert!(root.thread.read(cx).history_prefix_len() <= 3);
+                assert_eq!(
+                    root.list_state.item_count(),
+                    root.thread.read(cx).entries().len()
+                );
+            });
+        }
+        assert!(
+            thread
+                .read_with(&cx, |thread, cx| thread.to_markdown(cx))
+                .contains("page-9")
+        );
+        for _ in 0..10 {
+            root.update(&mut cx, |root, cx| root.test_load_history(true, cx));
+            cx.run_until_parked();
+            root.read_with(&cx, |root, cx| {
+                assert!(
+                    root.test_history_error().is_none(),
+                    "{:?}",
+                    root.test_history_error()
+                );
+                assert!(root.thread.read(cx).history_prefix_len() <= 3);
+            });
+        }
+        let text = thread.read_with(&cx, |thread, cx| thread.to_markdown(cx));
+        assert!(text.contains("page-0"));
+        assert!(!text.contains("page-9"));
+        assert!(text.contains("Live tail"));
+        assert_eq!(
+            editor.read_with(&cx, |editor, cx| editor.text(cx)),
+            "Keep this draft"
+        );
+    }
+
+    #[gpui::test]
     async fn grouped_variants_keep_empty_first_message_fork_durable(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let connection = StubAgentConnection::new();

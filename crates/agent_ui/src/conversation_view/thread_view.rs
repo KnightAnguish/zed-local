@@ -94,6 +94,15 @@ impl ThreadFeedbackState {
             }
         }
         let session_id = thread.read(cx).session_id().clone();
+        if thread.read(cx).history_prefix_len() > 0
+            && thread.read(cx).status() == ThreadStatus::Idle
+        {
+            thread
+                .update(cx, |thread, cx| {
+                    thread.trim_history_prefix(thread.history_prefix_len(), cx)
+                })
+                .log_err();
+        }
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = thread.read(cx).connection().telemetry_id();
         let task = telemetry.thread_data(&session_id, cx);
@@ -1097,6 +1106,13 @@ impl ThreadView {
                         this.evict_older_history(scroll_top.item_ix, cx);
                         if scroll_top.item_ix < 3 && this.history_error.is_none() {
                             this.load_older_history(cx);
+                        } else if scroll_top.item_ix
+                            >= this.history_window.entries().saturating_sub(3)
+                            && scroll_top.item_ix <= this.history_window.entries()
+                            && this.history_window.next_newer().is_some()
+                            && this.history_error.is_none()
+                        {
+                            this.load_newer_history(cx);
                         }
                     });
                 });
@@ -1157,11 +1173,28 @@ impl ThreadView {
                     match result {
                         Ok(page) => {
                             let require_overlap = this.history_cursor.is_none();
+                            let messages = page.messages.clone();
                             match this.thread.update(cx, |thread, cx| {
                                 thread.prepend_history(page.messages, require_overlap, cx)
                             }) {
                                 Ok(added) => {
-                                    this.history_window.prepend(added, cursor);
+                                    this.history_window.prepend(&messages[..added], cursor);
+                                    if let Some(excess) = this.history_window.excess_newest() {
+                                        let index = this.history_window.entries() - excess.count;
+                                        match this.thread.update(cx, |thread, cx| {
+                                            thread.trim_history_range(index, excess.count, cx)
+                                        }) {
+                                            Ok(()) => {
+                                                this.history_window.evicted_newest();
+                                                this.followup_cache.borrow_mut().clear();
+                                            }
+                                            Err(error) => {
+                                                this.history_error =
+                                                    Some(format!("History: {error}").into());
+                                                return false;
+                                            }
+                                        }
+                                    }
                                     this.history_exhausted = page.next_cursor.is_none();
                                     this.history_cursor = page.next_cursor;
                                     return added == 0 && !this.history_exhausted;
@@ -1188,6 +1221,20 @@ impl ThreadView {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_load_history(&mut self, newer: bool, cx: &mut Context<Self>) {
+        if newer {
+            self.load_newer_history(cx);
+        } else {
+            self.load_older_history(cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_history_error(&self) -> Option<&SharedString> {
+        self.history_error.as_ref()
+    }
+
     pub(super) fn invalidate_history_pages(&mut self) {
         self.history_task = None;
         self.history_window = Default::default();
@@ -1195,6 +1242,63 @@ impl ThreadView {
         self.history_exhausted = false;
         self.history_error = None;
         self.followup_cache.borrow_mut().clear();
+    }
+
+    fn load_newer_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_task.is_some()
+            || self.is_loading_contents
+            || self.editing_message.is_some()
+            || !matches!(self.thread.read(cx).status(), ThreadStatus::Idle)
+        {
+            return;
+        }
+        let Some(page) = self.history_window.next_newer() else {
+            return;
+        };
+        let connection = self.thread.read(cx).connection().clone();
+        let session_id = self.thread.read(cx).session_id().clone();
+        self.history_error = None;
+        self.history_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .update(|cx| connection.history_page(session_id, page.cursor.clone(), cx))
+                .await
+                .and_then(|loaded| page.select(loaded.messages));
+            this.update(cx, |this, cx| {
+                this.history_task = None;
+                if !matches!(this.thread.read(cx).status(), ThreadStatus::Idle)
+                    || this.editing_message.is_some()
+                {
+                    return;
+                }
+                let result = result.and_then(|messages| {
+                    let index = this.history_window.entries();
+                    let added = this.thread.update(cx, |thread, cx| {
+                        thread.append_history_at(index, messages, cx)
+                    })?;
+                    anyhow::ensure!(
+                        added == page.count,
+                        "Restored history overlaps changed messages; reopen chat"
+                    );
+                    this.history_window.restored_newer();
+                    if let Some(excess) = this.history_window.excess_oldest() {
+                        this.thread.update(cx, |thread, cx| {
+                            thread.trim_history_prefix(excess.count, cx)
+                        })?;
+                        this.history_window.evicted_oldest();
+                        this.history_cursor = excess.cursor;
+                        this.history_exhausted = false;
+                        this.followup_cache.borrow_mut().clear();
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    this.history_error = Some(format!("History: {error}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
     }
 
     fn evict_older_history(&mut self, scroll_top: usize, cx: &mut Context<Self>) {
@@ -6260,6 +6364,29 @@ impl ThreadView {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered = v_flex()
+                        .w_full()
+                        .when(
+                            index == this.history_window.entries()
+                                && this.history_window.next_newer().is_some(),
+                            |element| {
+                                element.child(
+                                    Button::new(
+                                        "load-newer-history",
+                                        if this.history_task.is_some() {
+                                            "Loading history…"
+                                        } else {
+                                            "Load newer messages in this gap"
+                                        },
+                                    )
+                                    .disabled(this.history_task.is_some())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.load_newer_history(cx)),
+                                    ),
+                                )
+                            },
+                        )
+                        .child(rendered);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
@@ -6395,6 +6522,10 @@ impl ThreadView {
                                     })
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
+                                    .children(message.chunks.iter().filter_map(|chunk| match chunk {
+                                        acp::ContentBlock::ResourceLink(link) if link.meta.as_ref().and_then(|meta| meta.get("zedHistoryImage")).and_then(serde_json::Value::as_bool) == Some(true) => Some(self.render_resource_link(link, cx)),
+                                        _ => None,
+                                    }))
                             )
                             .when(editor_focus, |this| {
                                 let base_container = h_flex()
@@ -6694,7 +6825,9 @@ impl ThreadView {
             && thread.read(cx).connection().supports_message_fork()
         {
             match entry {
-                AgentThreadEntry::UserMessage(message) => {
+                AgentThreadEntry::UserMessage(message) if !message.chunks.iter().any(|chunk| matches!(chunk,
+                    acp::ContentBlock::ResourceLink(link) if link.meta.as_ref().and_then(|meta| meta.get("zedHistoryImage")).and_then(serde_json::Value::as_bool) == Some(true)
+                )) => {
                     message.protocol_id.clone().map(|message_id| {
                         (
                             acp_thread::SessionForkPoint {
@@ -10575,6 +10708,19 @@ impl ThreadView {
     ) -> AnyElement {
         let uri: SharedString = resource_link.uri.clone().into();
         let is_file = resource_link.uri.strip_prefix("file://");
+        let history_image = is_file
+            .filter(|path| {
+                resource_link
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("zedHistoryImage"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && Path::new(path).is_absolute()
+                    && !path.starts_with("\\\\")
+                    && !path.starts_with("//")
+            })
+            .map(PathBuf::from);
 
         let Some(project) = self.project.upgrade() else {
             return Empty.into_any_element();
@@ -10618,6 +10764,21 @@ impl ThreadView {
             .border_l_1()
             .border_color(self.tool_card_border_color(cx))
             .overflow_hidden()
+            .when_some(history_image, |element, path| {
+                element.child(
+                    div()
+                        .image_cache(gpui::retain_all(SharedString::from(format!(
+                            "history-image-{}",
+                            resource_link.uri
+                        ))))
+                        .child(
+                            img(path)
+                                .max_w_96()
+                                .max_h_96()
+                                .object_fit(ObjectFit::ScaleDown),
+                        ),
+                )
+            })
             .child(
                 Button::new(button_id, label)
                     .label_size(LabelSize::Small)

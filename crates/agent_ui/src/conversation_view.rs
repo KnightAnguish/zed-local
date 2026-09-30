@@ -335,6 +335,7 @@ impl Conversation {
                     | AcpThreadEvent::EntriesRemoved(_)
                     | AcpThreadEvent::HistoryPrepended(_)
                     | AcpThreadEvent::HistoryTrimmed(_)
+                    | AcpThreadEvent::HistorySpliced { .. }
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::Stopped(_)
@@ -595,6 +596,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::EntriesRemoved(_)
         | AcpThreadEvent::HistoryPrepended(_)
         | AcpThreadEvent::HistoryTrimmed(_)
+        | AcpThreadEvent::HistorySpliced { .. }
         | AcpThreadEvent::Retry(_)
         | AcpThreadEvent::TokenUsageUpdated
         | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -1671,7 +1673,9 @@ impl ConversationView {
                     });
                 }
             }
-            AcpThreadEvent::HistoryPrepended(_) | AcpThreadEvent::HistoryTrimmed(_) => {
+            AcpThreadEvent::HistoryPrepended(_)
+            | AcpThreadEvent::HistoryTrimmed(_)
+            | AcpThreadEvent::HistorySpliced { .. } => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
                         let scroll = active.list_state.logical_scroll_top();
@@ -1695,6 +1699,18 @@ impl ConversationView {
                                 AcpThreadEvent::HistoryPrepended(count) => scroll.item_ix + count,
                                 AcpThreadEvent::HistoryTrimmed(count) => {
                                     scroll.item_ix.saturating_sub(*count)
+                                }
+                                AcpThreadEvent::HistorySpliced {
+                                    index,
+                                    removed,
+                                    inserted,
+                                } => {
+                                    if scroll.item_ix <= *index {
+                                        scroll.item_ix
+                                    } else {
+                                        scroll.item_ix.saturating_sub(*removed).max(*index)
+                                            + inserted
+                                    }
                                 }
                                 _ => unreachable!(),
                             },

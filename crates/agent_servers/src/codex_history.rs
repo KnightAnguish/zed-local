@@ -219,6 +219,14 @@ fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPag
     let mut messages = Vec::new();
     let mut identifiers = std::collections::HashSet::new();
     for turn in page.data.into_iter().rev() {
+        let turn_start = messages.len();
+        let artifacts: Vec<_> = turn
+            .items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("imageGeneration"))
+            .filter_map(|item| item.get("savedPath").and_then(Value::as_str))
+            .filter_map(history_image_link)
+            .collect();
         for item in turn.items {
             let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
             if kind != "userMessage" && kind != "agentMessage" {
@@ -259,13 +267,12 @@ fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPag
                         }
                         // Keep attachment references without eagerly fetching or decoding old images.
                         Some("localImage") => {
-                            content.push(acp::ContentBlock::Text(acp::TextContent::new(format!(
-                                "[Image: {}]",
-                                input
-                                    .get("path")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("attachment")
-                            ))))
+                            let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+                            content.push(history_image_link(path).unwrap_or_else(|| {
+                                acp::ContentBlock::Text(acp::TextContent::new(
+                                    "[Image attachment unavailable]",
+                                ))
+                            }));
                         }
                         Some("image") => content.push(acp::ContentBlock::Text(
                             acp::TextContent::new("[Image attachment]"),
@@ -283,11 +290,43 @@ fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPag
                 content,
             });
         }
+        if let Some(reply) = messages[turn_start..]
+            .iter_mut()
+            .rev()
+            .find(|message| !message.is_user)
+        {
+            reply.content.extend(artifacts);
+        }
     }
     Ok(HistoryPage {
         messages,
         next_cursor: page.next_cursor,
     })
+}
+
+fn history_image_link(path: &str) -> Option<acp::ContentBlock> {
+    let file = std::path::Path::new(path);
+    if !file.is_absolute() || path.starts_with("\\\\") || path.starts_with("//") {
+        return None;
+    }
+    let mime = match file.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return None,
+    };
+    Some(acp::ContentBlock::ResourceLink(
+        acp::ResourceLink::new(
+            file.file_name()?.to_string_lossy(),
+            format!("file://{path}"),
+        )
+        .mime_type(mime)
+        .meta(serde_json::Map::from_iter([(
+            "zedHistoryImage".into(),
+            json!(true),
+        )])),
+    ))
 }
 
 #[cfg(test)]
@@ -384,5 +423,40 @@ mod tests {
     fn codex_history_attachment_does_not_load_data_url() {
         let page = decode_page(json!({"data":[{"items":[{"type":"userMessage","id":"image","content":[{"type":"image","url":"data:image/png;base64,secret"}]}]}],"nextCursor":null}), None).expect("page");
         assert!(!format!("{:?}", page.messages).contains("secret"));
+    }
+
+    #[test]
+    fn codex_history_image_references_preserve_reply_identity_without_payloads() {
+        let path = if cfg!(windows) {
+            "C:/pictures/image.png"
+        } else {
+            "/pictures/image.png"
+        };
+        let page = decode_page(
+            json!({"data":[{"items":[
+                {"type":"userMessage","id":"user","content":[{"type":"localImage","path":path}]},
+                {"type":"imageGeneration","id":"tool","savedPath":path,"result":"private-base64"},
+                {"type":"agentMessage","id":"reply","text":"Done"}
+            ]}]}),
+            None,
+        )
+        .expect("page");
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[1].id.to_string(), "reply");
+        assert_eq!(page.messages[1].content.len(), 2);
+        assert!(matches!(
+            page.messages[0].content[0],
+            acp::ContentBlock::ResourceLink(_)
+        ));
+        assert!(!format!("{:?}", page).contains("private-base64"));
+        for invalid in [
+            "https://example.com/p.png",
+            "relative.png",
+            "//server/share/p.png",
+            "\\\\server\\share\\p.png",
+            "C:/secret.txt",
+        ] {
+            assert!(history_image_link(invalid).is_none());
+        }
     }
 }

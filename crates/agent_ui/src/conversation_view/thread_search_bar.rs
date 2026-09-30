@@ -197,6 +197,7 @@ impl ThreadSearchBar {
                             | AcpThreadEvent::EntriesRemoved(_)
                             | AcpThreadEvent::HistoryPrepended(_)
                             | AcpThreadEvent::HistoryTrimmed(_)
+                            | AcpThreadEvent::HistorySpliced { .. }
                     )
                 {
                     this.schedule_update_matches(window, cx);
