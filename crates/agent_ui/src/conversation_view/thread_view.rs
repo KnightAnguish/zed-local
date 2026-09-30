@@ -1486,6 +1486,13 @@ impl ThreadView {
         }
     }
 
+    pub fn can_switch_variant(&self, cx: &App) -> bool {
+        self.thread.read(cx).status() == ThreadStatus::Idle
+            && !self.is_loading_contents
+            && !self.has_queued_messages()
+            && self.message_editor.read(cx).is_empty(cx)
+    }
+
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = &self.thread;
 
@@ -6609,14 +6616,14 @@ impl ThreadView {
         };
         let primary = if let Some((point, draft)) = fork_point {
             let label = if point.before {
-                "Edit in New Chat"
+                "Edit Message"
             } else {
-                "Branch After This Reply"
+                "New Variant After Reply"
             };
             v_flex().w_full().child(primary).child(
                 h_flex().justify_end().child(
                     Button::new(("fork-message", entry_ix), label)
-                        .tooltip(Tooltip::text("Creates a separate chat. Original chat and files are not rolled back."))
+                        .tooltip(Tooltip::text("Creates another variant in this chat. History is preserved; files are not rolled back."))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(AcpThreadViewEvent::ForkMessage { point: point.clone(), draft: draft.clone() });
                         })),

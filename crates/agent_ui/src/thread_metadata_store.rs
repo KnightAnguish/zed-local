@@ -29,6 +29,7 @@ use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
+mod branches;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -498,6 +499,8 @@ pub struct ArchivedGitWorktree {
 ///
 /// Listens to ConversationView events and updates metadata when the root thread changes.
 pub struct ThreadMetadataStore {
+    branches: branches::Branches,
+    branches_writable: bool,
     db: ThreadMetadataDb,
     threads: HashMap<ThreadId, ThreadMetadata>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
@@ -512,15 +515,17 @@ pub struct ThreadMetadataStore {
 
 #[derive(Debug, PartialEq)]
 enum DbOperation {
+    Branches(String),
     Upsert(ThreadMetadata),
     Delete(ThreadId),
 }
 
 impl DbOperation {
-    fn id(&self) -> ThreadId {
+    fn id(&self) -> Option<ThreadId> {
         match self {
-            DbOperation::Upsert(thread) => thread.thread_id,
-            DbOperation::Delete(thread_id) => *thread_id,
+            DbOperation::Upsert(thread) => Some(thread.thread_id),
+            DbOperation::Delete(thread_id) => Some(*thread_id),
+            DbOperation::Branches(_) => None,
         }
     }
 }
@@ -601,6 +606,81 @@ impl ThreadMetadataStore {
         self.threads.values()
     }
 
+    pub fn variant_ids(&self, id: ThreadId) -> Vec<ThreadId> {
+        self.branches
+            .variants(id)
+            .into_iter()
+            .filter(|id| self.threads.contains_key(id))
+            .collect()
+    }
+
+    pub fn is_grouped(&self, id: ThreadId) -> bool {
+        self.branches.contains(id)
+    }
+
+    pub fn is_visible_variant(&self, id: ThreadId) -> bool {
+        self.branches
+            .visible(id, |id| self.threads.contains_key(&id))
+    }
+
+    pub fn can_group_variants(&self) -> bool {
+        self.branches_writable
+    }
+
+    fn persist_branches(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.branches_writable,
+            "Conversation groups could not be loaded"
+        );
+        self.pending_thread_ops_tx
+            .try_send(DbOperation::Branches(serde_json::to_string(
+                &self.branches,
+            )?))?;
+        Ok(())
+    }
+
+    pub fn group_variant(
+        &mut self,
+        source: ThreadId,
+        child: ThreadId,
+        point: acp_thread::SessionForkPoint,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.branches_writable,
+            "Conversation groups could not be loaded"
+        );
+        let source_metadata = self.entry(source).context("Missing source metadata")?;
+        let child_metadata = self.entry(child).context("Missing variant metadata")?;
+        anyhow::ensure!(
+            source_metadata.agent_id == child_metadata.agent_id
+                && source_metadata.worktree_paths == child_metadata.worktree_paths
+                && source_metadata
+                    .matches_remote_connection(child_metadata.remote_connection.as_ref()),
+            "Variants must use the same agent and project"
+        );
+        let previous = self.branches.clone();
+        self.branches
+            .add(source, child, point.message_id.to_string(), point.before)?;
+        if let Err(error) = self.persist_branches() {
+            self.branches = previous;
+            return Err(error);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn select_variant(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let previous = self.branches.clone();
+        if self.branches_writable && self.branches.select(id) {
+            if let Err(error) = self.persist_branches() {
+                self.branches = previous;
+                log::error!("Could not save selected chat variant: {error:#}");
+            }
+            cx.notify();
+        }
+    }
+
     pub fn reload_task(&self) -> Shared<Task<()>> {
         self.reload_task
             .clone()
@@ -609,7 +689,8 @@ impl ThreadMetadataStore {
 
     /// Returns all archived threads.
     pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
-        self.entries().filter(|t| t.archived)
+        self.entries()
+            .filter(|t| t.archived && self.is_visible_variant(t.thread_id))
     }
 
     /// Returns all threads for the given path list and remote connection,
@@ -628,6 +709,7 @@ impl ThreadMetadataStore {
             .into_iter()
             .flatten()
             .filter_map(|s| self.threads.get(s))
+            .filter(|s| self.is_visible_variant(s.thread_id))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
@@ -650,6 +732,7 @@ impl ThreadMetadataStore {
             .into_iter()
             .flatten()
             .filter_map(|s| self.threads.get(s))
+            .filter(|s| self.is_visible_variant(s.thread_id))
             .filter(|s| !s.archived)
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
@@ -1229,13 +1312,20 @@ impl ThreadMetadataStore {
                             DbOperation::Delete(thread_id) => {
                                 db.delete(thread_id).await.log_err();
                             }
+                            DbOperation::Branches(serialized) => {
+                                db.save_branches(serialized).await.log_err();
+                            }
                         }
                     }
                 }
             }
         });
 
+        let loaded_branches = db.load_branches().log_err();
+        let branches_writable = loaded_branches.is_some();
         let mut this = Self {
+            branches: loaded_branches.unwrap_or_default(),
+            branches_writable,
             db,
             threads: HashMap::default(),
             threads_by_paths: HashMap::default(),
@@ -1279,7 +1369,8 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
-        let is_draft = thread_ref.is_draft_thread();
+        // An empty first-message edit is still a durable fork, not an ephemeral new chat.
+        let is_draft = thread_ref.is_draft_thread() && !self.is_grouped(thread_id);
         let existing_thread = self.entry(thread_id);
 
         // Draft session IDs may change on reload, so let's not save them until they're valid
@@ -1462,12 +1553,32 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            CREATE TABLE conversation_variants (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT NOT NULL);
+        ),
     ];
 }
 
 db::static_connection!(ThreadMetadataDb, []);
 
 impl ThreadMetadataDb {
+    fn load_branches(&self) -> anyhow::Result<branches::Branches> {
+        let rows =
+            self.select::<String>("SELECT state FROM conversation_variants WHERE id = 1")?()?;
+        rows.first()
+            .map(|state| serde_json::from_str(state))
+            .transpose()
+            .map(|state| state.unwrap_or_default())
+            .context("Load conversation variants")
+    }
+
+    async fn save_branches(&self, state: String) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut statement = Statement::prepare(conn, "INSERT INTO conversation_variants(id, state) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state")?;
+            statement.bind(&state, 1)?;
+            statement.exec()
+        }).await
+    }
     #[allow(dead_code)]
     pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
         self.select::<ThreadId>(
@@ -1832,6 +1943,108 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
     use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn grouped_variants_persist_one_sidebar_entry(cx: &mut TestAppContext) {
+        init_test(cx);
+        let paths = PathList::new(&[Path::new("/variants")]);
+        let first = make_metadata("variant-a", "Shared chat", Utc::now(), paths.clone());
+        let second = make_metadata("variant-b", "Shared chat", Utc::now(), paths.clone());
+        let (first_id, second_id) = (first.thread_id, second.thread_id);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        store.update(cx, |store, cx| {
+            store.save(first, cx);
+            store.save(second, cx);
+            store
+                .group_variant(
+                    first_id,
+                    second_id,
+                    acp_thread::SessionForkPoint {
+                        message_id: acp::MessageId::new("edited-message"),
+                        before: true,
+                    },
+                    cx,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .entries_for_path(&paths, None)
+                    .map(|row| row.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![second_id]
+            );
+            assert_eq!(
+                store.entries().count(),
+                2,
+                "Grouping must not delete metadata"
+            );
+            store.select_variant(first_id, cx);
+        });
+        cx.run_until_parked();
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        assert!(db.load_branches().unwrap().visible(first_id, |_| true));
+        let restored = cx.new(|cx| ThreadMetadataStore::new(db, cx));
+        cx.run_until_parked();
+        restored.update(cx, |store, cx| {
+            assert_eq!(store.variant_ids(first_id), vec![first_id, second_id]);
+            assert_eq!(
+                store
+                    .entries_for_path(&paths, None)
+                    .map(|row| row.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![first_id]
+            );
+            store.archive(first_id, None, cx);
+            assert_eq!(store.entries_for_path(&paths, None).count(), 0);
+            assert_eq!(store.archived_entries().count(), 1);
+            store.unarchive(first_id, cx);
+            store.delete(first_id, cx);
+            assert_eq!(
+                store
+                    .entries_for_path(&paths, None)
+                    .map(|row| row.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![second_id]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn grouped_variants_reject_cross_project_and_corrupt_storage(cx: &mut TestAppContext) {
+        init_test(cx);
+        let first = make_metadata("a", "A", Utc::now(), PathList::new(&[Path::new("/a")]));
+        let second = make_metadata("b", "B", Utc::now(), PathList::new(&[Path::new("/b")]));
+        let (first_id, second_id) = (first.thread_id, second.thread_id);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        store.update(cx, |store, cx| {
+            store.save(first, cx);
+            store.save(second, cx);
+            assert!(
+                store
+                    .group_variant(
+                        first_id,
+                        second_id,
+                        acp_thread::SessionForkPoint {
+                            message_id: acp::MessageId::new("message"),
+                            before: true,
+                        },
+                        cx
+                    )
+                    .is_err()
+            );
+            assert!(!store.is_grouped(first_id));
+        });
+        cx.run_until_parked();
+        let db = store.read_with(cx, |store, _| store.db.clone());
+        db.save_branches("invalid JSON".into()).await.unwrap();
+        let restored = cx.new(|cx| ThreadMetadataStore::new(db, cx));
+        cx.run_until_parked();
+        restored.read_with(cx, |store, _| {
+            assert!(!store.can_group_variants());
+            assert!(store.is_visible_variant(first_id));
+            assert!(store.is_visible_variant(second_id));
+        });
+    }
 
     fn make_db_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {

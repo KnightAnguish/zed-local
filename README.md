@@ -41,14 +41,30 @@ the project are shared, not rolled back or copied. Repeated clicks while a fork 
 are ignored, and a failed fork reports an error without replacing the original chat.
 
 With adapter capability `_meta.zedMessageFork: 1`, idle root conversations offer
-**Edit in New Chat** on user messages with a server ID and **Branch After This Reply**
+**Edit Message** on user messages with a server ID and **New Variant After Reply**
 on final replies. Editing forks before the user turn and opens an unsent draft; it never
 changes the source conversation. The adapter validates the selected boundary against
 stored Codex history. Editing the first message uses `thread/revert` on the new fork only
 (tested with Codex 0.159.2). A later steering message within the same turn is rejected.
 Live attachment messages may require reopening history before their server ID is available.
+
+Message-boundary edits/forks are grouped locally into one sidebar conversation, with a
+`< 1/2 >` variant selector in the chat toolbar. Each variant keeps its own session and
+context meter; token usage is never summed across variants. Selection loads the saved
+session, not a new prompt. A running turn, pending prompt, queued message or nonempty
+composer blocks switching. The separate **Continue in New Chat** action remains independent.
+The metadata database stores parent/message boundaries and the selected variant in a new
+`conversation_variants` table; per-variant drafts use the existing draft-prompt store.
+Sidebar queries show only the selected member. Archiving it hides the group; deleting a
+member does not delete other histories and exposes a surviving member if necessary.
+Corrupt group storage leaves original rows visible and disables creating new groups.
+The selector currently lists all group variants in creation order, not a per-message tree.
+These changes live on `decay/grouped-variants`; the official profile is not migrated.
 The candidate adapter lives on `local/zed-message-fork`; production dist is not replaced.
-Compilation and protocol tests pass; mouse interaction and draft restoration remain unverified.
+The full dev build and all 447 agent_ui tests pass, including per-variant context,
+group persistence, draft storage and empty first-message fork durability. Protocol fork
+tests passed in the preceding candidate; mouse layout/clicks and production integration
+remain unverified.
 
 Remaining backlog: UI smoke verification and isolated profile migration, including
 preservation of the bounded restored UI history and weekly usage indicator provided by

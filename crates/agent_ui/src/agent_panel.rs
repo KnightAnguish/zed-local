@@ -3170,6 +3170,13 @@ impl AgentPanel {
         conversation_view: Entity<ConversationView>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if ThreadMetadataStore::try_global(cx).is_some_and(|store| {
+            store
+                .read(cx)
+                .is_grouped(conversation_view.read(cx).thread_id)
+        }) {
+            return false;
+        }
         let (thread_id, is_draft, is_empty) = {
             let conversation = conversation_view.read(cx);
             let thread_id = conversation.thread_id;
@@ -4280,6 +4287,10 @@ impl AgentPanel {
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let conversation_view = conversation_view.read(cx);
             let thread_agent = conversation_view.agent_key().clone();
+            let thread_id = conversation_view.thread_id;
+            if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                store.update(cx, |store, cx| store.select_variant(thread_id, cx));
+            }
             if self.selected_agent != thread_agent {
                 self.selected_agent = thread_agent;
                 self.serialize(cx);
@@ -4494,7 +4505,10 @@ impl AgentPanel {
         let is_draft = ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
             .unwrap_or(false);
-        let initial_content = is_draft
+        let has_variants = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .is_grouped(thread_id);
+        let initial_content = (is_draft || has_variants)
             .then(|| crate::draft_prompt_store::read(thread_id, cx))
             .flatten()
             .map(|blocks| AgentInitialContent::ContentBlock {
@@ -4718,6 +4732,12 @@ impl AgentPanel {
     }
     /// Whether the active thread is any kind of draft
     pub fn active_thread_is_draft(&self, cx: &App) -> bool {
+        if self
+            .active_thread_id(cx)
+            .is_some_and(|id| ThreadMetadataStore::global(cx).read(cx).is_grouped(id))
+        {
+            return false;
+        }
         self.active_agent_thread(cx)
             .is_some_and(|thread| thread.read(cx).is_draft_thread())
     }
@@ -5620,9 +5640,35 @@ impl AgentPanel {
         }
         let view = conversation.read(cx);
         let agent = view.agent_key().clone();
+        let source_thread_id = view.thread_id;
+        let source_metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(source_thread_id)
+            .cloned();
+        if point.is_some()
+            && (!ThreadMetadataStore::global(cx)
+                .read(cx)
+                .can_group_variants()
+                || source_metadata.is_none())
+        {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Conversation metadata is unavailable; editing was not started",
+                cx,
+            );
+            return;
+        }
         let Some(thread_view) = view.root_thread_view() else {
             return;
         };
+        if point.is_some() && !thread_view.read(cx).can_switch_variant(cx) {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Finish the current turn and save or clear the draft before editing",
+                cx,
+            );
+            return;
+        }
         let thread = thread_view.read(cx).thread.read(cx);
         if thread.status() != ThreadStatus::Idle || !thread.connection().supports_fork_session() {
             Self::show_deferred_toast(
@@ -5636,7 +5682,12 @@ impl AgentPanel {
             Self::show_deferred_toast(&self.workspace, "The chat has no working directory", cx);
             return;
         };
-        let title: SharedString = format!("{} — branch", view.title(cx)).into();
+        let title: SharedString = if point.is_some() {
+            view.title(cx)
+        } else {
+            format!("{} — branch", view.title(cx)).into()
+        };
+        let group_point = point.clone();
         let request = thread.connection().clone().fork_session(
             thread.session_id().clone(),
             thread.project().clone(),
@@ -5652,23 +5703,61 @@ impl AgentPanel {
                 this.pending_session_fork = false;
                 match result {
                     Ok(session_id) => {
+                        let child_id = ThreadId::new();
+                        if let (Some(point), Some(mut metadata)) = (group_point, source_metadata) {
+                            metadata.thread_id = child_id;
+                            metadata.session_id = Some(session_id.clone());
+                            metadata.archived = false;
+                            metadata.updated_at = chrono::Utc::now();
+                            let result = ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                                store.save(metadata, cx);
+                                store.group_variant(source_thread_id, child_id, point, cx)
+                            });
+                            if let Err(error) = result {
+                                log::error!("Could not group chat variant: {error:#}");
+                                Self::show_deferred_toast(
+                                    &this.workspace,
+                                    "The variant was saved separately because grouping failed",
+                                    cx,
+                                );
+                            }
+                            if let Some(blocks) = draft.as_ref() {
+                                crate::draft_prompt_store::write(child_id, blocks, cx)
+                                    .detach_and_log_err(cx);
+                            }
+                        }
                         let initial_content =
                             draft.map(|blocks| AgentInitialContent::ContentBlock {
                                 blocks,
                                 auto_submit: false,
                             });
-                        let thread = this.create_agent_thread_with_server_for_external_session(
+                        let thread = this.create_agent_thread_inner(
                             agent,
                             None,
-                            session_id,
+                            Some(child_id),
+                            Some(session_id),
                             Some(work_dirs),
                             Some(title),
                             initial_content,
+                            None,
                             AgentThreadSource::AgentPanel,
                             window,
                             cx,
                         );
-                        this.set_base_view(thread.into(), true, window, cx);
+                        let source_is_active = this.active_thread_id(cx) == Some(source_thread_id);
+                        let source_ready = this.active_conversation_view()
+                            .and_then(|view| view.read(cx).root_thread_view())
+                            .is_some_and(|view| view.read(cx).can_switch_variant(cx));
+                        if source_is_active && source_ready {
+                            this.set_base_view(thread.into(), true, window, cx);
+                        } else {
+                            if source_is_active {
+                                ThreadMetadataStore::global(cx).update(cx, |store, cx| store.select_variant(source_thread_id, cx));
+                                Self::show_deferred_toast(&this.workspace, "Variant prepared. Clear the current draft before switching to it", cx);
+                            }
+                            this.retained_threads
+                                .insert(child_id, thread.conversation_view);
+                        }
                     }
                     Err(error) => {
                         log::error!("Could not fork chat: {error:#}");
@@ -5683,6 +5772,71 @@ impl AgentPanel {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn switch_variant(&mut self, target: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_session_fork {
+            return;
+        }
+        let Some(conversation) = self.active_conversation_view() else {
+            return;
+        };
+        let view = conversation.read(cx);
+        if view.is_loading()
+            || view
+                .root_thread_view()
+                .is_some_and(|view| !view.read(cx).can_switch_variant(cx))
+        {
+            return;
+        }
+        let source = view.thread_id;
+        let agent = view.agent_key().clone();
+        let store = ThreadMetadataStore::global(cx);
+        if !store.read(cx).variant_ids(source).contains(&target) {
+            return;
+        }
+        let Some(metadata) = store.read(cx).entry(target).cloned() else {
+            return;
+        };
+        self.load_agent_thread(
+            agent,
+            target,
+            Some(metadata.folder_paths().clone()),
+            metadata.title(),
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
+
+    fn render_variant_selector(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let view = self.active_conversation_view()?.read(cx);
+        let id = view.thread_id;
+        let ids = ThreadMetadataStore::global(cx).read(cx).variant_ids(id);
+        if ids.len() < 2 {
+            return None;
+        }
+        let index = ids.iter().position(|candidate| *candidate == id)?;
+        let disabled = self.pending_session_fork
+            || view.is_loading()
+            || view
+                .root_thread_view()
+                .is_some_and(|view| !view.read(cx).can_switch_variant(cx));
+        let previous = index
+            .checked_sub(1)
+            .and_then(|index| ids.get(index))
+            .copied();
+        let next = ids.get(index + 1).copied();
+        Some(h_flex().gap_1()
+            .child(Button::new("previous-chat-variant", "‹").disabled(disabled || previous.is_none())
+                .tooltip(Tooltip::text("Previous variant; context belongs to the selected variant. Clear the draft before switching."))
+                .on_click(cx.listener(move |this, _, window, cx| { if let Some(target) = previous { this.switch_variant(target, window, cx); } })))
+            .child(Label::new(format!("{}/{}", index + 1, ids.len())))
+            .child(Button::new("next-chat-variant", "›").disabled(disabled || next.is_none())
+                .tooltip(Tooltip::text("Next variant; files remain shared"))
+                .on_click(cx.listener(move |this, _, window, cx| { if let Some(target) = next { this.switch_variant(target, window, cx); } })))
+            .into_any_element())
     }
 
     fn render_panel_options_menu(
@@ -6319,6 +6473,7 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .children(self.render_variant_selector(cx))
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
@@ -9494,6 +9649,196 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    #[gpui::test]
+    async fn grouped_variants_switch_context_without_merging_usage(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let mut ids = Vec::new();
+        let connection = StubAgentConnection::new();
+        for used_tokens in [40_000, 35_000] {
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("Response".into()),
+            )]);
+            open_thread_with_connection(&panel, connection.clone(), &mut cx);
+            send_message(&panel, &mut cx);
+            ids.push(active_thread_id(&panel, &cx));
+            let thread = panel.read_with(&cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+            thread.update(&mut cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens,
+                        max_tokens: 100_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            });
+        }
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store
+                    .group_variant(
+                        ids[0],
+                        ids[1],
+                        acp_thread::SessionForkPoint {
+                            message_id: acp::MessageId::new("message"),
+                            before: true,
+                        },
+                        cx,
+                    )
+                    .unwrap()
+            });
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            let view = panel.active_conversation_view().unwrap().read(cx);
+            assert!(!view.is_loading(), "Variant still loading");
+            let root = view.root_thread_view().unwrap();
+            let root = root.read(cx);
+            assert_eq!(root.thread.read(cx).status(), ThreadStatus::Idle);
+            assert!(!root.is_loading_contents, "Prompt resolution still running");
+            assert!(!root.has_queued_messages(), "Unexpected queued prompt");
+            assert!(
+                root.message_editor.read(cx).is_empty(cx),
+                "Editor retained sent prompt: {}",
+                root.message_editor.read(cx).text(cx)
+            );
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .variant_ids(ids[1])
+                    .contains(&ids[0])
+            );
+            panel.switch_variant(ids[0], window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_thread_id(cx), Some(ids[0]));
+            assert_eq!(
+                panel
+                    .active_agent_thread(cx)
+                    .unwrap()
+                    .read(cx)
+                    .token_usage()
+                    .unwrap()
+                    .used_tokens,
+                40_000
+            );
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.switch_variant(ids[1], window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_thread_id(cx), Some(ids[1]));
+            assert_eq!(
+                panel
+                    .active_agent_thread(cx)
+                    .unwrap()
+                    .read(cx)
+                    .token_usage()
+                    .unwrap()
+                    .used_tokens,
+                35_000
+            );
+        });
+        let editor = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_conversation_view()
+                .unwrap()
+                .read(cx)
+                .root_thread_view()
+                .unwrap()
+                .read(cx)
+                .message_editor
+                .clone()
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_message(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Unsent draft",
+                ))],
+                window,
+                cx,
+            )
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.switch_variant(ids[0], window, cx)
+        });
+        assert_eq!(
+            active_thread_id(&panel, &cx),
+            ids[1],
+            "Switch must preserve an unsent draft"
+        );
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(crate::conversation_view::DRAFT_PROMPT_PERSIST_DEBOUNCE * 2);
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let draft = crate::draft_prompt_store::read(ids[1], cx)
+                .expect("Variant draft must survive reloading");
+            assert_eq!(
+                draft,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Unsent draft"
+                ))]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn grouped_variants_keep_empty_first_message_fork_durable(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        send_message(&panel, &mut cx);
+        let source = active_thread_id(&panel, &cx);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        let child = active_thread_id(&panel, &cx);
+        let session = active_session_id(&panel, &cx);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store
+                    .group_variant(
+                        source,
+                        child,
+                        acp_thread::SessionForkPoint {
+                            message_id: acp::MessageId::new("first"),
+                            before: true,
+                        },
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        let view = panel.read_with(&cx, |panel, _| {
+            panel.active_conversation_view().unwrap().clone()
+        });
+        view.update(&mut cx, |_, cx| cx.emit(RootThreadUpdated));
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(!panel.try_make_empty_draft_ephemeral(view.clone(), cx));
+            assert!(!panel.active_thread_is_draft(cx));
+            assert_eq!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(child)
+                    .unwrap()
+                    .session_id
+                    .as_ref(),
+                Some(&session)
+            );
+            panel.switch_variant(source, window, cx);
+        });
+        assert_eq!(active_thread_id(&panel, &cx), source);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.switch_variant(child, window, cx)
+        });
+        assert_eq!(active_thread_id(&panel, &cx), child);
+        assert_eq!(active_session_id(&panel, &cx), session);
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
