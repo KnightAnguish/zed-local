@@ -88,6 +88,12 @@ pub fn build_terminal_auth_task(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionForkPoint {
+    pub message_id: acp::MessageId,
+    pub before: bool,
+}
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
@@ -125,11 +131,16 @@ pub trait AgentConnection {
         false
     }
 
+    fn supports_message_fork(&self) -> bool {
+        false
+    }
+
     fn fork_session(
         self: Rc<Self>,
         _session_id: acp::SessionId,
         _project: Entity<Project>,
         _work_dirs: PathList,
+        _point: Option<SessionForkPoint>,
         _cx: &mut App,
     ) -> Task<Result<acp::SessionId>> {
         Task::ready(Err(anyhow::anyhow!("Forking sessions is not supported")))

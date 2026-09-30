@@ -40,9 +40,19 @@ The source conversation is preserved; no prompt is submitted automatically. File
 the project are shared, not rolled back or copied. Repeated clicks while a fork is pending
 are ignored, and a failed fork reports an error without replacing the original chat.
 
-Remaining backlog: mouse-driven sent-message editing;
-forking a conversation at a selected turn; preservation of the bounded restored UI history
-and weekly usage indicator provided by `codex-acp-modern`. Chat forks share history up to
+With adapter capability `_meta.zedMessageFork: 1`, idle root conversations offer
+**Edit in New Chat** on user messages with a server ID and **Branch After This Reply**
+on final replies. Editing forks before the user turn and opens an unsent draft; it never
+changes the source conversation. The adapter validates the selected boundary against
+stored Codex history. Editing the first message uses `thread/revert` on the new fork only
+(tested with Codex 0.159.2). A later steering message within the same turn is rejected.
+Live attachment messages may require reopening history before their server ID is available.
+The candidate adapter lives on `local/zed-message-fork`; production dist is not replaced.
+Compilation and protocol tests pass; mouse interaction and draft restoration remain unverified.
+
+Remaining backlog: UI smoke verification and isolated profile migration, including
+preservation of the bounded restored UI history and weekly usage indicator provided by
+`codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

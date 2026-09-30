@@ -755,6 +755,7 @@ fn client_capabilities_for_agent(
     beta_features_enabled: bool,
 ) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
+        ("zedMessageFork".into(), 1.into()),
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
     ]);
@@ -1741,13 +1742,28 @@ impl AgentConnection for AcpConnection {
         self.agent_capabilities.session_capabilities.fork.is_some() && self.supports_load_session()
     }
 
+    fn supports_message_fork(&self) -> bool {
+        self.supports_fork_session()
+            && self
+                .agent_capabilities
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("zedMessageFork"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+    }
+
     fn fork_session(
         self: Rc<Self>,
         session_id: acp::SessionId,
         project: Entity<Project>,
         work_dirs: PathList,
+        point: Option<acp_thread::SessionForkPoint>,
         cx: &mut App,
     ) -> Task<Result<acp::SessionId>> {
+        if point.is_some() && !self.supports_message_fork() {
+            return Task::ready(Err(anyhow!("This agent cannot fork at a message")));
+        }
         if !self.supports_fork_session() {
             return Task::ready(Err(anyhow!("This agent cannot fork and reload sessions")));
         }
@@ -1756,12 +1772,20 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mut request = directories.into_fork_session_request(session_id.clone(), mcp_servers);
+        if let Some(point) = point {
+            request.meta = Some(acp::Meta::from_iter([(
+                "zed".into(),
+                serde_json::json!({
+                    "fork": {"version": 1, "messageId": point.message_id,
+                        "position": if point.before { "before" } else { "after" }}
+                }),
+            )]));
+        }
         cx.spawn(async move |_| {
             let response = self
                 .connection
-                .send_request(
-                    directories.into_fork_session_request(session_id.clone(), mcp_servers),
-                )
+                .send_request(request)
                 .block_task()
                 .await
                 .map_err(map_acp_error)?;
@@ -2745,6 +2769,7 @@ mod tests {
                     original_id.clone(),
                     project.clone(),
                     work_dirs.clone(),
+                    None,
                     cx,
                 )
             })
@@ -2774,6 +2799,7 @@ mod tests {
                     acp::SessionId::new(invalid_source),
                     project.clone(),
                     work_dirs.clone(),
+                    None,
                     cx,
                 ))
                 .await

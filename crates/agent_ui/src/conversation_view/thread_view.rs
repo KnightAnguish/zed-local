@@ -242,6 +242,10 @@ impl RenderOnce for GeneratingSpinnerElement {
 
 pub enum AcpThreadViewEvent {
     Interacted,
+    ForkMessage {
+        point: acp_thread::SessionForkPoint,
+        draft: Option<Vec<acp::ContentBlock>>,
+    },
 }
 
 impl EventEmitter<AcpThreadViewEvent> for ThreadView {}
@@ -6552,6 +6556,65 @@ impl ThreadView {
 
         let is_turn_end = Self::entry_is_finalized_turn_end(thread.read(cx).entries(), entry_ix)
             .unwrap_or(!is_generating);
+
+        let fork_point = if thread.read(cx).status() == ThreadStatus::Idle
+            && !self.is_subagent()
+            && thread.read(cx).connection().supports_message_fork()
+        {
+            match entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    message.protocol_id.clone().map(|message_id| {
+                        (
+                            acp_thread::SessionForkPoint {
+                                message_id,
+                                before: true,
+                            },
+                            Some(message.chunks.clone()),
+                        )
+                    })
+                }
+                AgentThreadEntry::AssistantMessage(message) if is_turn_end => {
+                    message.chunks.iter().rev().find_map(|chunk| {
+                        if let acp_thread::AssistantMessageChunk::Message {
+                            id: Some(message_id),
+                            ..
+                        } = chunk
+                        {
+                            Some((
+                                acp_thread::SessionForkPoint {
+                                    message_id: message_id.clone(),
+                                    before: false,
+                                },
+                                None,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let primary = if let Some((point, draft)) = fork_point {
+            let label = if point.before {
+                "Edit in New Chat"
+            } else {
+                "Branch After This Reply"
+            };
+            v_flex().w_full().child(primary).child(
+                h_flex().justify_end().child(
+                    Button::new(("fork-message", entry_ix), label)
+                        .tooltip(Tooltip::text("Creates a separate chat. Original chat and files are not rolled back."))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(AcpThreadViewEvent::ForkMessage { point: point.clone(), draft: draft.clone() });
+                        })),
+                ),
+            ).into_any_element()
+        } else {
+            primary
+        };
 
         let primary = if is_turn_end && !assistant_message_is_blank {
             let user_message_index = thread

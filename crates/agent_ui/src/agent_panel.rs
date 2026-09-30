@@ -4372,7 +4372,18 @@ impl AgentPanel {
             cx.subscribe_in(
                 &tv,
                 window,
-                |this, _view, event: &AcpThreadViewEvent, _window, cx| match event {
+                |this, _view, event: &AcpThreadViewEvent, window, cx| match event {
+                    AcpThreadViewEvent::ForkMessage { point, draft } => {
+                        if let Some(conversation) = this.active_conversation_view().cloned() {
+                            this.fork_conversation(
+                                conversation,
+                                Some(point.clone()),
+                                draft.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
                     AcpThreadViewEvent::Interacted => {
                         let Some(thread_id) = this.active_thread_id(cx) else {
                             return;
@@ -5599,6 +5610,8 @@ impl AgentPanel {
     fn fork_conversation(
         &mut self,
         conversation: Entity<ConversationView>,
+        point: Option<acp_thread::SessionForkPoint>,
+        draft: Option<Vec<acp::ContentBlock>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5628,6 +5641,7 @@ impl AgentPanel {
             thread.session_id().clone(),
             thread.project().clone(),
             work_dirs.clone(),
+            point,
             cx,
         );
         self.pending_session_fork = true;
@@ -5637,16 +5651,25 @@ impl AgentPanel {
             this.update_in(cx, |this, window, cx| {
                 this.pending_session_fork = false;
                 match result {
-                    Ok(session_id) => this.external_thread_by_session(
-                        agent,
-                        session_id,
-                        Some(work_dirs),
-                        Some(title),
-                        true,
-                        AgentThreadSource::AgentPanel,
-                        window,
-                        cx,
-                    ),
+                    Ok(session_id) => {
+                        let initial_content =
+                            draft.map(|blocks| AgentInitialContent::ContentBlock {
+                                blocks,
+                                auto_submit: false,
+                            });
+                        let thread = this.create_agent_thread_with_server_for_external_session(
+                            agent,
+                            None,
+                            session_id,
+                            Some(work_dirs),
+                            Some(title),
+                            initial_content,
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                        this.set_base_view(thread.into(), true, window, cx);
+                    }
                     Err(error) => {
                         log::error!("Could not fork chat: {error:#}");
                         Self::show_deferred_toast(
@@ -5761,6 +5784,8 @@ impl AgentPanel {
                                                 .update(cx, |panel, cx| {
                                                     panel.fork_conversation(
                                                         conversation.clone(),
+                                                        None,
+                                                        None,
                                                         window,
                                                         cx,
                                                     )
