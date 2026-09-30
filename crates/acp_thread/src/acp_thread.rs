@@ -2372,6 +2372,7 @@ pub enum AcpThreadEvent {
     TokenUsageUpdated,
     EntryUpdated(usize),
     EntriesRemoved(Range<usize>),
+    HistoryPrepended(usize),
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
     ElicitationRequested(ElicitationEntryId),
@@ -2508,6 +2509,7 @@ impl AcpThread {
                 | AcpThreadEvent::ElicitationResponded(_) => this.update_idle_sleep_prevention(cx),
                 AcpThreadEvent::PromptUpdated
                 | AcpThreadEvent::NewEntry
+                | AcpThreadEvent::HistoryPrepended(_)
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::TokenUsageUpdated
                 | AcpThreadEvent::EntryUpdated(_)
@@ -2637,6 +2639,85 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    pub fn prepend_history(
+        &mut self,
+        messages: Vec<HistoryMessage>,
+        require_overlap: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<usize> {
+        let mut known = HashSet::default();
+        for entry in &self.entries {
+            match entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    known.extend(message.protocol_id.iter().cloned());
+                }
+                AgentThreadEntry::AssistantMessage(message) => {
+                    for chunk in &message.chunks {
+                        match chunk {
+                            AssistantMessageChunk::Message { id, .. }
+                            | AssistantMessageChunk::Thought { id, .. } => {
+                                known.extend(id.iter().cloned())
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let languages = self.project.read(cx).languages().clone();
+        if require_overlap
+            && !messages.is_empty()
+            && !self.entries.is_empty()
+            && !messages.iter().any(|message| known.contains(&message.id))
+        {
+            anyhow::bail!(
+                "Cannot align saved history with the visible chat. Reopen the chat before loading older messages."
+            );
+        }
+        let path_style = self.project.read(cx).path_style(cx);
+        let mut entries = Vec::new();
+        for message in messages {
+            if !known.insert(message.id.clone()) {
+                break;
+            }
+            if message.is_user {
+                let mut block = ContentBlock::Empty;
+                for content in &message.content {
+                    block.append(content.clone(), &languages, path_style, cx);
+                }
+                entries.push(AgentThreadEntry::UserMessage(UserMessage {
+                    protocol_id: Some(message.id),
+                    client_id: None,
+                    is_optimistic: false,
+                    content: block,
+                    chunks: message.content,
+                    checkpoint: None,
+                    indented: false,
+                }));
+            } else {
+                entries.push(AgentThreadEntry::AssistantMessage(AssistantMessage {
+                    chunks: message
+                        .content
+                        .into_iter()
+                        .map(|content| AssistantMessageChunk::Message {
+                            id: Some(message.id.clone()),
+                            block: ContentBlock::new(content, &languages, path_style, cx),
+                        })
+                        .collect(),
+                    indented: false,
+                    is_subagent_output: false,
+                }));
+            }
+        }
+        let count = entries.len();
+        if count > 0 {
+            self.entries.splice(0..0, entries);
+            cx.emit(AcpThreadEvent::HistoryPrepended(count));
+            cx.notify();
+        }
+        Ok(count)
     }
 
     pub fn is_compacting(&self) -> bool {
@@ -5796,6 +5877,66 @@ mod tests {
             "Underlying terminal should contain output from before kill, got: {}",
             inner_content
         );
+    }
+
+    #[gpui::test]
+    async fn test_native_history_prepend_is_ordered_and_idempotent(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("session");
+        let message = |id: &str, is_user| HistoryMessage {
+            id: acp::MessageId::new(id.to_owned()),
+            is_user,
+            content: vec![id.to_owned().into()],
+        };
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block_from_agent(
+                Some(acp::MessageId::new("tail")),
+                "tail".into(),
+                cx,
+            );
+            let page = vec![
+                message("old", true),
+                message("reply", false),
+                message("tail", true),
+                message("not-yet-visible", false),
+            ];
+            assert_eq!(
+                thread
+                    .prepend_history(page.clone(), true, cx)
+                    .expect("prepend"),
+                2
+            );
+            assert_eq!(thread.entries().len(), 3);
+            assert_eq!(
+                thread.prepend_history(page, true, cx).expect("duplicate"),
+                0
+            );
+            assert!(
+                thread
+                    .prepend_history(vec![message("unrelated", true)], true, cx)
+                    .is_err()
+            );
+            assert_eq!(thread.entries().len(), 3);
+            assert_eq!(
+                thread
+                    .prepend_history(vec![message("older", true)], false, cx)
+                    .expect("next page"),
+                1
+            );
+            assert!(
+                thread.to_markdown(cx).find("older").expect("older")
+                    < thread.to_markdown(cx).find("reply").expect("reply")
+            );
+            assert!(!thread.to_markdown(cx).contains("not-yet-visible"));
+            assert!(thread.token_usage().is_none());
+        });
     }
 
     #[gpui::test]

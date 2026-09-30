@@ -94,7 +94,33 @@ pub struct SessionForkPoint {
     pub before: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct HistoryMessage {
+    pub id: acp::MessageId,
+    pub is_user: bool,
+    pub content: Vec<acp::ContentBlock>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryPage {
+    pub messages: Vec<HistoryMessage>,
+    pub next_cursor: Option<String>,
+}
+
 pub trait AgentConnection {
+    fn supports_history_pages(&self) -> bool {
+        false
+    }
+
+    fn history_page(
+        &self,
+        _session_id: acp::SessionId,
+        _cursor: Option<String>,
+        _cx: &mut App,
+    ) -> Task<Result<HistoryPage>> {
+        Task::ready(Err(anyhow::anyhow!("History pagination is not supported")))
+    }
+
     fn agent_id(&self) -> AgentId;
 
     fn telemetry_id(&self) -> SharedString;

@@ -9787,6 +9787,56 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn native_history_prepend_preserves_view_anchor_and_draft(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Recent reply".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+        let root = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_conversation_view()
+                .unwrap()
+                .read(cx)
+                .root_thread_view()
+                .unwrap()
+        });
+        let thread = root.read_with(&cx, |root, _| root.thread.clone());
+        let editor = root.read_with(&cx, |root, _| root.message_editor.clone());
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_message(vec!["Unsent draft".into()], window, cx)
+        });
+        cx.run_until_parked();
+        let before = root.read_with(&cx, |root, _| root.list_state.logical_scroll_top());
+        let old_length = thread.read_with(&cx, |thread, _| thread.entries().len());
+        thread.update(&mut cx, |thread, cx| {
+            thread
+                .prepend_history(
+                    vec![acp_thread::HistoryMessage {
+                        id: acp::MessageId::new("older"),
+                        is_user: true,
+                        content: vec!["Older prompt".into()],
+                    }],
+                    false,
+                    cx,
+                )
+                .expect("prepend");
+        });
+        cx.run_until_parked();
+        root.read_with(&cx, |root, cx| {
+            assert_eq!(root.list_state.item_count(), old_length + 1);
+            assert_eq!(
+                root.list_state.logical_scroll_top().item_ix,
+                before.item_ix + 1
+            );
+            assert_eq!(root.message_editor.read(cx).text(cx), "Unsent draft");
+            assert!(root.entry_view_state.read(cx).entry(old_length).is_some());
+        });
+    }
+
+    #[gpui::test]
     async fn grouped_variants_keep_empty_first_message_fork_durable(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let connection = StubAgentConnection::new();

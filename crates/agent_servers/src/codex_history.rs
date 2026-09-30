@@ -1,0 +1,366 @@
+use acp_thread::{HistoryMessage, HistoryPage};
+use agent_client_protocol::schema::v1 as acp;
+use anyhow::{Context as _, Result, bail, ensure};
+use futures::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, io::BufReader};
+use project::agent_server_store::AgentServerCommand;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{path::PathBuf, process::Stdio};
+use util::process::Child;
+
+const PAGE_SIZE: usize = 20;
+const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+
+struct ReaderProcess(Child);
+
+impl Drop for ReaderProcess {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.kill() {
+            log::debug!("Codex history reader already stopped: {error}");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CodexHistory {
+    executable: PathBuf,
+    environment: collections::HashMap<String, String>,
+    directory: Option<PathBuf>,
+}
+
+impl CodexHistory {
+    pub(crate) fn from_command(
+        command: &AgentServerCommand,
+        directory: Option<PathBuf>,
+    ) -> Option<Self> {
+        let environment = command.env.clone()?;
+        let executable = PathBuf::from(environment.get("CODEX_PATH")?);
+        // Never resolve another account/runtime via PATH or invoke a shell wrapper.
+        if !executable.is_absolute() || !executable.is_file() {
+            return None;
+        }
+        #[cfg(windows)]
+        if !executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        {
+            return None;
+        }
+        Some(Self {
+            executable,
+            environment,
+            directory,
+        })
+    }
+
+    pub(crate) async fn page(
+        &self,
+        session_id: acp::SessionId,
+        cursor: Option<String>,
+    ) -> Result<HistoryPage> {
+        let mut command = std::process::Command::new(&self.executable);
+        command
+            .args(["app-server", "--listen", "stdio://"])
+            .envs(&self.environment);
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            command.creation_flags(0x08000000);
+        }
+        let mut process = ReaderProcess(Child::spawn(
+            command,
+            Stdio::piped(),
+            Stdio::piped(),
+            Stdio::null(),
+        )?);
+        let child = &mut process.0;
+        let mut input = child
+            .stdin
+            .take()
+            .context("Codex history stdin unavailable")?;
+        let mut output = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("Codex history stdout unavailable")?,
+        );
+        let result = async {
+            input
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id":1,"method":"initialize","params":{
+                            "clientInfo":{"name":"zed_local_history","version":"1"},
+                            "capabilities":{"experimentalApi":true}
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            input.flush().await?;
+            read_response(&mut output, 1).await?;
+            input
+                .write_all(
+                    format!(
+                        "{}\n{}\n",
+                        json!({"method":"initialized","params":{}}),
+                        json!({"id":2,"method":"thread/turns/list","params":{
+                            "threadId":session_id.to_string(),"cursor":cursor,"limit":PAGE_SIZE,
+                            "sortDirection":"desc","itemsView":"summary"
+                        }})
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            input.flush().await?;
+            decode_page(read_response(&mut output, 2).await?, cursor.as_deref())
+        }
+        .await;
+        // This process only reads stored pages. It never resumes or prompts a session.
+        if let Err(error) = child.kill() {
+            log::warn!("Could not stop Codex history reader: {error}");
+        }
+        child
+            .status()
+            .await
+            .context("Could not reap Codex history reader")?;
+        result
+    }
+}
+
+async fn read_response(
+    reader: &mut (impl futures::AsyncBufRead + Unpin),
+    id: u64,
+) -> Result<Value> {
+    for _ in 0..128 {
+        let mut line = Vec::new();
+        (&mut *reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        ensure!(
+            !line.is_empty(),
+            "Codex history reader closed before replying"
+        );
+        ensure!(
+            line.len() as u64 <= MAX_LINE_BYTES,
+            "Codex history page exceeds 16 MiB"
+        );
+        let value: Value =
+            serde_json::from_slice(&line).context("Invalid Codex history response")?;
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            ensure!(
+                value.get("id").is_none(),
+                "Unexpected request in read-only Codex history connection"
+            );
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            bail!(
+                "Codex history request failed: {}",
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown RPC error")
+            );
+        }
+        return value
+            .get("result")
+            .cloned()
+            .context("Missing Codex history result");
+    }
+    bail!("Too many notifications from Codex history reader")
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnPage {
+    data: Vec<Turn>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Turn {
+    items: Vec<Value>,
+}
+
+fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPage> {
+    let page: TurnPage = serde_json::from_value(value)?;
+    ensure!(
+        page.data.len() <= PAGE_SIZE,
+        "Codex returned too many history turns"
+    );
+    ensure!(
+        page.next_cursor.as_deref().is_none() || page.next_cursor.as_deref() != previous_cursor,
+        "Codex returned a repeated history cursor"
+    );
+    let mut messages = Vec::new();
+    let mut identifiers = std::collections::HashSet::new();
+    for turn in page.data.into_iter().rev() {
+        for item in turn.items {
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind != "userMessage" && kind != "agentMessage" {
+                continue;
+            }
+            if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                continue;
+            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .context("History message has no ID")?;
+            ensure!(
+                identifiers.insert(id.to_owned()),
+                "Duplicate history message ID"
+            );
+            let content = if kind == "agentMessage" {
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .context("History reply has no text")?,
+                ))]
+            } else {
+                let mut content = Vec::new();
+                for input in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .context("History message has no content")?
+                {
+                    match input.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            content.push(acp::ContentBlock::Text(acp::TextContent::new(
+                                input
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .context("History text is missing")?,
+                            )))
+                        }
+                        // Keep attachment references without eagerly fetching or decoding old images.
+                        Some("localImage") => {
+                            content.push(acp::ContentBlock::Text(acp::TextContent::new(format!(
+                                "[Image: {}]",
+                                input
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("attachment")
+                            ))))
+                        }
+                        Some("image") => content.push(acp::ContentBlock::Text(
+                            acp::TextContent::new("[Image attachment]"),
+                        )),
+                        _ => content.push(acp::ContentBlock::Text(acp::TextContent::new(
+                            "[Attachment]",
+                        ))),
+                    }
+                }
+                content
+            };
+            messages.push(HistoryMessage {
+                id: acp::MessageId::new(id),
+                is_user: kind == "userMessage",
+                content,
+            });
+        }
+    }
+    Ok(HistoryPage {
+        messages,
+        next_cursor: page.next_cursor,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_history_rpc_errors_are_not_empty_pages() {
+        futures::executor::block_on(async {
+            let mut input =
+                futures::io::Cursor::new(b"{\"id\":2,\"error\":{\"message\":\"not found\"}}\n");
+            assert!(
+                read_response(&mut input, 2)
+                    .await
+                    .expect_err("error")
+                    .to_string()
+                    .contains("not found")
+            );
+            let mut input = futures::io::Cursor::new(
+                b"{\"method\":\"notice\"}\n{\"id\":2,\"result\":{\"data\":[]}}\n",
+            );
+            assert_eq!(
+                read_response(&mut input, 2).await.expect("reply"),
+                json!({"data":[]})
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "Requires explicitly selected diagnostic thread and Codex executable; never prompts"]
+    fn codex_history_live_read_only() {
+        let executable = PathBuf::from(
+            std::env::var("ZED_CODEX_HISTORY_TEST_EXE").expect("diagnostic executable"),
+        );
+        let session = std::env::var("ZED_CODEX_HISTORY_TEST_THREAD").expect("diagnostic thread");
+        let history = CodexHistory {
+            executable,
+            environment: Default::default(),
+            directory: None,
+        };
+        let page = futures::executor::block_on(history.page(acp::SessionId::new(session), None))
+            .expect("read-only page");
+        assert!(!page.messages.is_empty());
+    }
+
+    #[test]
+    fn codex_history_preserves_order_and_filters_actions() {
+        let page = decode_page(
+            json!({"data":[
+            {"items":[{"type":"agentMessage","id":"new","text":"new"}]},
+            {"items":[{"type":"userMessage","id":"old","content":[{"type":"text","text":"old"}]},
+                {"type":"agentMessage","id":"hidden","phase":"commentary","text":"step"},
+                {"type":"commandExecution","id":"tool"}]}
+        ],"nextCursor":"older"}),
+            None,
+        )
+        .expect("page");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.to_string())
+                .collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some("older"));
+    }
+
+    #[test]
+    fn codex_history_rejects_invalid_pages() {
+        assert!(decode_page(json!({"data":[],"nextCursor":"same"}), Some("same")).is_err());
+        assert!(
+            decode_page(
+                json!({"data":[{"items":[{"type":"agentMessage","text":"missing ID"}]}]}),
+                None
+            )
+            .is_err()
+        );
+        assert!(decode_page(json!({"data":vec![json!({"items":[]});21]}), None).is_err());
+        assert!(
+            decode_page(
+                json!({"data":[{"items":[
+            {"type":"agentMessage","id":"same","text":"a"},
+            {"type":"agentMessage","id":"same","text":"b"}]}]}),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_history_attachment_does_not_load_data_url() {
+        let page = decode_page(json!({"data":[{"items":[{"type":"userMessage","id":"image","content":[{"type":"image","url":"data:image/png;base64,secret"}]}]}],"nextCursor":null}), None).expect("page");
+        assert!(!format!("{:?}", page.messages).contains("secret"));
+    }
+}

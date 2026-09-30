@@ -333,6 +333,7 @@ impl Conversation {
                     | AcpThreadEvent::TokenUsageUpdated
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
+                    | AcpThreadEvent::HistoryPrepended(_)
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::Stopped(_)
@@ -591,6 +592,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         AcpThreadEvent::EntryUpdated(_)
         | AcpThreadEvent::StatusChanged
         | AcpThreadEvent::EntriesRemoved(_)
+        | AcpThreadEvent::HistoryPrepended(_)
         | AcpThreadEvent::Retry(_)
         | AcpThreadEvent::TokenUsageUpdated
         | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -1663,6 +1665,34 @@ impl ConversationView {
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode(cx);
+                    });
+                }
+            }
+            AcpThreadEvent::HistoryPrepended(count) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| {
+                        let scroll = active.list_state.logical_scroll_top();
+                        active
+                            .entry_view_state
+                            .update(cx, |state, cx| state.rebuild_history(thread, window, cx));
+                        let old_count = active.list_state.item_count();
+                        let handles = (0..thread.read(cx).entries().len())
+                            .map(|index| {
+                                active
+                                    .entry_view_state
+                                    .read(cx)
+                                    .entry(index)
+                                    .and_then(|entry| entry.focus_handle(cx))
+                            })
+                            .collect::<Vec<_>>();
+                        active.generating_indicator_in_list = false;
+                        active.list_state.splice_focusable(0..old_count, handles);
+                        active.list_state.scroll_to(gpui::ListOffset {
+                            item_ix: scroll.item_ix + count,
+                            offset_in_item: scroll.offset_in_item,
+                        });
+                        active.sync_generating_indicator(cx);
+                        cx.notify();
                     });
                 }
             }

@@ -394,6 +394,7 @@ fn enqueue_notification<Notif>(
 }
 
 pub struct AcpConnection {
+    native_history: Option<crate::codex_history::CodexHistory>,
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
@@ -814,6 +815,13 @@ impl AcpConnection {
                 .cloned()
         });
         let original_command = command.clone();
+        let native_history = if agent_id.as_ref() == crate::CODEX_ID
+            && project.read_with(cx, |project, _| project.is_local())
+        {
+            crate::codex_history::CodexHistory::from_command(&command, root_dir.clone())
+        } else {
+            None
+        };
         let (path, args, env) = project
             .read_with(cx, |project, cx| {
                 project.remote_client().and_then(|client| {
@@ -1077,6 +1085,7 @@ impl AcpConnection {
 
         Ok(Self {
             id: agent_id,
+            native_history,
             auth_methods,
             agent_server_store,
             connection,
@@ -1119,6 +1128,7 @@ impl AcpConnection {
 
         Self {
             id: agent_id,
+            native_history: None,
             telemetry_id: "test".into(),
             agent_version: None,
             connection,
@@ -1613,6 +1623,32 @@ fn meta_terminal_auth_task(
 }
 
 impl AgentConnection for AcpConnection {
+    fn supports_history_pages(&self) -> bool {
+        self.native_history.is_some()
+    }
+
+    fn history_page(
+        &self,
+        session_id: acp::SessionId,
+        cursor: Option<String>,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::HistoryPage>> {
+        let Some(history) = self.native_history.clone() else {
+            return Task::ready(Err(anyhow!("Native Codex history is not configured")));
+        };
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let request = Box::pin(history.page(session_id, cursor));
+            let timeout = Box::pin(executor.timer(std::time::Duration::from_secs(30)));
+            match futures::future::select(request, timeout).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => {
+                    Err(anyhow!("Codex history request timed out"))
+                }
+            }
+        })
+    }
+
     fn agent_id(&self) -> AgentId {
         self.id.clone()
     }

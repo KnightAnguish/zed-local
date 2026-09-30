@@ -51,6 +51,23 @@ pub struct EntryViewState {
 }
 
 impl EntryViewState {
+    pub(crate) fn rebuild_history(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Editors subscribe with their entry index; simply shifting them would route edits to the wrong message.
+        self.entries.clear();
+        self.expanded_thinking_blocks.clear();
+        self.auto_expanded_thinking_block = None;
+        self.user_toggled_thinking_blocks.clear();
+        self.expanded_compactions.clear();
+        for index in 0..thread.read(cx).entries().len() {
+            self.sync_entry(index, thread, window, cx);
+        }
+    }
+
     pub fn new(
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,

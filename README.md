@@ -71,6 +71,32 @@ preservation of the bounded restored UI history and weekly usage indicator provi
 `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
+Native integration, stage 1 (`decay/native-history`): a local `codex-acp` connection with
+an explicit absolute executable in `CODEX_PATH` can now read older history directly from
+Codex, without asking the ACP adapter to replay it. Scrolling near the top or clicking
+**Load earlier messages** requests `thread/turns/list` pages of 20 turns. The reader uses
+the configured runtime/environment, never a PATH fallback, and is disabled for remote
+projects. Each short-lived app-server only initializes and reads stored history: no
+resume, prompt, history mutation, shell wrapper, or model request. A 30-second deadline,
+16 MiB response-line bound, cursor progress check and three-page-per-gesture bound protect
+the reader. Errors remain visible with an explicit retry; no full-history fallback.
+
+Messages are prepended by stable protocol IDs, with an overlap check on the first page,
+without changing the context meter or stored Codex history. UI editors are rebound to
+their new indices and the previous scroll anchor is restored. Loading/rebinding is
+deferred while the thread is generating or a message is being edited. The initial tail,
+prompts, tools, permissions, weekly quota and skill profiles still use the existing adapter.
+This is NOT yet a replacement for that adapter. Older attachments currently have text
+placeholders; generated-image tool results are filtered with other historical tool steps.
+Resident-page eviction, lazy attachment previews and native live-session/usage integration
+remain unfinished. Pages loaded by scrolling currently remain in the open chat's memory.
+
+Validation: dev build, all 448 agent_ui tests, all 37 ordinary agent_servers tests, the
+acp_thread native-history regression and an explicitly selected real diagnostic session
+read pass. The latter used Codex 0.159.2 and submitted zero model prompts. Mouse scrolling,
+long-chat memory measurements and production-profile integration are still unverified.
+The official editor, its profile and production adapter bundle remain unchanged.
+
 Assistant responses also render standalone `:codex-followup[Label]{prompt="Text"}`
 lines as buttons below the response. Straight and smart quotes are supported. Hover shows
 the complete prompt; clicking uses the normal message send path. Buttons are disabled while

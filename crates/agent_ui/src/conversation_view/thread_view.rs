@@ -598,6 +598,10 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    history_cursor: Option<String>,
+    history_exhausted: bool,
+    history_error: Option<SharedString>,
+    history_task: Option<Task<()>>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
@@ -1007,6 +1011,10 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            history_cursor: None,
+            history_exhausted: false,
+            history_error: None,
+            history_task: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1083,6 +1091,9 @@ impl ThreadView {
                             });
                         }
                         this.schedule_save(cx);
+                        if scroll_top.item_ix < 3 && this.history_error.is_none() {
+                            this.load_older_history(cx);
+                        }
                     });
                 });
             });
@@ -1107,6 +1118,69 @@ impl ThreadView {
             })
             .ok();
         }));
+    }
+
+    fn load_older_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_task.is_some()
+            || self.history_exhausted
+            || self.is_loading_contents
+            || self.editing_message.is_some()
+            || !matches!(self.thread.read(cx).status(), ThreadStatus::Idle)
+        {
+            return;
+        }
+        let connection = self.thread.read(cx).connection().clone();
+        if !connection.supports_history_pages() {
+            return;
+        }
+        let session_id = self.thread.read(cx).session_id().clone();
+        self.history_error = None;
+        self.history_task = Some(cx.spawn(async move |this, cx| {
+            // Skip overlapping or tool-only pages, but bound work per scroll gesture.
+            for _ in 0..3 {
+                let Ok(cursor) = this.read_with(cx, |this, _| this.history_cursor.clone()) else {
+                    return;
+                };
+                let result = cx
+                    .update(|cx| connection.history_page(session_id.clone(), cursor, cx))
+                    .await;
+                let continue_loading = this.update(cx, |this, cx| {
+                    if !matches!(this.thread.read(cx).status(), ThreadStatus::Idle)
+                        || this.editing_message.is_some()
+                    {
+                        return false;
+                    }
+                    match result {
+                        Ok(page) => {
+                            let require_overlap = this.history_cursor.is_none();
+                            match this.thread.update(cx, |thread, cx| {
+                                thread.prepend_history(page.messages, require_overlap, cx)
+                            }) {
+                                Ok(added) => {
+                                    this.history_exhausted = page.next_cursor.is_none();
+                                    this.history_cursor = page.next_cursor;
+                                    return added == 0 && !this.history_exhausted;
+                                }
+                                Err(error) => {
+                                    this.history_error = Some(format!("History: {error}").into())
+                                }
+                            }
+                        }
+                        Err(error) => this.history_error = Some(format!("History: {error}").into()),
+                    }
+                    false
+                });
+                if !matches!(continue_loading, Ok(true)) {
+                    break;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.history_task = None;
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
     }
 
     pub fn handle_message_editor_event(
@@ -12401,6 +12475,32 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .when(
+                self.thread.read(cx).connection().supports_history_pages()
+                    && !self.history_exhausted,
+                |this| {
+                    this.child(
+                        Button::new(
+                            "load-older-history",
+                            if self.history_task.is_some() {
+                                "Loading earlier messages…"
+                            } else if self.history_error.is_some() {
+                                "Retry loading earlier messages"
+                            } else {
+                                "Load earlier messages"
+                            },
+                        )
+                        .disabled(self.history_task.is_some())
+                        .tooltip({
+                            let message = self.history_error.clone().unwrap_or_else(|| {
+                                "Read older messages directly from Codex".into()
+                            });
+                            Tooltip::text(message)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.load_older_history(cx))),
+                    )
+                },
+            )
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
