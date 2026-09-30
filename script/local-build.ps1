@@ -29,7 +29,7 @@ try {
     # Explicit selection avoids a machine-specific default selecting an older toolchain without Spectre libraries.
     Import-Module (Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
     Enter-VsDevShell -VsInstallPath $visualStudio -SkipAutomaticLocation -DevCmdArguments "-arch=amd64 -host_arch=amd64 -vcvars_ver=$($toolchain.Name)"
-    & cargo build --locked -p zed --profile $Profile
+    & cargo build --locked -p zed -p cli --profile $Profile
     if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)." }
 } finally {
     Pop-Location
