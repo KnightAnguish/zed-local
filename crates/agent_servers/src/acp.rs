@@ -662,7 +662,14 @@ impl AcpConnection {
         let native_history = if agent_id.as_ref() == crate::CODEX_ID
             && project.read_with(cx, |project, _| project.is_local())
         {
-            crate::codex_history::CodexHistory::from_command(&command, root_dir.clone())
+            let root_dir = project.read_with(cx, |project, cx| {
+                project
+                    .default_path_list(cx)
+                    .ordered_paths()
+                    .next()
+                    .cloned()
+            });
+            crate::codex_history::CodexHistory::from_command(&command, root_dir)
         } else {
             None
         };
