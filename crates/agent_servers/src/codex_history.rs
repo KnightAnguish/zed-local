@@ -206,7 +206,7 @@ struct Turn {
     items: Vec<Value>,
 }
 
-fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPage> {
+pub(crate) fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPage> {
     let page: TurnPage = serde_json::from_value(value)?;
     ensure!(
         page.data.len() <= PAGE_SIZE,

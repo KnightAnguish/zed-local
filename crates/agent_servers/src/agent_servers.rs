@@ -1,5 +1,7 @@
 mod acp;
 mod codex_history;
+#[allow(dead_code)] // Migration implementation; routing stays legacy until parity gates pass.
+mod codex_native;
 mod codex_usage;
 mod custom;
 

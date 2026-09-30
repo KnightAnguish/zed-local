@@ -5,6 +5,10 @@
 
 ## Local fork
 
+The complete Rust replacement of the Codex adapter is being developed on
+`decay/native-codex`; see [migration status and parity gates](NATIVE_CODEX.md).
+It is not selected by production routing yet. Existing adapter and chat storage remain intact.
+
 Branch `decay/local` starts at official tag `v1.21.0` (33c95853ed2b6956f339733c63a8220964ecbeb6).
 `upstream` points to the official repository; pushes to it are disabled locally.
 `upstream/main` is tracked for inspection, but stable releases are the default merge candidates.
