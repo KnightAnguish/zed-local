@@ -121,6 +121,20 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        _session_id: acp::SessionId,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        Task::ready(Err(anyhow::anyhow!("Forking sessions is not supported")))
+    }
+
     /// Whether this agent supports closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false

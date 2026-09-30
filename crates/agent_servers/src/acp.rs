@@ -1464,6 +1464,16 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
+
     fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
@@ -1725,6 +1735,42 @@ impl AgentConnection for AcpConnection {
 
     fn supports_load_session(&self) -> bool {
         self.agent_capabilities.load_session
+    }
+
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some() && self.supports_load_session()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!("This agent cannot fork and reload sessions")));
+        }
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = mcp_servers_for_project(&project, cx);
+        cx.spawn(async move |_| {
+            let response = self
+                .connection
+                .send_request(
+                    directories.into_fork_session_request(session_id.clone(), mcp_servers),
+                )
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            anyhow::ensure!(
+                response.session_id != session_id,
+                "Agent returned the original session instead of a fork"
+            );
+            Ok(response.session_id)
+        })
     }
 
     fn supports_resume_session(&self) -> bool {
@@ -2373,6 +2419,7 @@ pub mod test_support {
                                 .load_session(true)
                                 .session_capabilities(
                                     acp::SessionCapabilities::default()
+                                        .fork(acp::SessionForkCapabilities::new())
                                         .close(acp::SessionCloseCapabilities::new()),
                                 ),
                         ),
@@ -2418,6 +2465,20 @@ pub mod test_support {
                             responder.respond(Default::default())
                         }
                     }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: acp::ForkSessionRequest, responder, _cx| {
+                    if req.session_id == acp::SessionId::new("reject-fork") {
+                        return responder.respond_with_error(acp::ErrorCode::InternalError.into());
+                    }
+                    let session_id = if req.session_id == acp::SessionId::new("same-id") {
+                        req.session_id
+                    } else {
+                        acp::SessionId::new("forked-session")
+                    };
+                    responder.respond(acp::ForkSessionResponse::new(session_id))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2653,6 +2714,72 @@ mod tests {
             cx.set_global(settings_store);
             cx.update_flags(false, vec![]);
         });
+    }
+
+    #[gpui::test]
+    async fn fork_session_preserves_source_and_loads_new_session(cx: &mut gpui::TestAppContext) {
+        init_feature_flags_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let connection = harness.connection.clone();
+        assert!(connection.supports_fork_session());
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+        let original_id = acp::SessionId::new("source-session");
+        let original = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    original_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("source loads");
+        let fork_id = cx
+            .update(|cx| {
+                connection.clone().fork_session(
+                    original_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    cx,
+                )
+            })
+            .await
+            .expect("fork succeeds");
+        assert_ne!(fork_id, original_id);
+        let fork = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    fork_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("fork loads");
+        assert_ne!(fork.entity_id(), original.entity_id());
+        original.read_with(cx, |thread, _| {
+            assert_eq!(thread.session_id(), &original_id)
+        });
+        fork.read_with(cx, |thread, _| assert_eq!(thread.session_id(), &fork_id));
+        for invalid_source in ["reject-fork", "same-id"] {
+            assert!(
+                cx.update(|cx| connection.clone().fork_session(
+                    acp::SessionId::new(invalid_source),
+                    project.clone(),
+                    work_dirs.clone(),
+                    cx,
+                ))
+                .await
+                .is_err()
+            );
+        }
     }
 
     #[gpui::test]
@@ -3295,6 +3422,15 @@ mod tests {
 
         let session_id = acp::SessionId::new("session-1");
         let new_session_request = directories.clone().into_new_session_request(Vec::new());
+        let fork_session_request = directories
+            .clone()
+            .into_fork_session_request(session_id.clone(), Vec::new());
+        assert_eq!(fork_session_request.session_id, session_id);
+        assert_eq!(fork_session_request.cwd, new_session_request.cwd);
+        assert_eq!(
+            fork_session_request.additional_directories,
+            new_session_request.additional_directories
+        );
         let load_session_request = directories
             .clone()
             .into_load_session_request(session_id.clone(), Vec::new());

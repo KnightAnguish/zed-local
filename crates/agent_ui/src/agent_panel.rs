@@ -1169,6 +1169,7 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    pending_session_fork: bool,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
@@ -1582,6 +1583,7 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            pending_session_fork: false,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
@@ -5594,6 +5596,72 @@ impl AgentPanel {
         }
     }
 
+    fn fork_conversation(
+        &mut self,
+        conversation: Entity<ConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_session_fork {
+            return;
+        }
+        let view = conversation.read(cx);
+        let agent = view.agent_key().clone();
+        let Some(thread_view) = view.root_thread_view() else {
+            return;
+        };
+        let thread = thread_view.read(cx).thread.read(cx);
+        if thread.status() != ThreadStatus::Idle || !thread.connection().supports_fork_session() {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Stop the agent before branching this chat",
+                cx,
+            );
+            return;
+        }
+        let Some(work_dirs) = thread.work_dirs().cloned() else {
+            Self::show_deferred_toast(&self.workspace, "The chat has no working directory", cx);
+            return;
+        };
+        let title: SharedString = format!("{} — branch", view.title(cx)).into();
+        let request = thread.connection().clone().fork_session(
+            thread.session_id().clone(),
+            thread.project().clone(),
+            work_dirs.clone(),
+            cx,
+        );
+        self.pending_session_fork = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            this.update_in(cx, |this, window, cx| {
+                this.pending_session_fork = false;
+                match result {
+                    Ok(session_id) => this.external_thread_by_session(
+                        agent,
+                        session_id,
+                        Some(work_dirs),
+                        Some(title),
+                        true,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    ),
+                    Err(error) => {
+                        log::error!("Could not fork chat: {error:#}");
+                        Self::show_deferred_toast(
+                            &this.workspace,
+                            "Could not create chat branch. See the Zed log for details.",
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_panel_options_menu(
         &self,
         _window: &mut Window,
@@ -5629,6 +5697,16 @@ impl AgentPanel {
         let has_thread_messages = conversation_view.as_ref().is_some_and(|conversation_view| {
             conversation_view.read(cx).has_user_submitted_prompt(cx)
         });
+
+        let panel = cx.entity().downgrade();
+        let can_fork_session = !self.pending_session_fork
+            && conversation_view.as_ref().is_some_and(|view| {
+                view.read(cx).root_thread_view().is_some_and(|view| {
+                    let thread = view.read(cx).thread.read(cx);
+                    thread.status() == ThreadStatus::Idle
+                        && thread.connection().supports_fork_session()
+                })
+            });
 
         let has_auth_methods = match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
@@ -5672,6 +5750,25 @@ impl AgentPanel {
                             menu = menu.header("Current Thread");
 
                             if let Some(conversation_view) = conversation_view.as_ref() {
+                                if can_fork_session {
+                                    let conversation = conversation_view.clone();
+                                    let panel = panel.clone();
+                                    menu = menu.entry(
+                                        "Continue in New Chat",
+                                        None,
+                                        move |window, cx| {
+                                            panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.fork_conversation(
+                                                        conversation.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .log_err();
+                                        },
+                                    );
+                                }
                                 if can_regenerate_thread_title {
                                     menu = menu.entry("Regenerate Thread Title", None, {
                                         let conversation_view = conversation_view.clone();

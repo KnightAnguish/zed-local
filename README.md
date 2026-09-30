@@ -32,7 +32,15 @@ it never downloads or installs the official editor. No checks run while Zed is c
 Default application data paths use `ZedLocal`, with a separate Windows app identifier.
 The launcher still requires an explicit profile to keep experiments isolated from daily use.
 
-Initial backlog: mouse-driven sent-message editing;
+The agent panel's ellipsis menu offers **Continue in New Chat** when the current agent
+advertises ACP session forking and history loading, and the root thread is idle.
+It forks the stored session through ACP, then opens the returned session with normal
+history loading. It never rebuilds agent context from the bounded visible transcript.
+The source conversation is preserved; no prompt is submitted automatically. Files in
+the project are shared, not rolled back or copied. Repeated clicks while a fork is pending
+are ignored, and a failed fork reports an error without replacing the original chat.
+
+Remaining backlog: mouse-driven sent-message editing;
 forking a conversation at a selected turn; preservation of the bounded restored UI history
 and weekly usage indicator provided by `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
