@@ -1,5 +1,6 @@
 mod acp;
 mod codex_history;
+mod codex_usage;
 mod custom;
 
 #[cfg(any(test, feature = "test-support"))]

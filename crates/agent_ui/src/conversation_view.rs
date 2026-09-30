@@ -334,6 +334,7 @@ impl Conversation {
                     | AcpThreadEvent::EntryUpdated(_)
                     | AcpThreadEvent::EntriesRemoved(_)
                     | AcpThreadEvent::HistoryPrepended(_)
+                    | AcpThreadEvent::HistoryTrimmed(_)
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
                     | AcpThreadEvent::Stopped(_)
@@ -593,6 +594,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::StatusChanged
         | AcpThreadEvent::EntriesRemoved(_)
         | AcpThreadEvent::HistoryPrepended(_)
+        | AcpThreadEvent::HistoryTrimmed(_)
         | AcpThreadEvent::Retry(_)
         | AcpThreadEvent::TokenUsageUpdated
         | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -1664,11 +1666,12 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.invalidate_history_pages();
                         active.sync_editor_mode(cx);
                     });
                 }
             }
-            AcpThreadEvent::HistoryPrepended(count) => {
+            AcpThreadEvent::HistoryPrepended(_) | AcpThreadEvent::HistoryTrimmed(_) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
                         let scroll = active.list_state.logical_scroll_top();
@@ -1688,7 +1691,13 @@ impl ConversationView {
                         active.generating_indicator_in_list = false;
                         active.list_state.splice_focusable(0..old_count, handles);
                         active.list_state.scroll_to(gpui::ListOffset {
-                            item_ix: scroll.item_ix + count,
+                            item_ix: match event {
+                                AcpThreadEvent::HistoryPrepended(count) => scroll.item_ix + count,
+                                AcpThreadEvent::HistoryTrimmed(count) => {
+                                    scroll.item_ix.saturating_sub(*count)
+                                }
+                                _ => unreachable!(),
+                            },
                             offset_in_item: scroll.offset_in_item,
                         });
                         active.sync_generating_indicator(cx);

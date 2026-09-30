@@ -2296,6 +2296,7 @@ pub struct AcpThread {
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
+    history_prefix_len: usize,
     elicitations: ElicitationStore,
     plan: Plan,
     project: Entity<Project>,
@@ -2373,6 +2374,7 @@ pub enum AcpThreadEvent {
     EntryUpdated(usize),
     EntriesRemoved(Range<usize>),
     HistoryPrepended(usize),
+    HistoryTrimmed(usize),
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
     ElicitationRequested(ElicitationEntryId),
@@ -2510,6 +2512,7 @@ impl AcpThread {
                 AcpThreadEvent::PromptUpdated
                 | AcpThreadEvent::NewEntry
                 | AcpThreadEvent::HistoryPrepended(_)
+                | AcpThreadEvent::HistoryTrimmed(_)
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::TokenUsageUpdated
                 | AcpThreadEvent::EntryUpdated(_)
@@ -2549,6 +2552,7 @@ impl AcpThread {
             update_last_checkpoint_if_changed_task: None,
             shared_buffers: Default::default(),
             entries: Default::default(),
+            history_prefix_len: 0,
             elicitations: ElicitationStore::default(),
             plan: Default::default(),
             title,
@@ -2714,10 +2718,29 @@ impl AcpThread {
         let count = entries.len();
         if count > 0 {
             self.entries.splice(0..0, entries);
+            self.history_prefix_len += count;
             cx.emit(AcpThreadEvent::HistoryPrepended(count));
             cx.notify();
         }
         Ok(count)
+    }
+
+    pub fn trim_history_prefix(&mut self, count: usize, cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.status() == ThreadStatus::Idle,
+            "Cannot evict history while the agent is running"
+        );
+        anyhow::ensure!(
+            count <= self.history_prefix_len && count <= self.entries.len(),
+            "Cannot evict live chat entries"
+        );
+        if count > 0 {
+            self.entries.drain(..count);
+            self.history_prefix_len -= count;
+            cx.emit(AcpThreadEvent::HistoryTrimmed(count));
+            cx.notify();
+        }
+        Ok(())
     }
 
     pub fn is_compacting(&self) -> bool {
@@ -4260,6 +4283,8 @@ impl AcpThread {
                                     let range = user_msg_ix..this.entries.len();
                                     if range.start < range.end {
                                         this.entries.truncate(user_msg_ix);
+                                        this.history_prefix_len =
+                                            this.history_prefix_len.min(user_msg_ix);
                                         cx.emit(AcpThreadEvent::EntriesRemoved(range));
                                     }
                                     cx.emit(AcpThreadEvent::Refusal);
@@ -4482,6 +4507,7 @@ impl AcpThread {
 
                     let range = ix..this.entries.len();
                     this.entries.truncate(ix);
+                    this.history_prefix_len = this.history_prefix_len.min(ix);
                     cx.emit(AcpThreadEvent::EntriesRemoved(range));
 
                     // Kill and remove the terminals
@@ -5935,6 +5961,20 @@ mod tests {
                     < thread.to_markdown(cx).find("reply").expect("reply")
             );
             assert!(!thread.to_markdown(cx).contains("not-yet-visible"));
+            assert!(thread.token_usage().is_none());
+            assert!(thread.trim_history_prefix(4, cx).is_err());
+            assert_eq!(thread.entries().len(), 4);
+            thread
+                .trim_history_prefix(3, cx)
+                .expect("evict stored prefix");
+            assert_eq!(thread.entries().len(), 1);
+            assert!(thread.trim_history_prefix(1, cx).is_err());
+            assert_eq!(
+                thread
+                    .prepend_history(vec![message("old", true), message("tail", true)], true, cx)
+                    .expect("reload"),
+                1
+            );
             assert!(thread.token_usage().is_none());
         });
     }

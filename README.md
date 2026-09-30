@@ -71,12 +71,12 @@ preservation of the bounded restored UI history and weekly usage indicator provi
 `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
-Native integration, stage 1 (`decay/native-history`): a local `codex-acp` connection with
+Native integration, stages 1–2 (`decay/native-history`): a local `codex-acp` connection with
 an explicit absolute executable in `CODEX_PATH` can now read older history directly from
 Codex, without asking the ACP adapter to replay it. Scrolling near the top or clicking
 **Load earlier messages** requests `thread/turns/list` pages of 20 turns. The reader uses
 the configured runtime/environment, never a PATH fallback, and is disabled for remote
-projects. Each short-lived app-server only initializes and reads stored history: no
+projects. Each short-lived app-server only initializes and reads stored history/account limits: no
 resume, prompt, history mutation, shell wrapper, or model request. A 30-second deadline,
 16 MiB response-line bound, cursor progress check and three-page-per-gesture bound protect
 the reader. Errors remain visible with an explicit retry; no full-history fallback.
@@ -85,15 +85,29 @@ Messages are prepended by stable protocol IDs, with an overlap check on the firs
 without changing the context meter or stored Codex history. UI editors are rebound to
 their new indices and the previous scroll anchor is restored. Loading/rebinding is
 deferred while the thread is generating or a message is being edited. The initial tail,
-prompts, tools, permissions, weekly quota and skill profiles still use the existing adapter.
+prompts, tools, permissions and skill profiles still use the existing adapter.
 This is NOT yet a replacement for that adapter. Older attachments currently have text
 placeholders; generated-image tool results are filtered with other historical tool steps.
-Resident-page eviction, lazy attachment previews and native live-session/usage integration
-remain unfinished. Pages loaded by scrolling currently remain in the open chat's memory.
+When scrolling back toward newer messages, whole loaded pages more than 40 entries above
+the viewport are released, with the request cursor retained for reloading. Live entries,
+agent context and stored history are never evicted. This is one-sided reclamation, NOT a
+fully bounded bidirectional window: deep upward browsing and a long live session can still
+grow memory; recreating a view over a retained thread loses its page bookkeeping.
+Lazy attachment previews and native live-session integration remain unfinished.
 
-Validation: dev build, all 448 agent_ui tests, all 37 ordinary agent_servers tests, the
-acp_thread native-history regression and an explicitly selected real diagnostic session
-read pass. The latter used Codex 0.159.2 and submitted zero model prompts. Mouse scrolling,
+Weekly usage is now read and formatted in Rust via `account/rateLimits/read`, replacing the
+adapter's `weekly-usage` config option in the existing percentage/arrow UI. Only the account
+Codex weekly window is used, never a model-specific quota. Unknown/failed/expired values
+show an em dash, not 0%. Tooltip contains remaining percent and reset time in Moscow time.
+Refresh occurs at connection/config access/prompt start (60-second throttle), or explicitly
+via Refresh (2-second throttle); there is no background periodic timer. No model prompt is
+submitted. The adapter may still perform its own legacy usage reads until it is replaced.
+
+Validation: final dev build, 150 acp_thread tests, 39 ordinary agent_servers tests and
+449 agent_ui tests pass. The final parallel UI run had one nonreproducing workspace-DB
+backfill failure; that test alone and all 449 tests run sequentially pass. An explicitly
+selected real diagnostic session read plus account-limits read pass against Codex 0.159.2,
+with zero model prompts. Mouse scrolling,
 long-chat memory measurements and production-profile integration are still unverified.
 The official editor, its profile and production adapter bundle remain unchanged.
 

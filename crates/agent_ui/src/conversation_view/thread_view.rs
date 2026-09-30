@@ -8,6 +8,7 @@ use crate::{
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
 mod followups;
+mod history_window;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -599,6 +600,7 @@ pub struct ThreadView {
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
     history_cursor: Option<String>,
+    history_window: history_window::HistoryWindow,
     history_exhausted: bool,
     history_error: Option<SharedString>,
     history_task: Option<Task<()>>,
@@ -1012,6 +1014,7 @@ impl ThreadView {
             profile_selector,
             list_state,
             history_cursor: None,
+            history_window: Default::default(),
             history_exhausted: false,
             history_error: None,
             history_task: None,
@@ -1091,6 +1094,7 @@ impl ThreadView {
                             });
                         }
                         this.schedule_save(cx);
+                        this.evict_older_history(scroll_top.item_ix, cx);
                         if scroll_top.item_ix < 3 && this.history_error.is_none() {
                             this.load_older_history(cx);
                         }
@@ -1142,7 +1146,7 @@ impl ThreadView {
                     return;
                 };
                 let result = cx
-                    .update(|cx| connection.history_page(session_id.clone(), cursor, cx))
+                    .update(|cx| connection.history_page(session_id.clone(), cursor.clone(), cx))
                     .await;
                 let continue_loading = this.update(cx, |this, cx| {
                     if !matches!(this.thread.read(cx).status(), ThreadStatus::Idle)
@@ -1157,6 +1161,7 @@ impl ThreadView {
                                 thread.prepend_history(page.messages, require_overlap, cx)
                             }) {
                                 Ok(added) => {
+                                    this.history_window.prepend(added, cursor);
                                     this.history_exhausted = page.next_cursor.is_none();
                                     this.history_cursor = page.next_cursor;
                                     return added == 0 && !this.history_exhausted;
@@ -1181,6 +1186,42 @@ impl ThreadView {
             .log_err();
         }));
         cx.notify();
+    }
+
+    pub(super) fn invalidate_history_pages(&mut self) {
+        self.history_task = None;
+        self.history_window = Default::default();
+        self.history_cursor = None;
+        self.history_exhausted = false;
+        self.history_error = None;
+        self.followup_cache.borrow_mut().clear();
+    }
+
+    fn evict_older_history(&mut self, scroll_top: usize, cx: &mut Context<Self>) {
+        if self.history_task.is_some()
+            || self.is_loading_contents
+            || self.editing_message.is_some()
+            || !matches!(self.thread.read(cx).status(), ThreadStatus::Idle)
+        {
+            return;
+        }
+        let eviction = self.history_window.plan_eviction(scroll_top);
+        if eviction.entries == 0 {
+            return;
+        }
+        match self.thread.update(cx, |thread, cx| {
+            thread.trim_history_prefix(eviction.entries, cx)
+        }) {
+            Ok(()) => {
+                self.history_cursor = eviction.cursor.clone();
+                self.history_exhausted = false;
+                self.history_window.evicted(&eviction);
+                self.followup_cache.borrow_mut().clear();
+            }
+            Err(error) => {
+                self.history_error = Some(format!("History: {error}").into());
+            }
+        }
     }
 
     pub fn handle_message_editor_event(

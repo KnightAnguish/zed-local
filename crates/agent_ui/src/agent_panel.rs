@@ -9834,6 +9834,16 @@ mod tests {
             assert_eq!(root.message_editor.read(cx).text(cx), "Unsent draft");
             assert!(root.entry_view_state.read(cx).entry(old_length).is_some());
         });
+        thread.update(&mut cx, |thread, cx| {
+            thread.trim_history_prefix(1, cx).expect("evict")
+        });
+        cx.run_until_parked();
+        root.read_with(&cx, |root, cx| {
+            assert_eq!(root.list_state.item_count(), old_length);
+            assert_eq!(root.list_state.logical_scroll_top().item_ix, before.item_ix);
+            assert_eq!(root.message_editor.read(cx).text(cx), "Unsent draft");
+            assert!(root.entry_view_state.read(cx).entry(old_length).is_none());
+        });
     }
 
     #[gpui::test]

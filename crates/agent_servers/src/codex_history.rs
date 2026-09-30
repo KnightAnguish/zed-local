@@ -58,6 +58,28 @@ impl CodexHistory {
         session_id: acp::SessionId,
         cursor: Option<String>,
     ) -> Result<HistoryPage> {
+        decode_page(
+            self.read(
+                "thread/turns/list",
+                json!({
+                    "threadId":session_id.to_string(),"cursor":cursor,"limit":PAGE_SIZE,
+                    "sortDirection":"desc","itemsView":"summary"
+                }),
+            )
+            .await?,
+            cursor.as_deref(),
+        )
+    }
+
+    pub(crate) async fn rate_limits(&self) -> Result<Value> {
+        self.read("account/rateLimits/read", json!({})).await
+    }
+
+    async fn read(&self, method: &str, params: Value) -> Result<Value> {
+        ensure!(
+            matches!(method, "thread/turns/list" | "account/rateLimits/read"),
+            "Unsupported native read method"
+        );
         let mut command = std::process::Command::new(&self.executable);
         command
             .args(["app-server", "--listen", "stdio://"])
@@ -107,16 +129,13 @@ impl CodexHistory {
                     format!(
                         "{}\n{}\n",
                         json!({"method":"initialized","params":{}}),
-                        json!({"id":2,"method":"thread/turns/list","params":{
-                            "threadId":session_id.to_string(),"cursor":cursor,"limit":PAGE_SIZE,
-                            "sortDirection":"desc","itemsView":"summary"
-                        }})
+                        json!({"id":2,"method":method,"params":params})
                     )
                     .as_bytes(),
                 )
                 .await?;
             input.flush().await?;
-            decode_page(read_response(&mut output, 2).await?, cursor.as_deref())
+            read_response(&mut output, 2).await
         }
         .await;
         // This process only reads stored pages. It never resumes or prompts a session.
@@ -312,6 +331,9 @@ mod tests {
         let page = futures::executor::block_on(history.page(acp::SessionId::new(session), None))
             .expect("read-only page");
         assert!(!page.messages.is_empty());
+        let usage =
+            futures::executor::block_on(history.rate_limits()).expect("read-only account limits");
+        assert!(usage.get("rateLimits").is_some() || usage.get("rateLimitsByLimitId").is_some());
     }
 
     #[test]

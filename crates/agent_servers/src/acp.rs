@@ -395,6 +395,7 @@ fn enqueue_notification<Notif>(
 
 pub struct AcpConnection {
     native_history: Option<crate::codex_history::CodexHistory>,
+    native_usage: Option<crate::codex_usage::NativeUsage>,
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
@@ -1085,6 +1086,9 @@ impl AcpConnection {
 
         Ok(Self {
             id: agent_id,
+            native_usage: native_history
+                .clone()
+                .map(|reader| cx.update(|cx| crate::codex_usage::NativeUsage::new(reader, cx))),
             native_history,
             auth_methods,
             agent_server_store,
@@ -1129,6 +1133,7 @@ impl AcpConnection {
         Self {
             id: agent_id,
             native_history: None,
+            native_usage: None,
             telemetry_id: "test".into(),
             agent_version: None,
             connection,
@@ -2005,6 +2010,9 @@ impl AgentConnection for AcpConnection {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
+        if let Some(usage) = &self.native_usage {
+            usage.refresh(cx, false);
+        }
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
@@ -2097,14 +2105,19 @@ impl AgentConnection for AcpConnection {
     fn session_config_options(
         &self,
         session_id: &acp::SessionId,
-        _cx: &App,
+        cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
         let sessions = self.sessions.borrow();
         let session = sessions.get(session_id)?;
 
         let config_opts = session.config_options.as_ref()?;
+        if let Some(usage) = &self.native_usage {
+            usage.refresh(cx, false);
+        }
 
         Some(Rc::new(AcpSessionConfigOptions {
+            native_usage: self.native_usage.clone(),
+            native_watch_task: RefCell::new(None),
             session_id: session_id.clone(),
             connection: self.connection.clone(),
             state: config_opts.config_options.clone(),
@@ -4679,6 +4692,8 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
 }
 
 struct AcpSessionConfigOptions {
+    native_usage: Option<crate::codex_usage::NativeUsage>,
+    native_watch_task: RefCell<Option<Task<()>>>,
     session_id: acp::SessionId,
     connection: ConnectionTo<Agent>,
     state: Rc<RefCell<Vec<acp::SessionConfigOption>>>,
@@ -4688,7 +4703,10 @@ struct AcpSessionConfigOptions {
 
 impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
     fn config_options(&self) -> Vec<acp::SessionConfigOption> {
-        self.state.borrow().clone()
+        let options = self.state.borrow().clone();
+        self.native_usage
+            .as_ref()
+            .map_or_else(|| options.clone(), |usage| usage.options(options.clone()))
     }
 
     fn set_config_option(
@@ -4697,11 +4715,18 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
         value: acp::SessionConfigOptionValue,
         cx: &mut App,
     ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
+        if let Some(usage) = &self.native_usage
+            && crate::codex_usage::NativeUsage::owns(&config_id)
+        {
+            usage.refresh(cx, true);
+            return Task::ready(Ok(self.config_options()));
+        }
         let connection = self.connection.clone();
         let session_id = self.session_id.clone();
         let state = self.state.clone();
 
         let watch_tx = self.watch_tx.clone();
+        let native_usage = self.native_usage.clone();
 
         cx.foreground_executor().spawn(async move {
             let response = connection
@@ -4713,11 +4738,24 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
 
             *state.borrow_mut() = response.config_options.clone();
             watch_tx.borrow_mut().send(()).ok();
-            Ok(response.config_options)
+            Ok(native_usage.as_ref().map_or_else(
+                || response.config_options.clone(),
+                |usage| usage.options(response.config_options.clone()),
+            ))
         })
     }
 
-    fn watch(&self, _cx: &mut App) -> Option<watch::Receiver<()>> {
+    fn watch(&self, cx: &mut App) -> Option<watch::Receiver<()>> {
+        if let Some(usage) = &self.native_usage {
+            let mut receiver = usage.receiver.clone();
+            let sender = self.watch_tx.clone();
+            *self.native_watch_task.borrow_mut() =
+                Some(cx.foreground_executor().spawn(async move {
+                    while receiver.recv().await.is_ok() {
+                        sender.borrow_mut().send(()).log_err();
+                    }
+                }));
+        }
         Some(self.watch_rx.clone())
     }
 }
