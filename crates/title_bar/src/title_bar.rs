@@ -1172,6 +1172,7 @@ impl TitleBar {
                     | Some(AutoUpdateStatus::Downloading { .. })
                     | Some(AutoUpdateStatus::Checking) => "Updating...",
                     Some(AutoUpdateStatus::Idle)
+                    | Some(AutoUpdateStatus::Available { .. })
                     | Some(AutoUpdateStatus::Errored { .. })
                     | None => "Please update Zed to Collaborate",
                 };

@@ -21,7 +21,13 @@ branch from our last tested commit, merge the chosen release, run relevant tests
 then switch only after a functional check. Keep the preceding tested build for rollback.
 Source availability, compilation, and a successful UI test are distinct verification stages.
 
-Initial backlog: notification-only stable-release checks; mouse-driven sent-message editing;
+The local updater checks stable release metadata at startup and once per hour while Zed
+is running (unless `auto_update` is disabled). A title-bar notice opens release notes;
+it never downloads or installs the official editor. No checks run while Zed is closed.
+Default application data paths use `ZedLocal`, with a separate Windows app identifier.
+The launcher still requires an explicit profile to keep experiments isolated from daily use.
+
+Initial backlog: mouse-driven sent-message editing;
 forking a conversation at a selected turn; preservation of the bounded restored UI history
 and weekly usage indicator provided by `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.

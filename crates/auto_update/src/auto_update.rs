@@ -123,6 +123,9 @@ pub struct AssetQuery<'a> {
 pub enum AutoUpdateStatus {
     Idle,
     Checking,
+    Available {
+        version: Version,
+    },
     Downloading {
         version: Version,
         /// Download progress as a fraction in the range `0.0..=1.0`, or `None`
@@ -147,6 +150,10 @@ impl PartialEq for AutoUpdateStatus {
         match (self, other) {
             (AutoUpdateStatus::Idle, AutoUpdateStatus::Idle) => true,
             (AutoUpdateStatus::Checking, AutoUpdateStatus::Checking) => true,
+            (
+                AutoUpdateStatus::Available { version: v1 },
+                AutoUpdateStatus::Available { version: v2 },
+            ) => v1 == v2,
             (
                 AutoUpdateStatus::Downloading { version: v1, .. },
                 AutoUpdateStatus::Downloading { version: v2, .. },
@@ -175,6 +182,7 @@ impl AutoUpdateStatus {
 
 pub struct AutoUpdater {
     status: AutoUpdateStatus,
+    notification_only: bool,
     current_version: Version,
     client: Arc<Client>,
     pending_poll: Option<Task<Option<()>>>,
@@ -273,12 +281,14 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
+        let poll_for_updates = paths::IS_LOCAL_FORK
+            || ReleaseChannel::try_global(cx)
+                .map(|channel| channel.poll_for_updates())
+                .unwrap_or(false);
 
-        if option_env!("ZED_UPDATE_EXPLANATION").is_none()
-            && env::var("ZED_UPDATE_EXPLANATION").is_err()
+        if (paths::IS_LOCAL_FORK
+            || (option_env!("ZED_UPDATE_EXPLANATION").is_none()
+                && env::var("ZED_UPDATE_EXPLANATION").is_err()))
             && poll_for_updates
         {
             let mut update_subscription = AutoUpdateSetting::get_global(cx)
@@ -303,9 +313,10 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
 }
 
 pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
-    if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
-        .map(ToOwned::to_owned)
-        .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
+    if !paths::IS_LOCAL_FORK
+        && let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
+            .map(ToOwned::to_owned)
+            .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
     {
         drop(window.prompt(
             gpui::PromptLevel::Info,
@@ -317,9 +328,10 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         return;
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
+    if !paths::IS_LOCAL_FORK
+        && !ReleaseChannel::try_global(cx)
+            .map(|channel| channel.poll_for_updates())
+            .unwrap_or(false)
     {
         return;
     }
@@ -433,7 +445,8 @@ impl AutoUpdater {
         // update helper instead of the app, so that it can overwrite the app
         // and then spawn the new binary.
         #[cfg(target_os = "windows")]
-        let quit_subscription = Some(cx.on_app_quit(|_, _| finalize_auto_update_on_quit()));
+        let quit_subscription =
+            (!paths::IS_LOCAL_FORK).then(|| cx.on_app_quit(|_, _| finalize_auto_update_on_quit()));
         #[cfg(not(target_os = "windows"))]
         let quit_subscription = None;
 
@@ -454,6 +467,7 @@ impl AutoUpdater {
 
         Self {
             status: AutoUpdateStatus::Idle,
+            notification_only: paths::IS_LOCAL_FORK,
             current_version,
             client,
             pending_poll: None,
@@ -481,6 +495,7 @@ impl AutoUpdater {
     }
 
     pub fn start_polling(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let notification_only = self.notification_only;
         let poll_interval =
             ReleaseChannel::try_global(cx).map_or(POLL_INTERVAL, |channel| match channel {
                 ReleaseChannel::Nightly => NIGHTLY_POLL_INTERVAL,
@@ -488,7 +503,7 @@ impl AutoUpdater {
             });
 
         cx.spawn(async move |this, cx| {
-            if cfg!(target_os = "windows") {
+            if cfg!(target_os = "windows") && !notification_only {
                 use util::ResultExt;
 
                 cleanup_windows()
@@ -498,7 +513,9 @@ impl AutoUpdater {
             }
 
             #[cfg(all(not(target_os = "windows"), not(test)))]
-            cx.background_spawn(cleanup_stale_installer_dirs()).detach();
+            if !notification_only {
+                cx.background_spawn(cleanup_stale_installer_dirs()).detach();
+            }
 
             loop {
                 this.update(cx, |this, cx| this.poll(UpdateCheckType::Automatic, cx))?;
@@ -524,6 +541,8 @@ impl AutoUpdater {
         }
         self.update_check_type = check_type;
 
+        let previous_status = self.status.clone();
+
         cx.notify();
 
         self.pending_poll = Some(cx.spawn(async move |this, cx| {
@@ -543,7 +562,10 @@ impl AutoUpdater {
                         // Be quiet if the check was automated (e.g. when offline)
                         UpdateCheckType::Automatic => {
                             log::info!("auto-update check failed: error:{:?}", error);
-                            AutoUpdateStatus::Idle
+                            match previous_status {
+                                AutoUpdateStatus::Available { .. } => previous_status,
+                                _ => AutoUpdateStatus::Idle,
+                            }
                         }
                         UpdateCheckType::Manual => {
                             log::error!("auto-update failed: error:{:?}", error);
@@ -731,17 +753,24 @@ impl AutoUpdater {
     }
 
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
-        let (client, installed_version, previous_status, release_channel) =
-            this.read_with(cx, |this, cx| {
+        let (client, installed_version, previous_status, release_channel, notification_only) = this
+            .read_with(cx, |this, cx| {
                 (
                     this.client.http_client(),
                     this.current_version.clone(),
                     this.status.clone(),
-                    ReleaseChannel::try_global(cx).unwrap_or(ReleaseChannel::Stable),
+                    if this.notification_only {
+                        ReleaseChannel::Stable
+                    } else {
+                        ReleaseChannel::try_global(cx).unwrap_or(ReleaseChannel::Stable)
+                    },
+                    this.notification_only,
                 )
             });
 
-        Self::check_dependencies()?;
+        if !notification_only {
+            Self::check_dependencies()?;
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Checking;
@@ -772,6 +801,17 @@ impl AutoUpdater {
             });
             return Ok(());
         };
+
+        // Return before creating installer directories or downloading executable code.
+        if notification_only {
+            this.update(cx, |this, cx| {
+                this.status = AutoUpdateStatus::Available {
+                    version: newer_version,
+                };
+                cx.notify();
+            });
+            return Ok(());
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Downloading {
@@ -1322,6 +1362,9 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
 }
 
 pub async fn finalize_auto_update_on_quit() {
+    if paths::IS_LOCAL_FORK {
+        return;
+    }
     let Some(installer_path) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.join("updates")))
@@ -1371,6 +1414,52 @@ mod tests {
 
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
+
+    #[gpui::test]
+    async fn test_local_fork_checks_stable_without_downloading(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let updater = cx.update(|cx| {
+            settings::init(cx);
+            let version = Version::new(1, 21, 0);
+            release_channel::init_test(version.clone(), ReleaseChannel::Dev, cx);
+            let requests = requests.clone();
+            let http = FakeHttpClient::create(move |request| {
+                requests.fetch_add(1, atomic::Ordering::SeqCst);
+                async move {
+                    anyhow::ensure!(
+                        request.uri().path() == "/releases/stable/latest/asset",
+                        "Notification-only updater attempted a download"
+                    );
+                    Ok(Response::builder().status(200).body(
+                        r#"{"version":"1.21.1","url":"https://test.example/must-not-download"}"#
+                            .into(),
+                    )?)
+                }
+            });
+            let client = Client::new(Arc::new(FakeSystemClock::new()), http, cx);
+            cx.new(|cx| AutoUpdater::new(version, client, cx))
+        });
+        assert!(updater.read_with(cx, |updater, _| updater.notification_only));
+        for _ in 0..2 {
+            let updater = updater.clone();
+            cx.spawn(async move |mut cx| AutoUpdater::update(updater, &mut cx).await)
+                .await
+                .expect("metadata check should succeed");
+        }
+        assert_eq!(requests.load(atomic::Ordering::SeqCst), 2);
+        let status = updater.read_with(cx, |updater, _| updater.status());
+        assert_eq!(
+            status,
+            AutoUpdateStatus::Available {
+                version: Version::new(1, 21, 1)
+            }
+        );
+        assert!(
+            !status.is_updated(),
+            "An available upstream release is not installed"
+        );
+    }
 
     #[gpui::test]
     fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
@@ -1432,6 +1521,8 @@ mod tests {
         });
 
         let auto_updater = cx.update(|cx| AutoUpdater::get(cx).expect("auto updater should exist"));
+
+        auto_updater.update(cx, |updater, _| updater.notification_only = false);
 
         cx.background_executor.run_until_parked();
 

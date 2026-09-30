@@ -21,7 +21,7 @@ foreach ($forbidden in $forbiddenDirectories) {
 $executable = Join-Path $BuildRoot "target\$Profile\zed.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Build Zed Local first.' }
 New-Item -ItemType Directory -Path $profileDirectory -Force | Out-Null
-# Keep a stock baseline from replacing itself via the official updater.
+# Also protect a stock baseline binary if the fork has not been built yet.
 $previousExplanation = $env:ZED_UPDATE_EXPLANATION
 try {
     $env:ZED_UPDATE_EXPLANATION = 'Local test build: installer updates are disabled. Merge and rebuild upstream releases instead.'
