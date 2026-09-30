@@ -7,6 +7,7 @@ use crate::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
+mod followups;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -590,6 +591,9 @@ pub struct ThreadView {
     pub thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
+    followup_cache: RefCell<
+        HashMap<gpui::EntityId, (SharedString, Entity<Markdown>, Vec<followups::Followup>)>,
+    >,
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
@@ -1010,6 +1014,7 @@ impl ThreadView {
             thread_retry_status: None,
             thread_error: None,
             thread_error_markdown: None,
+            followup_cache: RefCell::new(HashMap::default()),
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
@@ -6116,6 +6121,7 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        self.prepare_followups(cx);
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -6372,8 +6378,12 @@ impl ThreadView {
                                     }
 
                                     Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
+                                        self.render_followup_markdown(
+                                            md.clone(),
+                                            style.clone(),
+                                            cx,
+                                        )
+                                        .into_any_element(),
                                     )
                                 })
                             }
@@ -11588,6 +11598,109 @@ impl ThreadView {
                     .child(self.create_copy_button(error.to_string())),
             )
             .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn prepare_followups(&self, cx: &mut Context<Self>) {
+        let messages: Vec<_> = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .filter_map(|entry| {
+                if let AgentThreadEntry::AssistantMessage(message) = entry {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .flat_map(|message| message.chunks.iter())
+            .filter_map(|chunk| {
+                if let AssistantMessageChunk::Message { block, .. } = chunk {
+                    block.markdown().cloned()
+                } else {
+                    None
+                }
+            })
+            .filter(|markdown| markdown.read(cx).source().contains(":codex-followup["))
+            .take(64)
+            .collect();
+        let mut cache = self.followup_cache.borrow_mut();
+        cache.retain(|key, _| messages.iter().any(|markdown| markdown.entity_id() == *key));
+        for markdown in messages {
+            let source = markdown.read(cx).source().clone();
+            let key = markdown.entity_id();
+            if cache
+                .get(&key)
+                .is_some_and(|(cached, _, _)| cached == &source)
+            {
+                continue;
+            }
+            let (text, choices) = followups::extract(&source);
+            let registry = self.thread.read(cx).project().read(cx).languages().clone();
+            let rendered = cx.new(|cx| Markdown::new(text.into(), Some(registry), None, cx));
+            cache.insert(key, (source, rendered, choices));
+        }
+    }
+
+    fn render_followup_markdown(
+        &self,
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let source = markdown.read(cx).source().clone();
+        if !source.contains(":codex-followup[") {
+            return self.render_markdown(markdown, style, cx).into_any_element();
+        }
+        let cache = self.followup_cache.borrow();
+        let key = markdown.entity_id();
+        let Some((cached, rendered, choices)) = cache.get(&key) else {
+            return self.render_markdown(markdown, style, cx).into_any_element();
+        };
+        if cached != &source || choices.is_empty() {
+            return self.render_markdown(markdown, style, cx).into_any_element();
+        }
+        let disabled = self.thread.read(cx).status() != ThreadStatus::Idle
+            || self.is_loading_contents
+            || self.is_subagent()
+            || !self.message_editor.read(cx).is_empty(cx);
+        v_flex()
+            .gap_2()
+            .child(self.render_markdown(rendered.clone(), style, cx))
+            .children(choices.iter().enumerate().map(|(index, choice)| {
+                let prompt = choice.prompt.clone();
+                Button::new(("codex-followup", index), choice.label.clone())
+                    .disabled(disabled)
+                    .tooltip(Tooltip::text(if disabled {
+                        format!(
+                            "Wait for the agent and clear the draft before sending.\n{}",
+                            prompt
+                        )
+                    } else {
+                        prompt.clone()
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.thread.read(cx).status() != ThreadStatus::Idle
+                            || this.is_loading_contents
+                            || this.is_subagent()
+                            || !this.message_editor.read(cx).is_empty(cx)
+                        {
+                            return;
+                        }
+                        this.message_editor.update(cx, |editor, cx| {
+                            editor.set_message(
+                                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                    prompt.clone(),
+                                ))],
+                                window,
+                                cx,
+                            );
+                        });
+                        this.send(window, cx);
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn render_markdown(

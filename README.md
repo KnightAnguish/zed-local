@@ -55,6 +55,14 @@ preservation of the bounded restored UI history and weekly usage indicator provi
 `codex-acp-modern`. Chat forks share history up to
 the split, not subsequent messages; project files remain shared unless a worktree is chosen.
 
+Assistant responses also render standalone `:codex-followup[Label]{prompt="Text"}`
+lines as buttons below the response. Straight and smart quotes are supported. Hover shows
+the complete prompt; clicking uses the normal message send path. Buttons are disabled while
+the agent is busy, in subagent views, or while the composer contains a draft. Source history,
+copy/search text, code examples, and malformed/incomplete directives remain unchanged.
+Only the last 64 directive-bearing message chunks have an extra presentation cache.
+Inline directives embedded in prose are not converted. UI clicking remains to be verified.
+
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
