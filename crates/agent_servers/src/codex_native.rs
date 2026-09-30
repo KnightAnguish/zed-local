@@ -2,6 +2,7 @@
 //! Keep the legacy connector until the parity gates in NATIVE_CODEX.md pass.
 mod events;
 mod profiles;
+mod settings;
 mod transport;
 
 use acp_thread::{
@@ -32,6 +33,9 @@ struct Session {
     thread: WeakEntity<AcpThread>,
     active: Option<ActiveTurn>,
     uncertain: bool,
+    preferences: settings::Preferences,
+    settings_sender: Rc<RefCell<watch::Sender<()>>>,
+    settings_receiver: watch::Receiver<()>,
 }
 
 struct Approval {
@@ -59,6 +63,8 @@ pub(crate) struct NativeCodexConnection {
     event_task: RefCell<Option<Task<()>>>,
     profile_home: RefCell<Option<PathBuf>>,
     profile_override: RefCell<Option<String>>,
+    models: RefCell<Rc<Vec<settings::Model>>>,
+    quota: Rc<settings::Quota>,
 }
 
 impl NativeCodexConnection {
@@ -90,10 +96,13 @@ impl NativeCodexConnection {
         *connection.profile_home.borrow_mut() =
             Some(PathBuf::from(text(&initialized, "codexHome")?));
         *connection.profile_override.borrow_mut() = profile_override;
+        *connection.models.borrow_mut() = settings::catalog(&connection.rpc).await?;
+        cx.update(|cx| connection.quota.refresh(cx, false));
         Ok(connection)
     }
 
     fn from_rpc(rpc: Rpc, events: async_channel::Receiver<Event>, cx: &mut AsyncApp) -> Rc<Self> {
+        let quota = settings::Quota::new(rpc.clone());
         let connection = Rc::new(Self {
             rpc,
             sessions: Rc::new(RefCell::new(HashMap::new())),
@@ -101,6 +110,8 @@ impl NativeCodexConnection {
             event_task: RefCell::new(None),
             profile_home: RefCell::new(None),
             profile_override: RefCell::new(None),
+            models: RefCell::new(Rc::new(Vec::new())),
+            quota,
         });
         let weak = Rc::downgrade(&connection);
         *connection.event_task.borrow_mut() = Some(cx.spawn(async move |cx| {
@@ -117,6 +128,7 @@ impl NativeCodexConnection {
                 }
             }
             if let Some(connection) = weak.upgrade() {
+                connection.quota.invalidate("Codex disconnected");
                 connection.fail_active("Codex app-server disconnected. Reconnect before continuing; no turn was replayed.");
                 let approvals = std::mem::take(&mut *connection.approvals.borrow_mut());
                 for approval in approvals.into_values() { approval.cancel_ui(cx); }
@@ -137,6 +149,17 @@ impl NativeCodexConnection {
     }
 
     fn notification(&self, method: &str, params: Value, cx: &mut AsyncApp) -> Result<()> {
+        if method == "account/updated" {
+            self.quota.invalidate("Account changed");
+            cx.update(|cx| self.quota.refresh(cx, false));
+            return Ok(());
+        }
+        if method == "account/rateLimits/updated" {
+            // Rolling updates are sparse. Refetch the account snapshot instead of replacing
+            // complete weekly metadata with a possibly model-specific/partial window.
+            cx.update(|cx| self.quota.refresh(cx, false));
+            return Ok(());
+        }
         if method == "serverRequest/resolved" {
             if let Some(id) = params.get("requestId") {
                 let approval = self.approvals.borrow_mut().remove(&id.to_string());
@@ -183,6 +206,7 @@ impl NativeCodexConnection {
                 }
             }
             if method == "turn/completed" {
+                cx.update(|cx| self.quota.refresh(cx, false));
                 if let Some(active) = session.active.take() {
                     let _ = active.completion.send(events::turn_result(&params));
                 }
@@ -363,6 +387,8 @@ impl NativeCodexConnection {
             "thread/start"
         };
         let response = self.rpc.request(method, params).await?;
+        let preferences =
+            settings::Preferences::from_response(self.models.borrow().clone(), &response)?;
         let id = acp::SessionId::new(text(&response["thread"], "id")?);
         if response["thread"]["status"]["type"].as_str() == Some("active") {
             self.rpc
@@ -412,12 +438,16 @@ impl NativeCodexConnection {
                 }
             }
         }
+        let (settings_sender, settings_receiver) = watch::channel(());
         self.sessions.borrow_mut().insert(
             id,
             Session {
                 thread: thread.downgrade(),
                 active: None,
                 uncertain: false,
+                preferences,
+                settings_sender: Rc::new(RefCell::new(settings_sender)),
+                settings_receiver,
             },
         );
         Ok(thread)
@@ -440,6 +470,7 @@ mod tests {
         let project = Project::test(fs, [], cx).await;
         let (rpc, peer, events) = Rpc::fake(cx.background_executor.clone());
         let connection = NativeCodexConnection::from_rpc(rpc, events, &mut cx.to_async());
+        *connection.models.borrow_mut() = Rc::new(serde_json::from_value(json!([{"model":"a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"balanced"},{"reasoningEffort":"high","description":"deep"}],"defaultReasoningEffort":"medium","serviceTiers":[{"id":"fast"}]}])).unwrap());
         let open = cx.update(|cx| {
             connection
                 .clone()
@@ -452,9 +483,66 @@ mod tests {
         let start = peer.next().await;
         assert_eq!(start["method"], "thread/start");
         assert_eq!(start["params"]["sandbox"], "read-only");
-        peer.send(json!({"id":start["id"],"result":{"thread":{"id":"session"}}}))
+        peer.send(json!({"id":start["id"],"result":{"thread":{"id":"session"},"model":"a","reasoningEffort":"medium","serviceTier":null}}))
             .await;
         (connection, peer, open.await.unwrap())
+    }
+
+    #[gpui::test]
+    async fn settings_reach_only_next_turn_and_cannot_change_active_turn(cx: &mut TestAppContext) {
+        let (connection, peer, _thread) = session(cx).await;
+        let id = acp::SessionId::new("session");
+        let options = cx
+            .update(|cx| connection.session_config_options(&id, cx))
+            .unwrap();
+        let quota = peer.next().await;
+        assert_eq!(quota["method"], "account/rateLimits/read");
+        peer.send(json!({"id":quota["id"],"result":{}})).await;
+        for (key, value) in [
+            (
+                "reasoning-effort",
+                acp::SessionConfigOptionValue::from("high"),
+            ),
+            ("mode", "agent-full-access".into()),
+            ("fast-mode", true.into()),
+        ] {
+            cx.update(|cx| options.set_config_option(acp::SessionConfigId::new(key), value, cx))
+                .await
+                .unwrap();
+        }
+        let prompt = cx.update(|cx| {
+            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+        });
+        let request = peer.next().await;
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(request["params"]["effort"], "high");
+        assert_eq!(request["params"]["serviceTier"], "fast");
+        assert_eq!(
+            request["params"]["sandboxPolicy"]["type"],
+            "dangerFullAccess"
+        );
+        assert!(
+            cx.update(|cx| options.set_config_option(
+                acp::SessionConfigId::new("mode"),
+                "native-read-only".into(),
+                cx
+            ))
+            .await
+            .is_err()
+        );
+        peer.send(json!({"id":request["id"],"result":{"turn":{"id":"turn"}}}))
+            .await;
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        prompt.await.unwrap();
+        assert!(
+            cx.update(|cx| options.set_config_option(
+                acp::SessionConfigId::new("mode"),
+                "native-read-only".into(),
+                cx
+            ))
+            .await
+            .is_ok()
+        );
     }
 
     #[gpui::test]
@@ -648,6 +736,7 @@ impl AgentConnection for NativeCodexConnection {
                 "Previous Codex operation has an unknown outcome; reconnect before sending another turn"
             )));
         }
+        let turn_params = session.preferences.turn_params(&params.session_id, input);
         session.active = Some(ActiveTurn {
             id: None,
             completion,
@@ -657,13 +746,7 @@ impl AgentConnection for NativeCodexConnection {
         let rpc = self.rpc.clone();
         let sessions = self.sessions.clone();
         cx.spawn(async move |_| {
-            let response = match rpc
-                .request(
-                    "turn/start",
-                    json!({"threadId":params.session_id,"input":input}),
-                )
-                .await
-            {
+            let response = match rpc.request("turn/start", turn_params).await {
                 Ok(response) => response,
                 Err(error) => {
                     if let Some(session) = sessions.borrow_mut().get_mut(&params.session_id) {
@@ -746,11 +829,98 @@ impl AgentConnection for NativeCodexConnection {
             id: id.clone(),
         }))
     }
+    fn session_config_options(
+        &self,
+        id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
+        let sessions = self.sessions.borrow();
+        let session = sessions.get(id)?;
+        self.quota.refresh(cx, false);
+        Some(Rc::new(ConfigOptions {
+            sessions: Rc::downgrade(&self.sessions),
+            id: id.clone(),
+            quota: self.quota.clone(),
+            sender: session.settings_sender.clone(),
+            receiver: session.settings_receiver.clone(),
+            quota_watch: RefCell::new(None),
+        }))
+    }
     fn session_list(&self, _: &mut App) -> Option<Rc<dyn AgentSessionList>> {
         Some(Rc::new(SessionList(self.rpc.clone())))
     }
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
+    }
+}
+
+struct ConfigOptions {
+    sessions: std::rc::Weak<RefCell<HashMap<acp::SessionId, Session>>>,
+    id: acp::SessionId,
+    quota: Rc<settings::Quota>,
+    sender: Rc<RefCell<watch::Sender<()>>>,
+    receiver: watch::Receiver<()>,
+    quota_watch: RefCell<Option<Task<()>>>,
+}
+impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
+    fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+        let mut options = self
+            .sessions
+            .upgrade()
+            .and_then(|sessions| {
+                sessions
+                    .borrow()
+                    .get(&self.id)
+                    .map(|session| session.preferences.options())
+            })
+            .unwrap_or_default();
+        options.push(self.quota.option());
+        options
+    }
+    fn set_config_option(
+        &self,
+        id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut App,
+    ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
+        let result = (|| {
+            if id.0.as_ref() == "weekly-usage" {
+                ensure!(
+                    value
+                        .as_value_id()
+                        .is_some_and(|value| matches!(value.0.as_ref(), "refresh" | "status")),
+                    "Invalid quota action"
+                );
+                self.quota.refresh(cx, true);
+            } else {
+                let sessions = self
+                    .sessions
+                    .upgrade()
+                    .context("Codex connection was closed")?;
+                let mut sessions = sessions.borrow_mut();
+                let session = sessions
+                    .get_mut(&self.id)
+                    .context("Codex session was closed")?;
+                ensure!(
+                    session.active.is_none() && !session.uncertain,
+                    "Stop the turn or reconnect before changing Codex settings"
+                );
+                session.preferences.change(id.0.as_ref(), &value)?;
+            }
+            self.sender.borrow_mut().send(()).log_err();
+            Ok(self.config_options())
+        })();
+        Task::ready(result)
+    }
+    fn watch(&self, cx: &mut App) -> Option<watch::Receiver<()>> {
+        let mut receiver = self.quota.receiver.clone();
+        let sender = self.sender.clone();
+        *self.quota_watch.borrow_mut() = Some(cx.foreground_executor().spawn(async move {
+            while receiver.recv().await.is_ok() {
+                sender.borrow_mut().send(()).log_err();
+            }
+        }));
+        Some(self.receiver.clone())
     }
 }
 

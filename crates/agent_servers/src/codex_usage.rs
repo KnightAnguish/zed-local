@@ -104,7 +104,7 @@ impl NativeUsage {
     }
 }
 
-fn usage_option(
+pub(crate) fn usage_option(
     response: Option<&Value>,
     error: Option<&str>,
     now: i64,

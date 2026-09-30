@@ -412,7 +412,9 @@ mod tests {
             rpc.request("account/rateLimits/read", json!({}))
         );
         assert!(!crate::codex_history::decode_page(history.unwrap(), None).unwrap().messages.is_empty());
-        assert!(models.unwrap()["data"].is_array());
+        let models = models.unwrap();
+        let catalog: Vec<crate::codex_native::settings::Model> = serde_json::from_value(models["data"].clone()).expect("installed model catalog schema");
+        assert!(!catalog.is_empty());
         let usage = usage.unwrap();
         assert!(usage.get("rateLimits").is_some() || usage.get("rateLimitsByLimitId").is_some());
         drop(drain);

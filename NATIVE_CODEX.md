@@ -34,8 +34,9 @@ chat database, installed editor, or adapter bundle is changed by these sources.
   No second registry, no config writes, no automatically reenabled skill. Invalid
   profiles fail visibly. `CODEX_ACP_SKILL_PROFILES=off`/explicit path preserved.
 
-The candidate deliberately uses a read-only sandbox until permission-mode/settings
-parity is implemented. Do not silently route a user's Full Access session to it.
+The candidate opens with a read-only sandbox; explicit permission-mode selection now
+changes subsequent turns. Import of Zed's saved defaults is still pending. Do not
+silently route a user's Full Access session to it.
 Unknown server requests are rejected, never accepted automatically. Unsupported prompt
 attachments fail explicitly rather than disappearing from a submitted prompt.
 
@@ -49,8 +50,8 @@ attachments fail explicitly rather than disappearing from a submitted prompt.
 | Permissions | Command/file allow-once/reject/cancel UI | Full decision contract, server resolution cleanup, permission profile requests, structured questions, MCP elicitations/auth |
 | Tools | Basic tool lifecycle and completed text output | Terminal streaming/lifetime/output bounds, structured file diffs/action log, MCP output, plans/compaction, subagents/background tasks |
 | Skills | Existing registry/catalog/cache merge ported; policy unit tests | Real project profile comparison against adapter; skill mention/completion; multi-root and project MCP bridge |
-| Settings | Not implemented | Model catalog/pagination, model/effort/fast/collaboration/modes, per-session persistence and defaults |
-| Quota | Existing native reader remains in old connector | Connect weekly indicator to persistent native RPC, refresh/watch and account-change invalidation |
+| Settings | Paginated catalog, per-session model/effort/Fast/permissions, next-turn overrides, UI watches | Collaboration mode, saved picker choices before a turn, Zed defaults, server-settings reconciliation and GUI tests |
+| Quota | Persistent native RPC, shared formatter, refresh/watch, account/disconnect invalidation | Native GUI smoke and sustained reconnect tests |
 | Auth/provider | Existing account checked through RPC | Login/logout browser/terminal flows, token refresh, gateway/custom providers; do not expose credentials |
 | Forks/edit | Not advertised by replacement | Full fork, message-boundary resolution, empty first-message fork/revert, stable user IDs, grouped variants regression tests |
 | Attachments | Text and inline-image input | Resource/embedded/skill/audio inputs; generated images/artifacts and historical input restoration |
@@ -101,3 +102,30 @@ local stdio transport. Rewriting this layer does not prove that warning is fixed
   This checkpoint is not a claim of complete replacement or an active deployment.
 - Full Windows dev build passed (`script/local-build.ps1 -Jobs 6`, 1m07s).
   Formatting and `git diff --check` passed. The binary was not installed or launched.
+
+## Settings and quota checkpoint (2026-09-30)
+
+- Native connection obtains the paginated server model catalog; effort options and Fast
+  support are discovered, not hard-coded. Cursor cycles/duplicate IDs/excessive lists fail.
+  Changing model preserves compatible effort or uses its reported default, and clears
+  unsupported Fast. Unknown saved models remain visible rather than silently substituted.
+- Settings belong to each session and are snapshotted into `turn/start`; changing them
+  during an active/uncertain turn fails. Full access requires explicit mode selection.
+  Leaving permission selection on "Keep server permissions" sends no permission override.
+  This is not a migration of the old adapter's default or unsent per-chat preferences:
+  pending picker choices are currently memory-only until a turn uses them. Collaboration
+  mode is intentionally not guessed from outdated docs; installed 0.159.2 TurnStartParams
+  does not expose the older collaborationMode field. No global config is written.
+- Weekly percentage uses the same persistent RPC and existing tested formatter. Automatic
+  refresh is throttled to 60 seconds; manual refresh to 2 seconds; overlapping refreshes
+  coalesce. Refresh on connect, option retrieval, turn completion and rate-limit events.
+  Account changes/disconnect clear cached data and cancel requests; generations prevent
+  old-account replies from repopulating the indicator. No new subprocess or timer polling.
+- All 65 agent_servers tests passed (2 live probes ignored by default), including eight
+  new tests for model compatibility, next-turn parameter wiring, active-turn guards,
+  catalog pagination, quota throttling and late old-account replies. Actual server turn
+  generation, GUI controls and durable preference restoration remain unverified.
+- OpenAI Docs app-server documentation was consulted; model capabilities are server-owned.
+  Installed runtime schemas take precedence where current documentation differs.
+- Updated real-runtime read-only probe passed in 0.84 s, including model type validation.
+  Full Windows dev build passed in 52.42 s. No production switch or manual GUI test.
