@@ -22,7 +22,13 @@ try {
     $env:CARGO_TARGET_DIR = Join-Path $buildDirectory 'target'
     $env:CARGO_HOME = Join-Path $buildDirectory 'cargo-home'
     $env:CARGO_BUILD_JOBS = "$Jobs"
-    & (Join-Path $visualStudio 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+    $toolchain = Get-ChildItem (Join-Path $visualStudio 'VC\Tools\MSVC') -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName 'lib\spectre\x64\libcmt.lib') } |
+        Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+    if (-not $toolchain) { throw 'Visual Studio x64 Spectre libraries are required.' }
+    # Explicit selection avoids a machine-specific default selecting an older toolchain without Spectre libraries.
+    Import-Module (Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+    Enter-VsDevShell -VsInstallPath $visualStudio -SkipAutomaticLocation -DevCmdArguments "-arch=amd64 -host_arch=amd64 -vcvars_ver=$($toolchain.Name)"
     & cargo build --locked -p zed --profile $Profile
     if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)." }
 } finally {

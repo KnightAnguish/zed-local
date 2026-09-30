@@ -16,6 +16,11 @@ isolated user-data directory and refuses the official Zed profile. The official 
 and its settings/databases must not be overwritten. Do not copy live databases as ordinary
 files: migrate using a consistent backup only after the user agrees to switch.
 
+The binary is `zedlocal.exe`. Building on Windows requires the x64 Spectre libraries;
+the local build script selects an installed MSVC toolchain containing them without
+changing the machine-wide compiler default. Do not share the same Cargo target directory
+between worktrees with different source revisions; use a separate `-BuildRoot` for experiments.
+
 Update workflow: fetch upstream, inspect the stable release changes, create a candidate
 branch from our last tested commit, merge the chosen release, run relevant tests/build,
 then switch only after a functional check. Keep the preceding tested build for rollback.

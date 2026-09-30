@@ -18,7 +18,7 @@ foreach ($forbidden in $forbiddenDirectories) {
         throw 'Use a separate profile directory, not the official Zed profile or a broad directory.'
     }
 }
-$executable = Join-Path $BuildRoot "target\$Profile\zed.exe"
+$executable = Join-Path $BuildRoot "target\$Profile\zedlocal.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Build Zed Local first.' }
 New-Item -ItemType Directory -Path $profileDirectory -Force | Out-Null
 # Also protect a stock baseline binary if the fork has not been built yet.
