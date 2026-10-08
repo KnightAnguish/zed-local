@@ -1989,6 +1989,7 @@ impl MessageContent {
             let render = ContentBlock::render_from_source(block, language_registry, cx);
             let source_index = match render {
                 RenderBlock::EmbeddedResource { .. }
+                | RenderBlock::ResourceLink
                 | RenderBlock::Unsupported { .. }
                 | RenderBlock::Image { .. } => Some(self.source_blocks.len()),
                 _ => None,
@@ -10184,7 +10185,16 @@ mod tests {
                 cx,
             );
             assert_eq!(content.blocks().len(), 1);
-            assert!(content.blocks().next().unwrap().resource_link().is_some());
+            assert_eq!(
+                content
+                    .blocks()
+                    .next()
+                    .unwrap()
+                    .resource_link()
+                    .unwrap()
+                    .uri,
+                "file:///C:/test.png"
+            );
             thread.push_user_content_block_from_agent(
                 Some(acp_v1::MessageId::new("tail")),
                 "tail".into(),
