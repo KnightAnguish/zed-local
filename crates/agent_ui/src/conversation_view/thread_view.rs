@@ -1479,8 +1479,9 @@ impl ThreadView {
             return false;
         };
         !self.is_subagent()
-            && thread.supports_truncate(cx)
-            && message.client_id.is_some()
+            && ((thread.supports_truncate(cx) && message.client_id.is_some())
+                || (thread.connection().supports_message_fork()
+                    && message.identity.legacy_id().is_some()))
             && message
                 .content
                 .source_blocks()
@@ -1983,7 +1984,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_switch_variant(cx) || self.is_subagent() {
+        if !self.can_switch_variant(cx) || !self.can_edit_user_message(index, cx) {
             return;
         }
         let Some(message) = self
