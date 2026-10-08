@@ -278,14 +278,15 @@ impl EntryViewState {
                     // block new content, nor should unchanged content reset their selection.
                     let was_read_only = editor.read(cx).editor().read(cx).read_only(cx);
                     // Native edits are enabled explicitly by the pencil action, not by checkpoint support.
-                    let is_editable = is_editable
-                        || (!was_read_only
-                            && thread.read(cx).connection().supports_message_fork()
-                            && message.identity.legacy_id().is_some()
-                            && !is_subagent
-                            && source_is_representable);
+                    let native_edit = !was_read_only
+                        && thread.read(cx).connection().supports_message_fork()
+                        && message.identity.legacy_id().is_some()
+                        && !is_subagent
+                        && source_is_representable;
+                    let is_editable = is_editable || native_edit;
                     let refreshed_source = ((!was_read_only
                         || *synced_source_version != source_version)
+                        && !native_edit
                         && (!is_editable || !editor.focus_handle(cx).is_focused(window)))
                     .then(|| source_blocks.to_vec());
                     editor.update(cx, |editor, cx| editor.set_read_only(!is_editable, cx));
