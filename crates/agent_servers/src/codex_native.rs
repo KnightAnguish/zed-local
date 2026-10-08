@@ -470,9 +470,12 @@ impl NativeCodexConnection {
                     json!({"threadId":id,"limit":20,"sortDirection":"desc","itemsView":"summary"}),
                 )
                 .await?;
-                Some(cx.background_spawn(async move {
-                    crate::codex_history::decode_page(response, None)
-                }).await?)
+                Some(
+                    cx.background_spawn(async move {
+                        crate::codex_history::decode_page(response, None)
+                    })
+                    .await?,
+                )
             } else {
                 None
             };
@@ -782,7 +785,7 @@ mod tests {
             let acp_thread::AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
                 panic!("user message expected");
             };
-            assert_eq!(message.protocol_id.as_ref().unwrap().0.as_ref(), "user-id");
+            assert_eq!(message.identity.legacy_id().unwrap().0.as_ref(), "user-id");
         });
     }
 
@@ -817,8 +820,8 @@ mod tests {
             let acp_thread::AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
                 panic!("user message expected")
             };
-            assert_eq!(message.protocol_id.as_ref().unwrap().0.as_ref(), "user-id");
-            assert_eq!(message.chunks, vec!["hello".into()]);
+            assert_eq!(message.identity.legacy_id().unwrap().0.as_ref(), "user-id");
+            assert_eq!(message.content.source_blocks(), &["hello".into()]);
         });
     }
 
