@@ -1540,7 +1540,9 @@ impl ThreadView {
                 });
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Focus) => {
-                if self.can_edit_user_message(event.entry_index, cx) {
+                if !self.thread.read(cx).connection().supports_message_fork()
+                    && self.can_edit_user_message(event.entry_index, cx)
+                {
                     self.editing_message = Some(event.entry_index);
                     cx.notify();
                 }
@@ -1548,6 +1550,7 @@ impl ThreadView {
             ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::LostFocus) => {
                 if let Some(AgentThreadEntry::UserMessage(user_message)) =
                     self.thread.read(cx).entries().get(event.entry_index)
+                    && !self.thread.read(cx).connection().supports_message_fork()
                     && self.can_edit_user_message(event.entry_index, cx)
                 {
                     if editor.read(cx).text(cx).as_str() == user_message.content.to_markdown(cx) {
