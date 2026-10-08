@@ -9,6 +9,7 @@ use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
 mod followups;
 mod history_window;
+mod local_html_links;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -1706,10 +1707,75 @@ impl ThreadView {
     }
 
     pub fn can_switch_variant(&self, cx: &App) -> bool {
+        self.editing_message.is_none() && self.can_prepare_variant(cx)
+    }
+
+    pub(crate) fn can_prepare_variant(&self, cx: &App) -> bool {
         self.thread.read(cx).status() == ThreadStatus::Idle
             && !self.is_loading_contents
             && !self.has_queued_messages()
             && self.message_editor.read(cx).is_empty(cx)
+    }
+
+    pub(crate) fn begin_message_edit(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_switch_variant(cx) || self.is_subagent() {
+            return;
+        }
+        let Some(message) = self
+            .thread
+            .read(cx)
+            .entries()
+            .get(index)
+            .and_then(|entry| entry.user_message())
+        else {
+            return;
+        };
+        if !self.thread.read(cx).connection().supports_message_fork()
+            || message.protocol_id.is_none()
+            || message.chunks.iter().any(|chunk| {
+                matches!(chunk,
+                acp::ContentBlock::ResourceLink(link) if link.meta.as_ref()
+                    .and_then(|meta| meta.get("zedHistoryImage"))
+                    .and_then(serde_json::Value::as_bool) == Some(true))
+            })
+        {
+            return;
+        }
+        let Some(editor) = self
+            .entry_view_state
+            .read(cx)
+            .entry(index)
+            .and_then(|entry| entry.message_editor())
+            .cloned()
+        else {
+            return;
+        };
+        self.editing_message = Some(index);
+        editor.update(cx, |editor, cx| editor.set_read_only(false, cx));
+        editor.focus_handle(cx).focus(window, cx);
+        self.scroll_to_user_message_index(Some(index), cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_variant_loading(&mut self, loading: bool, cx: &mut Context<Self>) {
+        self.is_loading_contents = loading;
+        if let Some(index) = self.editing_message
+            && self.thread.read(cx).connection().supports_message_fork()
+            && let Some(editor) = self
+                .entry_view_state
+                .read(cx)
+                .entry(index)
+                .and_then(|entry| entry.message_editor())
+                .cloned()
+        {
+            editor.update(cx, |editor, cx| editor.set_read_only(loading, cx));
+        }
+        cx.notify();
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2249,6 +2315,48 @@ impl ThreadView {
         }
         let thread = self.thread.clone();
 
+        if thread.read(cx).connection().supports_message_fork() {
+            if self.editing_message != Some(entry_ix) || !self.can_prepare_variant(cx) {
+                return;
+            }
+            let Some(message_id) = thread
+                .read(cx)
+                .entries()
+                .get(entry_ix)
+                .and_then(|entry| entry.user_message())
+                .and_then(|message| message.protocol_id.clone())
+            else {
+                return;
+            };
+            if message_editor.read(cx).is_empty(cx) {
+                return;
+            }
+            let contents = self.resolve_message_contents(&message_editor, cx);
+            self.set_variant_loading(true, cx);
+            cx.spawn(async move |this, cx| {
+                let result = contents.await;
+                this.update(cx, |this, cx| {
+                    this.set_variant_loading(false, cx);
+                    match result {
+                        Ok((blocks, _)) if !blocks.is_empty() => {
+                            cx.emit(AcpThreadViewEvent::ForkMessage {
+                                point: acp_thread::SessionForkPoint {
+                                    message_id,
+                                    before: true,
+                                },
+                                draft: Some(blocks),
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => this.handle_thread_error(error, cx),
+                    }
+                    cx.notify();
+                })
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
         let Some(client_id) = thread.update(cx, |thread, _| {
             thread
                 .entries()
@@ -2690,6 +2798,9 @@ impl ThreadView {
     }
 
     pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_loading_contents {
+            return;
+        }
         if let Some(index) = self.editing_message.take()
             && let Some(editor) = &self
                 .entry_view_state
@@ -2699,6 +2810,9 @@ impl ThreadView {
                 .cloned()
         {
             editor.update(cx, |editor, cx| {
+                if self.thread.read(cx).connection().supports_message_fork() {
+                    editor.set_read_only(true, cx);
+                }
                 if let Some(user_message) = self
                     .thread
                     .read(cx)
@@ -6447,7 +6561,10 @@ impl ThreadView {
 
                 let is_subagent = self.is_subagent();
                 let can_rewind = self.thread.read(cx).supports_truncate(cx);
-                let is_editable = can_rewind && message.client_id.is_some() && !is_subagent;
+                let native_edit =
+                    editing && self.thread.read(cx).connection().supports_message_fork();
+                let is_editable =
+                    (native_edit || (can_rewind && message.client_id.is_some())) && !is_subagent;
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -6522,12 +6639,16 @@ impl ThreadView {
                                     })
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
-                                    .children(message.chunks.iter().filter_map(|chunk| match chunk {
+                                    .child(crate::chat_image_previews::image_row().children(message.chunks.iter().filter_map(|chunk| match chunk {
                                         acp::ContentBlock::ResourceLink(link) if link.meta.as_ref().and_then(|meta| meta.get("zedHistoryImage")).and_then(serde_json::Value::as_bool) == Some(true) => Some(self.render_resource_link(link, cx)),
+                                        acp::ContentBlock::Image(image) => image.uri.as_deref()
+                                            .and_then(|uri| url::Url::parse(uri).ok())
+                                            .and_then(|uri| uri.to_file_path().ok())
+                                            .map(|path| crate::chat_image_previews::ChatImagePreview::new(path.to_string_lossy().into_owned(), Vec::new()).attachment().into_any_element()),
                                         _ => None,
-                                    }))
+                                    })))
                             )
-                            .when(editor_focus, |this| {
+                            .when(native_edit || (editor_focus && !self.thread.read(cx).connection().supports_message_fork()), |this| {
                                 let base_container = h_flex()
                                     .absolute()
                                     .top_neg_3p5()
@@ -6562,7 +6683,7 @@ impl ThreadView {
                                                         .icon_color(Color::Muted)
                                                         .icon_size(IconSize::XSmall)
                                                         .tooltip(Tooltip::text(
-                                                            "Editing will restart the thread from this point."
+                                                            "Send edited message; native Codex keeps the original variant."
                                                         ))
                                                         .on_click(cx.listener({
                                                             let editor = editor.clone();
@@ -6803,67 +6924,6 @@ impl ThreadView {
 
         let is_turn_end = Self::entry_is_finalized_turn_end(thread.read(cx).entries(), entry_ix)
             .unwrap_or(!is_generating);
-
-        let fork_point = if thread.read(cx).status() == ThreadStatus::Idle
-            && !self.is_subagent()
-            && thread.read(cx).connection().supports_message_fork()
-        {
-            match entry {
-                AgentThreadEntry::UserMessage(message) if !message.chunks.iter().any(|chunk| matches!(chunk,
-                    acp::ContentBlock::ResourceLink(link) if link.meta.as_ref().and_then(|meta| meta.get("zedHistoryImage")).and_then(serde_json::Value::as_bool) == Some(true)
-                )) => {
-                    message.protocol_id.clone().map(|message_id| {
-                        (
-                            acp_thread::SessionForkPoint {
-                                message_id,
-                                before: true,
-                            },
-                            Some(message.chunks.clone()),
-                        )
-                    })
-                }
-                AgentThreadEntry::AssistantMessage(message) if is_turn_end => {
-                    message.chunks.iter().rev().find_map(|chunk| {
-                        if let acp_thread::AssistantMessageChunk::Message {
-                            id: Some(message_id),
-                            ..
-                        } = chunk
-                        {
-                            Some((
-                                acp_thread::SessionForkPoint {
-                                    message_id: message_id.clone(),
-                                    before: false,
-                                },
-                                None,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let primary = if let Some((point, draft)) = fork_point {
-            let label = if point.before {
-                "Edit Message"
-            } else {
-                "New Variant After Reply"
-            };
-            v_flex().w_full().child(primary).child(
-                h_flex().justify_end().child(
-                    Button::new(("fork-message", entry_ix), label)
-                        .tooltip(Tooltip::text("Creates another variant in this chat. History is preserved; files are not rolled back."))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(AcpThreadViewEvent::ForkMessage { point: point.clone(), draft: draft.clone() });
-                        })),
-                ),
-            ).into_any_element()
-        } else {
-            primary
-        };
 
         let primary = if is_turn_end && !assistant_message_is_blank {
             let user_message_index = thread
@@ -7158,6 +7218,63 @@ impl ThreadView {
                 }))
         });
 
+        let can_fork = thread.read(cx).status() == ThreadStatus::Idle
+            && !self.is_subagent()
+            && thread.read(cx).connection().supports_message_fork();
+        let entries = thread.read(cx).entries();
+        let prompt_index = user_message_index.or_else(|| {
+            entries
+                .iter()
+                .take(entry_ix + 1)
+                .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+        });
+        let edit_button = can_fork.then(|| prompt_index).flatten().and_then(|index| {
+            let AgentThreadEntry::UserMessage(message) = entries.get(index)? else {
+                return None;
+            };
+            if message.chunks.iter().any(|chunk| {
+                matches!(chunk,
+                    acp::ContentBlock::ResourceLink(link) if link.meta.as_ref()
+                        .and_then(|meta| meta.get("zedHistoryImage"))
+                        .and_then(serde_json::Value::as_bool) == Some(true)
+                )
+            }) {
+                return None;
+            }
+            message.protocol_id.as_ref()?;
+            Some(
+                IconButton::new(("edit-message", entry_ix), IconName::Pencil)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text(
+                        "Edit User Message — a new variant is created only when you send",
+                    ))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_message_edit(index, window, cx);
+                    })),
+            )
+        });
+        let branch_button = can_fork.then(|| copy_response_index).flatten().and_then(|index| {
+            if Self::entry_is_finalized_turn_end(entries, index) == Some(false) {
+                return None;
+            }
+            let AgentThreadEntry::AssistantMessage(message) = entries.get(index)? else {
+                return None;
+            };
+            let message_id = message.chunks.iter().rev().find_map(|chunk| match chunk {
+                acp_thread::AssistantMessageChunk::Message { id: Some(id), .. } => Some(id.clone()),
+                _ => None,
+            })?;
+            let point = acp_thread::SessionForkPoint { message_id, before: false };
+            Some(IconButton::new(("branch-message", entry_ix), IconName::GitBranch)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("New Variant After This Reply — history is preserved; files are not rolled back"))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(AcpThreadViewEvent::ForkMessage { point: point.clone(), draft: None });
+                })))
+        });
+
         let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
 
         let last_turn_clock = show_stats
@@ -7277,6 +7394,8 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
+            .when_some(edit_button, |this, button| this.child(button))
+            .when_some(branch_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
@@ -7786,11 +7905,18 @@ impl ThreadView {
                 .filter(|(_, block)| block.visible_content(cx))
                 .map(|(block_ix, block)| {
                     let content = if let Some(markdown) = block.markdown() {
-                        self.render_followup_markdown(
-                            markdown.clone(),
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                            cx,
-                        )
+                        v_flex()
+                            .child(self.render_followup_markdown(
+                                markdown.clone(),
+                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                cx,
+                            ))
+                            .child(crate::chat_image_previews::image_row().children(crate::chat_image_previews::image_links(markdown.read(cx)).into_iter().map(|path| {
+                                crate::chat_image_previews::ChatImagePreview::new(
+                                    path, self.code_span_resolver.worktree_roots(cx),
+                                )
+                            })))
+                            .into_any_element()
                     } else {
                         self.render_output_content_block(
                             entry_ix, block_ix, block, None, false, window, cx,
@@ -8006,7 +8132,9 @@ impl ThreadView {
                     menu.when_some(focus, |menu, focus| menu.context(focus))
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()));
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    link_clipboard_text(&url),
+                                ));
                             })
                             .separator()
                         })
@@ -8122,6 +8250,70 @@ impl ThreadView {
         }
 
         has_running_terminal_call
+    }
+
+    fn render_compact_command(
+        &self,
+        group: SharedString,
+        tool_call: &ToolCall,
+        is_open: bool,
+        needs_confirmation: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let status = match tool_call.status {
+            ToolCallStatus::Pending => "Pending",
+            ToolCallStatus::InProgress => "Running",
+            ToolCallStatus::Completed => "Done",
+            ToolCallStatus::Failed => "Failed",
+            ToolCallStatus::Canceled | ToolCallStatus::Rejected => "Canceled",
+            ToolCallStatus::WaitingForConfirmation { .. } => "Permission required",
+        };
+        v_flex()
+            .child(
+                h_flex()
+                    .group(&group)
+                    .w_full()
+                    .justify_between()
+                    .p_0p5()
+                    .rounded_t(rems_from_px(5_f32))
+                    .bg(self.tool_card_header_bg(cx))
+                    .child(
+                        h_flex()
+                            .h(window.line_height() - px(2.))
+                            .px_1()
+                            .gap_1p5()
+                            .child(Icon::new(IconName::ToolTerminal)
+                                .size(IconSize::Small).color(Color::Muted))
+                            .child(Label::new("Run Command").size(LabelSize::Small)),
+                    )
+                    .child(
+                        h_flex().pr_0p5().gap_1()
+                            .child(Label::new(status).size(LabelSize::XSmall).color(
+                                if matches!(tool_call.status, ToolCallStatus::Failed) {
+                                    Color::Error
+                                } else { Color::Muted }
+                            ))
+                            .when(!needs_confirmation, |this| this.child(
+                                Disclosure::new(group.clone(), is_open)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown)
+                                    .on_click(cx.listener({
+                                        let id = tool_call.id.clone();
+                                        move |this, _, window, cx| {
+                                            this.entry_view_state.update(cx, |state, _| {
+                                    state.toggle_tool_call_expansion(&id);
+                                });
+                                this.refresh_thread_search(window, cx);
+                                            cx.notify();
+                                        }
+                                    }))
+                            )),
+                    ),
+            )
+            .when(is_open || needs_confirmation, |this| {
+                this.child(self.render_collapsible_command(group, false, tool_call.label.clone(), window, cx))
+            })
     }
 
     fn render_collapsible_command(
@@ -8327,7 +8519,7 @@ impl ThreadView {
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
         })
-        .command_slot(command_element);
+        .when(is_expanded || needs_confirmation, |header| header.command_slot(command_element));
 
         let terminal_view = self
             .entry_view_state
@@ -8833,10 +9025,11 @@ impl ThreadView {
         let body = v_flex()
             .map(|this| {
                 if is_terminal_tool {
-                    this.child(self.render_collapsible_command(
+                    this.child(self.render_compact_command(
                         card_header_id.clone(),
-                        true,
-                        tool_call.label.clone(),
+                        tool_call,
+                        is_open,
+                        needs_confirmation,
                         window,
                         cx,
                     ))
@@ -10723,6 +10916,12 @@ impl ThreadView {
             })
             .map(PathBuf::from);
 
+        if let Some(path) = &history_image {
+            return crate::chat_image_previews::ChatImagePreview::new(
+                path.to_string_lossy().into_owned(), Vec::new(),
+            ).attachment().into_any_element();
+        }
+
         let Some(project) = self.project.upgrade() else {
             return Empty.into_any_element();
         };
@@ -10767,17 +10966,9 @@ impl ThreadView {
             .overflow_hidden()
             .when_some(history_image, |element, path| {
                 element.child(
-                    div()
-                        .image_cache(gpui::retain_all(SharedString::from(format!(
-                            "history-image-{}",
-                            resource_link.uri
-                        ))))
-                        .child(
-                            img(path)
-                                .max_w_96()
-                                .max_h_96()
-                                .object_fit(ObjectFit::ScaleDown),
-                        ),
+                    crate::chat_image_previews::ChatImagePreview::new(
+                        path.to_string_lossy().into_owned(), Vec::new(),
+                    ).attachment(),
                 )
             })
             .child(
@@ -13125,6 +13316,15 @@ impl Render for ThreadView {
     }
 }
 
+pub(super) fn link_clipboard_text(link: &str) -> String {
+    url::Url::parse(link)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| link.to_owned())
+}
+
 pub(crate) fn open_link(
     url: SharedString,
     workspace: &WeakEntity<Workspace>,
@@ -13137,6 +13337,20 @@ pub(crate) fn open_link(
     };
 
     let path_style = workspace.read(cx).path_style(cx);
+    let project = workspace.read(cx).project().clone();
+    if project.read(cx).is_local() {
+        let browser_url = local_html_links::browser_url(&url, |path| {
+            project.update(cx, |project, cx| {
+                let project_path = project.find_project_path(path, cx)?;
+                project.entry_for_path(&project_path, cx)?;
+                project.absolute_path(&project_path, cx)
+            })
+        });
+        if let Some(browser_url) = browser_url {
+            cx.open_url(browser_url.as_str());
+            return;
+        }
+    }
     let (relative_path, fragment) = split_local_url_fragment(&url);
     if let Some(fragment) = fragment
         && !relative_path.is_empty()

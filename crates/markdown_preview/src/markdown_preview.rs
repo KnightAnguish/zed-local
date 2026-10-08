@@ -1,6 +1,8 @@
 use gpui::{App, actions};
 use workspace::Workspace;
 
+mod literary_diff;
+mod literary_review;
 pub mod markdown_preview_settings;
 pub mod markdown_preview_view;
 
@@ -11,6 +13,8 @@ use crate::markdown_preview_view::MarkdownPreviewView;
 actions!(
     markdown,
     [
+        /// Reviews Markdown changes by paragraph and word, independently of Git staging.
+        OpenLiteraryReview,
         /// Scrolls up by one page in the markdown preview.
         #[action(deprecated_aliases = ["markdown::MovePageUp"])]
         ScrollPageUp,

@@ -1,4 +1,5 @@
 mod connection;
+pub mod attachment_store;
 mod diff;
 mod mention;
 mod terminal;
@@ -2632,6 +2633,54 @@ impl AcpThread {
         &self.entries
     }
 
+    pub fn identify_pending_user_message(&mut self) -> Option<ClientUserMessageId> {
+        let AgentThreadEntry::UserMessage(message) = self.entries.last_mut()? else {
+            return None;
+        };
+        if !message.is_optimistic || message.protocol_id.is_some() {
+            return None;
+        }
+        Some(
+            message
+                .client_id
+                .get_or_insert_with(ClientUserMessageId::new)
+                .clone(),
+        )
+    }
+
+    pub fn bind_optimistic_message_id(
+        &mut self,
+        client_id: &ClientUserMessageId,
+        id: acp::MessageId,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let message = self.entries.iter_mut().find_map(|entry| match entry {
+            AgentThreadEntry::UserMessage(message)
+                if message.client_id.as_ref() == Some(client_id) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        });
+        let Some(message) = message else {
+            anyhow::bail!("Pending user message is no longer available");
+        };
+        anyhow::ensure!(
+            message.is_optimistic,
+            "Cannot bind an unrelated historical message"
+        );
+        anyhow::ensure!(
+            message
+                .protocol_id
+                .as_ref()
+                .is_none_or(|existing| existing == &id),
+            "Conflicting user message identity"
+        );
+        message.protocol_id = Some(id);
+        cx.notify();
+        Ok(())
+    }
+
     pub fn prepend_history(
         &mut self,
         messages: Vec<HistoryMessage>,
@@ -4135,11 +4184,10 @@ impl AcpThread {
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
         let language_registry = self.project.read(cx).languages().clone();
         let path_style = self.project.read(cx).path_style(cx);
-        let mut block = MessageContent::default();
-        for chunk in &message {
-            block.append_prompt(chunk.clone(), &language_registry, path_style, cx);
-        }
-        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
+        let session_id = self.session_id.clone();
+        let attachments = cx.background_spawn(async move {
+            attachment_store::prepare(&attachment_store::root(), message)
+        });
         let git_store = self.project.read(cx).git_store().clone();
 
         let client_user_message_ids = self.connection.client_user_message_ids(cx);
@@ -4148,8 +4196,14 @@ impl AcpThread {
             .map(|client_user_message_ids| client_user_message_ids.new_id());
 
         self.run_turn(cx, async move |this, cx| {
+            let message = attachments.await?;
+            let request = acp::PromptRequest::new(session_id, message.clone());
             if push_user_message {
                 this.update(cx, |this, cx| {
+                    let mut block = MessageContent::default();
+                    for chunk in &message {
+                        block.append_prompt(chunk.clone(), &language_registry, path_style, cx);
+                    }
                     this.push_entry(
                         AgentThreadEntry::UserMessage(UserMessage {
                             protocol_id: None,
@@ -6765,6 +6819,65 @@ mod tests {
                     .map(ToString::to_string)
                     .as_deref(),
                 Some("msg_user_3")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bind_optimistic_message_id_preserves_content(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| connection.new_session(project, PathList::default(), cx))
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block_with_protocol_id(
+                None,
+                true,
+                None,
+                "Typed prompt".into(),
+                false,
+                cx,
+            );
+            let client_id = thread.identify_pending_user_message().unwrap();
+            // Model a history prepend after the prompt was sent. Its position is not an identity.
+            thread
+                .prepend_history(
+                    vec![HistoryMessage {
+                        id: "older-id".into(),
+                        is_user: true,
+                        content: vec!["Older message".into()],
+                    }],
+                    false,
+                    cx,
+                )
+                .unwrap();
+            thread
+                .bind_optimistic_message_id(&client_id, "server-id".into(), cx)
+                .unwrap();
+            thread
+                .bind_optimistic_message_id(&client_id, "server-id".into(), cx)
+                .unwrap();
+            assert!(
+                thread
+                    .bind_optimistic_message_id(&client_id, "wrong-id".into(), cx)
+                    .is_err()
+            );
+            assert!(
+                thread
+                    .bind_optimistic_message_id(&ClientUserMessageId::new(), "missing".into(), cx)
+                    .is_err()
+            );
+            assert_eq!(thread.entries.len(), 2);
+            let AgentThreadEntry::UserMessage(message) = &thread.entries[1] else {
+                panic!("user message expected")
+            };
+            assert_eq!(message.content.to_markdown(cx), "Typed prompt");
+            assert_eq!(
+                message.protocol_id.as_ref().unwrap().0.as_ref(),
+                "server-id"
             );
         });
     }

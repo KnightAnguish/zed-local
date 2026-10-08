@@ -200,6 +200,7 @@ impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
 }
 
 pub struct MessageEditor {
+    path_preview: Option<(String, Option<(Entity<markdown::Markdown>, Vec<String>)>)>,
     mention_set: Entity<MentionSet>,
     editor: Entity<Editor>,
     workspace: WeakEntity<Workspace>,
@@ -603,6 +604,7 @@ impl MessageEditor {
 
         Self {
             editor,
+            path_preview: None,
             mention_set,
             workspace,
             session_capabilities,
@@ -1727,6 +1729,7 @@ impl MessageEditor {
         };
 
         let path_style = workspace.read(cx).project().read(cx).path_style(cx);
+        let attachment_paths = local_image_attachment_paths(&message);
         let mut text = String::new();
         let mut mentions = Vec::new();
         let append_normalized = |text: &mut String, mut segment: String| {
@@ -1737,7 +1740,10 @@ impl MessageEditor {
         for chunk in message {
             match chunk {
                 acp::ContentBlock::Text(text_content) => {
-                    append_normalized(&mut text, text_content.text);
+                    append_normalized(
+                        &mut text,
+                        visible_attachment_text(&text_content.text, &attachment_paths),
+                    );
                 }
                 acp::ContentBlock::Resource(acp::EmbeddedResource {
                     resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
@@ -1834,7 +1840,13 @@ impl MessageEditor {
             let Some((crease_id, tx, crease_entity)) = insert_crease_for_mention(
                 snapshot.anchor_to_buffer_anchor(anchor).unwrap().0,
                 range.end - range.start,
-                mention_uri.name().into(),
+                if matches!(&mention, Mention::Image(_))
+                    || matches!(&mention_uri, MentionUri::File { abs_path, .. } if attachment_paths.contains(abs_path))
+                {
+                    "Изображение".into()
+                } else {
+                    mention_uri.name().into()
+                },
                 mention_uri.icon_path(cx),
                 mention_uri.tooltip_text(),
                 Some(mention_uri.clone()),
@@ -2002,7 +2014,43 @@ impl Focusable for MessageEditor {
 }
 
 impl Render for MessageEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.editor.read(cx).read_only(cx) && self.mention_set.read(cx).is_empty() {
+            let source = self.text(cx);
+            if self
+                .path_preview
+                .as_ref()
+                .is_none_or(|(previous, _)| previous != &source)
+            {
+                let preview = crate::user_path_links::projection(&source).map(|(text, paths)| {
+                    (
+                        cx.new(|cx| markdown::Markdown::new(text.into(), None, None, cx)),
+                        paths,
+                    )
+                });
+                self.path_preview = Some((source, preview));
+            }
+            if let Some((_, Some((markdown, paths)))) = &self.path_preview {
+                let paths = paths.clone();
+                let workspace = self.workspace.clone();
+                return markdown::MarkdownElement::new(
+                    markdown.clone(),
+                    markdown::MarkdownStyle::themed(markdown::MarkdownFont::Agent, window, cx),
+                )
+                .on_url_click(move |url, window, cx| {
+                    if let Some(path) = url
+                        .strip_prefix("zed-user-path:")
+                        .and_then(|index| index.parse::<usize>().ok())
+                        .and_then(|index| paths.get(index))
+                    {
+                        open_user_path(path, &workspace, window, cx);
+                    }
+                })
+                .into_any_element();
+            }
+        } else {
+            self.path_preview = None;
+        }
         div()
             .key_context("MessageEditor")
             .on_action(cx.listener(Self::chat))
@@ -2040,7 +2088,108 @@ impl Render for MessageEditor {
                     },
                 )
             })
+            .into_any_element()
     }
+}
+
+fn local_image_attachment_paths(blocks: &[acp::ContentBlock]) -> Vec<std::path::PathBuf> {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let uri = match block {
+                acp::ContentBlock::Image(image) => image.uri.as_deref()?,
+                acp::ContentBlock::ResourceLink(link)
+                    if link
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("zedHistoryImage"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true) =>
+                {
+                    &link.uri
+                }
+                _ => return None,
+            };
+            url::Url::parse(uri)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .or_else(|| {
+                    // Earlier history records used file:// followed by a native absolute path.
+                    let path = std::path::Path::new(uri.strip_prefix("file://")?);
+                    path.is_absolute().then(|| path.to_path_buf())
+                })
+        })
+        .collect()
+}
+
+fn visible_attachment_text(text: &str, paths: &[std::path::PathBuf]) -> String {
+    let mut visible = text.to_owned();
+    for path in paths {
+        let reference = format!(
+            "Original image attachment (permanent local file): {}",
+            path.display()
+        );
+        // Only suppress generated references paired with an actual image block.
+        // The Image URI is retained, and prepare() adds the reference again on send.
+        if visible.trim() == reference {
+            visible.clear();
+            continue;
+        }
+        visible = visible
+            .split_inclusive('\n')
+            .filter(|line| line.trim_end_matches(['\r', '\n']) != reference)
+            .collect();
+    }
+    visible
+}
+
+fn open_user_path(
+    path: &str,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let normalized = if cfg!(not(target_os = "windows")) && !path.contains(':') {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    let absolute = if normalized.starts_with("file://") {
+        url::Url::parse(&normalized)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+    } else if std::path::Path::new(&normalized).is_absolute() {
+        Some(std::path::PathBuf::from(&normalized))
+    } else {
+        workspace.upgrade().and_then(|workspace| {
+            let project = workspace.read(cx).project().clone();
+            project.update(cx, |project, cx| {
+                let path = project.find_project_path(normalized.as_str(), cx)?;
+                project.absolute_path(&path, cx)
+            })
+        })
+    };
+    if let Some(absolute) = absolute {
+        if let Ok(url) = url::Url::from_file_path(&absolute) {
+            #[cfg(target_os = "windows")]
+            if absolute
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "zip" | "7z" | "rar" | "tar" | "gz"
+                    )
+                })
+            {
+                cx.open_url(url.as_str());
+                return;
+            }
+            crate::conversation_view::open_link(url.to_string().into(), workspace, window, cx);
+            return;
+        }
+    }
+    crate::conversation_view::open_link(normalized.into(), workspace, window, cx);
 }
 
 pub struct MessageEditorAddon {}
@@ -2528,6 +2677,139 @@ mod tests {
         } else {
             panic!("Expected Fetch URI");
         }
+    }
+
+    #[gpui::test]
+    async fn test_user_path_links_preserve_text_and_open_in_workspace(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"Архивы": {"a%20b.md": "literal", "a b.md": "space"}}),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let message_editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                let mut editor = MessageEditor::new(
+                    workspace.downgrade(),
+                    project.downgrade(),
+                    None,
+                    Default::default(),
+                    "Test Agent".into(),
+                    "Test",
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    window,
+                    cx,
+                );
+                editor.set_message(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "Архивы\\a%20b.md",
+                    ))],
+                    window,
+                    cx,
+                );
+                editor.set_read_only(true, cx);
+                editor
+            })
+        });
+        message_editor.update_in(cx, |editor, window, cx| {
+            drop(editor.render(window, cx));
+            assert!(editor.path_preview.as_ref().unwrap().1.is_some());
+            assert_eq!(editor.text(cx), "Архивы\\a%20b.md");
+            editor.set_read_only(false, cx);
+            drop(editor.render(window, cx));
+            assert!(editor.path_preview.is_none());
+            assert_eq!(editor.text(cx), "Архивы\\a%20b.md");
+        });
+        multi_workspace.update_in(cx, |_, window, cx| {
+            super::open_user_path("Архивы\\a%20b.md", &workspace.downgrade(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let active = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx))
+                .expect("file opened");
+            assert!(*active.path == *"Архивы/a%20b.md");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_attachment_display_keeps_original_on_resend(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(4, 4)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+        let prepared = acp_thread::attachment_store::prepare(
+            directory.path(),
+            vec![
+                acp::ContentBlock::Text(acp::TextContent::new("Мой текст")),
+                acp::ContentBlock::Image(acp::ImageContent::new(data.clone(), "image/png")),
+            ],
+        )
+        .unwrap();
+        let image_path = super::local_image_attachment_paths(&prepared)
+            .pop()
+            .unwrap();
+        let message_editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                let mut editor = MessageEditor::new(
+                    workspace.downgrade(),
+                    project.downgrade(),
+                    None,
+                    Default::default(),
+                    "Test Agent".into(),
+                    "Test",
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    window,
+                    cx,
+                );
+                editor.set_message(prepared, window, cx);
+                assert!(!editor.text(cx).contains("Original image attachment"));
+                assert!(editor.text(cx).contains("Мой текст"));
+                editor
+            })
+        });
+        let (content, _) = message_editor
+            .update(cx, |editor, cx| editor.contents(false, cx))
+            .await
+            .unwrap();
+        let resent = acp_thread::attachment_store::prepare(directory.path(), content).unwrap();
+        assert!(
+            resent.iter().any(
+                |block| matches!(block, acp::ContentBlock::Image(image) if image.data == data)
+            )
+        );
+        assert!(resent.iter().any(|block| matches!(block, acp::ContentBlock::Text(text) if text.text.contains(&image_path.display().to_string()))));
+        assert!(image_path.is_file());
+        let literal = format!(
+            "Original image attachment (permanent local file): {}\n",
+            image_path.display()
+        );
+        assert_eq!(super::visible_attachment_text(&literal, &[]), literal);
+        assert_eq!(
+            super::visible_attachment_text(&format!("до\n\n{literal}после"), &[image_path]),
+            "до\n\nпосле"
+        );
     }
 
     #[gpui::test]

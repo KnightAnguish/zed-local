@@ -376,6 +376,70 @@ async fn read_frame(reader: &mut (impl futures::AsyncBufRead + Unpin)) -> Result
 mod tests {
     use super::*;
     #[gpui::test]
+    #[ignore = "Explicit runtime and empty diagnostic cwd required; sends one short model request"]
+    fn live_ephemeral_turn(cx: &mut gpui::TestAppContext) {
+        use futures::FutureExt as _;
+        cx.background_executor.allow_parking();
+        let executable =
+            PathBuf::from(std::env::var("ZED_CODEX_HISTORY_TEST_EXE").expect("runtime"));
+        let directory = PathBuf::from(
+            std::env::var("ZED_CODEX_SMOKE_CWD").expect("empty diagnostic directory"),
+        );
+        let (rpc, events) = Rpc::start(
+            executable,
+            Default::default(),
+            Some(directory.clone()),
+            cx.background_executor.clone(),
+        );
+        let operation = cx.background_executor.spawn(async move {
+            rpc.initialize().await.unwrap();
+            let session = rpc.request("thread/start", json!({"cwd":directory,"ephemeral":true,"sandbox":"read-only","approvalPolicy":"on-request","baseInstructions":"This is a transport test. Follow the user instruction without using tools."})).await.unwrap();
+            let id = session["thread"]["id"].as_str().unwrap().to_owned();
+            let blocks: Vec<agent_client_protocol::schema::v1::ContentBlock> = serde_json::from_value(json!([
+                {"type":"text","text":"Reply with the attached marker only. Do not use tools or access files."},
+                {"type":"resource","resource":{"uri":"diagnostic://marker","text":"NATIVE_SMOKE_OK"}}
+            ])).unwrap();
+            let input = super::super::events::input(&blocks).unwrap();
+            rpc.request("turn/start", json!({"threadId":id,"input":input})).await.unwrap();
+            let mut translated = super::super::events::TurnEvents::default();
+            let mut answer = String::new();
+            let result: Result<()> = async {
+                while let Ok(event) = events.recv().await {
+                    match event {
+                        Event::Request { id, .. } => rpc.respond(id, Err(anyhow::anyhow!("Diagnostic request rejected")))?,
+                        Event::Notification { method, params } if params["threadId"] == id => {
+                            if method == "turn/completed" {
+                                ensure!(params["turn"]["status"] == "completed", "Diagnostic turn did not complete successfully");
+                                ensure!(answer.contains("NATIVE_SMOKE_OK"), "Marker missing from native streamed answer");
+                                return Ok(());
+                            }
+                            for update in translated.update(&method, &params)? {
+                                let value = serde_json::to_value(update)?;
+                                if value["sessionUpdate"] == "agent_message_chunk" {
+                                    if let Some(chunk) = value["content"]["text"].as_str() { answer.push_str(chunk); }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                bail!("Native diagnostic disconnected before completion")
+            }.await;
+            rpc.request("thread/unsubscribe", json!({"threadId":id})).await.unwrap();
+            result.unwrap();
+        });
+        futures::pin_mut!(operation);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while operation.as_mut().now_or_never().is_none() {
+            while cx.background_executor.tick() {}
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Live native turn exceeded 120 seconds"
+            );
+            std::thread::yield_now();
+        }
+    }
+    #[gpui::test]
     #[ignore = "Explicit local runtime and diagnostic thread required; no model request"]
     fn live_read_only(cx: &mut gpui::TestAppContext) {
         use futures::FutureExt as _;

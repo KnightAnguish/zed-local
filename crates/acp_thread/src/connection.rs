@@ -810,6 +810,9 @@ mod test_support {
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
         history_pages: Arc<Mutex<HashMap<Option<String>, HistoryPage>>>,
         supports_load_session: bool,
+        supports_message_fork: bool,
+        fork_requests: Arc<Mutex<Vec<Option<SessionForkPoint>>>>,
+        fork_succeeds: Arc<Mutex<bool>>,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
@@ -834,6 +837,9 @@ mod test_support {
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
                 supports_load_session: false,
+                supports_message_fork: false,
+                fork_requests: Default::default(),
+                fork_succeeds: Default::default(),
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
@@ -872,6 +878,19 @@ mod test_support {
         pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
             self.agent_id = agent_id;
             self
+        }
+
+        pub fn with_message_fork(mut self) -> Self {
+            self.supports_message_fork = true;
+            self
+        }
+
+        pub fn fork_requests(&self) -> Vec<Option<SessionForkPoint>> {
+            self.fork_requests.lock().clone()
+        }
+
+        pub fn set_fork_succeeds(&self, succeeds: bool) {
+            *self.fork_succeeds.lock() = succeeds;
         }
 
         pub fn with_telemetry_id(mut self, telemetry_id: SharedString) -> Self {
@@ -952,6 +971,31 @@ mod test_support {
     }
 
     impl AgentConnection for StubAgentConnection {
+        fn supports_message_fork(&self) -> bool {
+            self.supports_message_fork
+        }
+
+        fn supports_fork_session(&self) -> bool {
+            self.supports_message_fork
+        }
+
+        fn fork_session(
+            self: Rc<Self>,
+            _session_id: acp::SessionId,
+            _project: Entity<Project>,
+            _work_dirs: PathList,
+            point: Option<SessionForkPoint>,
+            cx: &mut App,
+        ) -> Task<Result<acp::SessionId>> {
+            self.fork_requests.lock().push(point);
+            if *self.fork_succeeds.lock() {
+                Task::ready(Ok(acp::SessionId::new(
+                    StubSessionCounter::next(cx).to_string(),
+                )))
+            } else {
+                Task::ready(Err(anyhow::anyhow!("Test fork failure")))
+            }
+        }
         fn supports_history_pages(&self) -> bool {
             !self.history_pages.lock().is_empty()
         }

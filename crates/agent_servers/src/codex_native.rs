@@ -1,7 +1,10 @@
 //! Native Codex integration under construction. Not selected by production routing.
 //! Keep the legacy connector until the parity gates in NATIVE_CODEX.md pass.
 mod events;
+mod forks;
+mod permissions;
 mod profiles;
+mod questions;
 mod settings;
 mod transport;
 
@@ -27,12 +30,14 @@ struct ActiveTurn {
     completion: oneshot::Sender<Result<acp::PromptResponse>>,
     events: TurnEvents,
     cancel_requested: bool,
+    optimistic_message: Option<acp_thread::ClientUserMessageId>,
 }
 
 struct Session {
     thread: WeakEntity<AcpThread>,
     active: Option<ActiveTurn>,
     uncertain: bool,
+    forking: bool,
     preferences: settings::Preferences,
     settings_sender: Rc<RefCell<watch::Sender<()>>>,
     settings_receiver: watch::Receiver<()>,
@@ -42,10 +47,16 @@ struct Approval {
     _task: Task<()>,
     thread: Option<WeakEntity<AcpThread>>,
     item_id: Option<acp::ToolCallId>,
+    elicitation: Rc<RefCell<Option<acp_thread::ElicitationEntryId>>>,
 }
 
 impl Approval {
     fn cancel_ui(&self, cx: &mut AsyncApp) {
+        if let (Some(thread), Some(id)) = (&self.thread, self.elicitation.borrow_mut().take()) {
+            thread
+                .update(cx, |thread, cx| thread.cancel_elicitation(&id, cx))
+                .log_err();
+        }
         if let (Some(thread), Some(item_id)) = (&self.thread, &self.item_id) {
             thread
                 .update(cx, |thread, cx| {
@@ -65,9 +76,46 @@ pub(crate) struct NativeCodexConnection {
     profile_override: RefCell<Option<String>>,
     models: RefCell<Rc<Vec<settings::Model>>>,
     quota: Rc<settings::Quota>,
+    fork_preferences: RefCell<HashMap<acp::SessionId, settings::Preferences>>,
 }
 
 impl NativeCodexConnection {
+    fn open_task(
+        self: Rc<Self>,
+        id: Option<acp::SessionId>,
+        project: Entity<Project>,
+        directories: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let (sender, receiver) = oneshot::channel();
+        // A dropped UI waiter must not abandon a server-side thread/start or resume.
+        cx.spawn(async move |cx| {
+            let result = self.clone().open(id, project, directories, title, cx).await;
+            if let Err(result) = sender.send(result) {
+                match result {
+                    Ok(thread) => {
+                        let id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+                        self.rpc
+                            .request("thread/unsubscribe", json!({"threadId":id}))
+                            .await
+                            .log_err();
+                        self.sessions.borrow_mut().remove(&id);
+                    }
+                    Err(error) => {
+                        log::warn!("Cancelled Codex open completed with an error: {error}")
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |_| {
+            receiver
+                .await
+                .context("Codex open task ended without a result")?
+        })
+    }
+
     pub(crate) async fn connect(
         command: AgentServerCommand,
         directory: Option<PathBuf>,
@@ -112,6 +160,7 @@ impl NativeCodexConnection {
             profile_override: RefCell::new(None),
             models: RefCell::new(Rc::new(Vec::new())),
             quota,
+            fork_preferences: RefCell::new(HashMap::new()),
         });
         let weak = Rc::downgrade(&connection);
         *connection.event_task.borrow_mut() = Some(cx.spawn(async move |cx| {
@@ -173,6 +222,32 @@ impl NativeCodexConnection {
             return Ok(());
         };
         let id = acp::SessionId::new(thread_id);
+        if matches!(method, "item/started" | "item/completed")
+            && params["item"]["type"] == "userMessage"
+        {
+            let binding = {
+                let mut sessions = self.sessions.borrow_mut();
+                sessions.get_mut(&id).and_then(|session| {
+                    let active = session.active.as_mut()?;
+                    // A late event from the previous turn must not bind the new draft.
+                    if active.id.as_deref().is_none()
+                        || active.id.as_deref() != params["turnId"].as_str()
+                    {
+                        return None;
+                    }
+                    active
+                        .optimistic_message
+                        .take()
+                        .map(|client_id| (session.thread.clone(), client_id))
+                })
+            };
+            if let Some((thread, client_id)) = binding {
+                let message_id = acp::MessageId::new(text(&params["item"], "id")?);
+                thread.update(cx, |thread, cx| {
+                    thread.bind_optimistic_message_id(&client_id, message_id, cx)
+                })??;
+            }
+        }
         // Extract UI updates before touching GPUI; no RefCell borrow across callbacks.
         let update = {
             let mut sessions = self.sessions.borrow_mut();
@@ -257,60 +332,45 @@ impl NativeCodexConnection {
             .map(|id| acp::ToolCallId::new(id.to_owned()));
         let weak = Rc::downgrade(self);
         let task_key = key.clone();
+        let elicitation = Rc::new(RefCell::new(None));
+        let task_elicitation = elicitation.clone();
         let task = cx.spawn(async move |cx| {
             let result: Result<Value> = async {
-                ensure!(
-                    matches!(
-                        method.as_str(),
-                        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-                    ),
-                    "Unsupported Codex server request {method}; nothing was approved"
-                );
+                if matches!(method.as_str(), "item/tool/requestUserInput" | "mcpServer/elicitation/request") {
+                    let thread = thread.context("Question requested for an unopened thread")?;
+                    let mcp = method == "mcpServer/elicitation/request";
+                    let request = if mcp { questions::mcp_request(&params)? } else { questions::request(&params)? };
+                    let (entry, response) = thread.update(cx, |thread, cx| thread.request_elicitation_with_id(request, cx))??;
+                    *task_elicitation.borrow_mut() = Some(entry);
+                    let response = response.await;
+                    return if mcp { questions::mcp_response(response) } else { questions::response(&params, response) };
+                }
+                let choices = permissions::Choices::new(&method, &params)?;
                 let thread = thread.context("Approval requested for an unopened thread")?;
                 let item_id = text(&params, "itemId")?.to_owned();
-                let options = vec![
-                    acp::PermissionOption::new(
-                        "accept",
-                        "Allow once",
-                        acp::PermissionOptionKind::AllowOnce,
-                    ),
-                    acp::PermissionOption::new(
-                        "decline",
-                        "Reject",
-                        acp::PermissionOptionKind::RejectOnce,
-                    ),
-                ];
                 let title = params["command"]
                     .as_str()
                     .or_else(|| params["reason"].as_str())
                     .unwrap_or("Codex requests permission");
-                let tool = acp::ToolCallUpdate::new(
-                    item_id,
-                    acp::ToolCallUpdateFields::new()
-                        .title(title.to_owned())
-                        .status(acp::ToolCallStatus::Pending),
-                );
+                let tool: acp::ToolCallUpdate = serde_json::from_value(json!({
+                    "toolCallId":item_id,"title":title,"status":"pending",
+                    "content":[{"type":"content","content":{"type":"text","text":serde_json::to_string_pretty(&params)?}}]
+                }))?;
                 let outcome = thread
                     .update(cx, |thread, cx| {
                         thread.request_tool_call_authorization(
                             tool,
-                            PermissionOptions::Flat(options),
+                            PermissionOptions::Flat(choices.options.clone()),
                             AuthorizationKind::PermissionGrant,
                             cx,
                         )
                     })??
                     .await;
-                let decision = match outcome {
-                    RequestPermissionOutcome::Selected(outcome)
-                        if outcome.option_id.0.as_ref() == "accept" =>
-                    {
-                        "accept"
-                    }
-                    RequestPermissionOutcome::Selected(_) => "decline",
+                match outcome {
+                    RequestPermissionOutcome::Selected(outcome) => choices.reply(Some(outcome.option_id.0.as_ref())),
                     RequestPermissionOutcome::Cancelled
-                    | RequestPermissionOutcome::InterruptedByFollowUp => "cancel",
-                };
-                Ok(json!({"decision":decision}))
+                    | RequestPermissionOutcome::InterruptedByFollowUp => choices.reply(None),
+                }
             }
             .await;
             rpc.respond(id, result).log_err();
@@ -324,6 +384,7 @@ impl NativeCodexConnection {
                 _task: task,
                 thread: approval_thread,
                 item_id: approval_item,
+                elicitation,
             },
         );
     }
@@ -387,70 +448,136 @@ impl NativeCodexConnection {
             "thread/start"
         };
         let response = self.rpc.request(method, params).await?;
-        let preferences =
-            settings::Preferences::from_response(self.models.borrow().clone(), &response)?;
         let id = acp::SessionId::new(text(&response["thread"], "id")?);
-        if response["thread"]["status"]["type"].as_str() == Some("active") {
-            self.rpc
-                .request("thread/unsubscribe", json!({"threadId":id}))
-                .await?;
-            anyhow::bail!(
-                "This Codex thread is still active; live reattachment is not implemented yet"
-            );
-        }
-        let tail = if session_id.is_some() {
-            let response = self
+        ensure!(
+            !id.0.is_empty() && session_id.as_ref().is_none_or(|expected| expected == &id),
+            "Codex returned an unexpected session identity"
+        );
+        let result: Result<Entity<AcpThread>> = async {
+            let mut preferences =
+                settings::Preferences::from_response(self.models.borrow().clone(), &response)?;
+            cx.update(|cx| preferences.apply_editor_defaults(cx))?;
+            if response["thread"]["status"]["type"].as_str() == Some("active") {
+                anyhow::bail!(
+                    "This Codex thread is still active; live reattachment is not implemented yet"
+                );
+            }
+            let tail = if session_id.is_some() {
+                let response = self
                 .rpc
                 .request(
                     "thread/turns/list",
                     json!({"threadId":id,"limit":20,"sortDirection":"desc","itemsView":"summary"}),
                 )
                 .await?;
-            Some(crate::codex_history::decode_page(response, None)?)
-        } else {
-            None
-        };
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
-        let connection = self.clone();
-        let thread = cx.new(|cx| {
-            AcpThread::new(
-                None,
-                title,
-                Some(work_dirs),
-                connection,
-                project,
-                action_log,
-                id.clone(),
-                watch::Receiver::constant(acp::PromptCapabilities::new().image(true)),
-                cx,
-            )
-        });
-        if let Some(tail) = tail {
-            for message in tail.messages {
-                for content in message.content {
-                    let chunk = acp::ContentChunk::new(content).message_id(message.id.clone());
-                    let update = if message.is_user {
-                        acp::SessionUpdate::UserMessageChunk(chunk)
-                    } else {
-                        acp::SessionUpdate::AgentMessageChunk(chunk)
+                Some(cx.background_spawn(async move {
+                    crate::codex_history::decode_page(response, None)
+                }).await?)
+            } else {
+                None
+            };
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let connection = self.clone();
+            let thread = cx.new(|cx| {
+                let weak_connection = Rc::downgrade(&connection);
+                let released_id = id.clone();
+                let entity_id = cx.entity().entity_id();
+                cx.on_release(move |_, cx| {
+                    let Some(connection) = weak_connection.upgrade() else {
+                        return;
                     };
-                    thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))?;
+                    let removed = {
+                        let mut sessions = connection.sessions.borrow_mut();
+                        if sessions
+                            .get(&released_id)
+                            .is_some_and(|session| session.thread.entity_id() == entity_id)
+                        {
+                            sessions.remove(&released_id)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(session) = removed {
+                        let rpc = connection.rpc.clone();
+                        cx.spawn(async move |_| {
+                            if let Some(turn) = session.active.and_then(|turn| turn.id) {
+                                rpc.request(
+                                    "turn/interrupt",
+                                    json!({"threadId":released_id,"turnId":turn}),
+                                )
+                                .await
+                                .log_err();
+                            }
+                            rpc.request("thread/unsubscribe", json!({"threadId":released_id}))
+                                .await
+                                .log_err();
+                        })
+                        .detach();
+                    }
+                })
+                .detach();
+                AcpThread::new(
+                    None,
+                    title,
+                    Some(work_dirs),
+                    connection,
+                    project,
+                    action_log,
+                    id.clone(),
+                    watch::Receiver::constant(
+                        acp::PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    ),
+                    cx,
+                )
+            });
+            if let Some(tail) = tail {
+                for message in tail.messages {
+                    for content in message.content {
+                        let chunk = acp::ContentChunk::new(content).message_id(message.id.clone());
+                        let update = if message.is_user {
+                            acp::SessionUpdate::UserMessageChunk(chunk)
+                        } else {
+                            acp::SessionUpdate::AgentMessageChunk(chunk)
+                        };
+                        thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))?;
+                    }
                 }
             }
+            let (settings_sender, settings_receiver) = watch::channel(());
+            if let Some(inherited) = self.fork_preferences.borrow_mut().remove(&id) {
+                preferences = inherited;
+            }
+            self.sessions.borrow_mut().insert(
+                id.clone(),
+                Session {
+                    thread: thread.downgrade(),
+                    active: None,
+                    uncertain: false,
+                    forking: false,
+                    preferences,
+                    settings_sender: Rc::new(RefCell::new(settings_sender)),
+                    settings_receiver,
+                },
+            );
+            Ok(thread)
         }
-        let (settings_sender, settings_receiver) = watch::channel(());
-        self.sessions.borrow_mut().insert(
-            id,
-            Session {
-                thread: thread.downgrade(),
-                active: None,
-                uncertain: false,
-                preferences,
-                settings_sender: Rc::new(RefCell::new(settings_sender)),
-                settings_receiver,
-            },
-        );
-        Ok(thread)
+        .await;
+        if let Err(error) = result {
+            if let Err(cleanup) = self
+                .rpc
+                .request("thread/unsubscribe", json!({"threadId":id}))
+                .await
+            {
+                anyhow::bail!(
+                    "Opening Codex chat failed: {error}; unsubscribe also failed: {cleanup}"
+                );
+            }
+            return Err(error);
+        }
+        result
     }
 }
 
@@ -543,6 +670,176 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    #[gpui::test]
+    async fn failed_resume_unsubscribes_without_registering_a_broken_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, peer, source) = session(cx).await;
+        let project = source.read_with(cx, |thread, _| thread.project().clone());
+        let load = cx.update(|cx| {
+            connection
+                .clone()
+                .load_session("broken".into(), project, PathList::default(), None, cx)
+        });
+        let account = peer.next().await;
+        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
+            .await;
+        let resume = peer.next().await;
+        assert_eq!(resume["method"], "thread/resume");
+        peer.send(json!({"id":resume["id"],"result":{"thread":{"id":"broken"}}}))
+            .await;
+        let unsubscribe = peer.next().await;
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"]["threadId"], "broken");
+        peer.send(json!({"id":unsubscribe["id"],"result":{}})).await;
+        assert!(load.await.is_err());
+        assert_eq!(connection.sessions.borrow().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn fork_load_inherits_unsent_preferences_without_changing_source(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, peer, source) = session(cx).await;
+        let id = acp::SessionId::new("session");
+        let project = source.read_with(cx, |thread, _| thread.project().clone());
+        connection
+            .sessions
+            .borrow_mut()
+            .get_mut(&id)
+            .unwrap()
+            .preferences
+            .change("reasoning-effort", &"high".into())
+            .unwrap();
+        async fn serve(peer: &transport::FakePeer, method: &str, result: Value) {
+            let request = peer.next().await;
+            assert_eq!(request["method"], method);
+            peer.send(json!({"id":request["id"],"result":result})).await;
+        }
+        let fork = cx.update(|cx| {
+            connection.clone().fork_session(
+                id.clone(),
+                project.clone(),
+                PathList::default(),
+                None,
+                cx,
+            )
+        });
+        serve(
+            &peer,
+            "thread/read",
+            json!({"thread":{"id":"session","status":{"type":"idle"}}}),
+        )
+        .await;
+        serve(&peer, "thread/fork", json!({"thread":{"id":"copy"}})).await;
+        serve(&peer, "thread/unsubscribe", json!({})).await;
+        let copy = fork.await.unwrap();
+        assert_eq!(connection.sessions.borrow().len(), 1);
+        let load = cx.update(|cx| {
+            connection
+                .clone()
+                .load_session(copy.clone(), project, PathList::default(), None, cx)
+        });
+        serve(&peer, "account/read", json!({"requiresOpenaiAuth":false})).await;
+        serve(&peer, "thread/resume", json!({"thread":{"id":"copy","status":{"type":"idle"}},"model":"a","reasoningEffort":"medium"})).await;
+        serve(
+            &peer,
+            "thread/turns/list",
+            json!({"data":[],"nextCursor":null}),
+        )
+        .await;
+        let _copy_thread = load.await.unwrap();
+        assert!(connection.fork_preferences.borrow().is_empty());
+        let sessions = connection.sessions.borrow();
+        for id in [&id, &copy] {
+            assert_eq!(
+                sessions
+                    .get(id)
+                    .unwrap()
+                    .preferences
+                    .turn_params(id, vec![])["effort"],
+                "high"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn send_through_thread_does_not_reenter_its_entity(cx: &mut TestAppContext) {
+        let (_connection, peer, thread) = session(cx).await;
+        let send = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
+        let send = cx.background_executor.spawn(send);
+        let start = peer.next().await;
+        assert_eq!(start["method"], "turn/start");
+        peer.send(json!({"id":start["id"],"result":{"turn":{"id":"turn"}}}))
+            .await;
+        peer.send(json!({"method":"item/started","params":{"threadId":"session","turnId":"turn","item":{"id":"user-id","type":"userMessage","content":[{"type":"text","text":"hello"}]}}})).await;
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        assert!(send.await.unwrap().is_some());
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries().len(), 1);
+            let acp_thread::AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
+                panic!("user message expected");
+            };
+            assert_eq!(message.protocol_id.as_ref().unwrap().0.as_ref(), "user-id");
+        });
+    }
+
+    #[gpui::test]
+    async fn live_user_identity_is_bound_once_without_echoing_text(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(
+                Some(acp_thread::ClientUserMessageId::new()),
+                "hello".into(),
+                cx,
+            )
+        });
+        let prompt = cx.update(|cx| {
+            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+        });
+        let start = peer.next().await;
+        peer.send(json!({"id":start["id"],"result":{"turn":{"id":"turn"}}}))
+            .await;
+        peer.send(
+            json!({"method":"turn/started","params":{"threadId":"session","turn":{"id":"turn"}}}),
+        )
+        .await;
+        peer.send(json!({"method":"item/completed","params":{"threadId":"session","turnId":"old-turn","item":{"id":"wrong-id","type":"userMessage"}}})).await;
+        for method in ["item/started", "item/completed"] {
+            peer.send(json!({"method":method,"params":{"threadId":"session","turnId":"turn","item":{"id":"user-id","type":"userMessage","content":[{"type":"text","text":"hello"}]}}})).await;
+        }
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        prompt.await.unwrap();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries().len(), 1);
+            let acp_thread::AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
+                panic!("user message expected")
+            };
+            assert_eq!(message.protocol_id.as_ref().unwrap().0.as_ref(), "user-id");
+            assert_eq!(message.chunks, vec!["hello".into()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn fork_guard_blocks_writes_and_is_released_on_drop(cx: &mut TestAppContext) {
+        let (connection, _peer, _thread) = session(cx).await;
+        let id = acp::SessionId::new("session");
+        let guard = forks::SessionGuard::acquire(connection.sessions.clone(), id.clone()).unwrap();
+        assert!(forks::SessionGuard::acquire(connection.sessions.clone(), id.clone()).is_err());
+        let prompt = cx.update(|cx| {
+            connection.prompt(
+                acp::PromptRequest::new(id.clone(), vec!["hello".into()]),
+                cx,
+            )
+        });
+        assert!(prompt.await.is_err());
+        let close = cx.update(|cx| connection.clone().close_session(&id, cx));
+        assert!(close.await.is_err());
+        drop(guard);
+        assert!(!connection.sessions.borrow().get(&id).unwrap().forking);
+        assert!(forks::SessionGuard::acquire(connection.sessions.clone(), id).is_ok());
     }
 
     #[gpui::test]
@@ -648,7 +945,7 @@ mod tests {
             thread.authorize_tool_call(
                 acp::ToolCallId::new("tool"),
                 acp_thread::SelectedPermissionOutcome::new(
-                    acp::PermissionOptionId::new("decline"),
+                    acp::PermissionOptionId::new("2"),
                     acp::PermissionOptionKind::RejectOnce,
                 ),
                 cx,
@@ -659,6 +956,135 @@ mod tests {
         assert_eq!(response["result"]["decision"], "decline");
         cx.run_until_parked();
         assert!(connection.approvals.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn questions_wait_for_input_and_return_the_actual_answer(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        peer.send(json!({"id":"question","method":"item/tool/requestUserInput","params":{"threadId":"session","itemId":"ask","questions":[{"id":"answer","header":"Input","question":"What next?","isOther":true,"isSecret":false,"options":null}]}})).await;
+        cx.run_until_parked();
+        assert_eq!(connection.approvals.borrow().len(), 1);
+        let entry = connection
+            .approvals
+            .borrow()
+            .get("\"question\"")
+            .unwrap()
+            .elicitation
+            .borrow()
+            .clone()
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from(
+                        [("answer".to_owned(), "Continue testing".into())],
+                    )),
+                )),
+                cx,
+            )
+        });
+        let reply = peer.next().await;
+        assert_eq!(reply["id"], "question");
+        assert_eq!(
+            reply["result"]["answers"]["answer"]["answers"],
+            json!(["Continue testing"])
+        );
+        cx.run_until_parked();
+        assert!(connection.approvals.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn cancelled_open_unsubscribes_after_the_server_returns(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        let project = thread.read_with(cx, |thread, _| thread.project().clone());
+        let pending = cx.update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::default(), cx)
+        });
+        let account = peer.next().await;
+        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
+            .await;
+        let start = peer.next().await;
+        assert_eq!(start["method"], "thread/start");
+        drop(pending);
+        cx.run_until_parked();
+        peer.send(json!({"id":start["id"],"result":{"thread":{"id":"abandoned"},"model":"a"}}))
+            .await;
+        let unsubscribe = peer.next().await;
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"]["threadId"], "abandoned");
+        peer.send(json!({"id":unsubscribe["id"],"result":{}})).await;
+        cx.run_until_parked();
+        assert_eq!(connection.sessions.borrow().len(), 1);
+        assert!(
+            connection
+                .sessions
+                .borrow()
+                .contains_key(&acp::SessionId::new("session"))
+        );
+    }
+
+    #[gpui::test]
+    async fn cancelled_fork_archives_only_the_new_copy(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        let project = thread.read_with(cx, |thread, _| thread.project().clone());
+        let pending = cx.update(|cx| {
+            connection.clone().fork_session(
+                acp::SessionId::new("session"),
+                project,
+                PathList::default(),
+                None,
+                cx,
+            )
+        });
+        let read = peer.next().await;
+        peer.send(
+            json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"idle"}}}}),
+        )
+        .await;
+        let fork = peer.next().await;
+        assert_eq!(fork["method"], "thread/fork");
+        drop(pending);
+        cx.run_until_parked();
+        peer.send(json!({"id":fork["id"],"result":{"thread":{"id":"abandoned-copy"}}}))
+            .await;
+        let unsubscribe = peer.next().await;
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        peer.send(json!({"id":unsubscribe["id"],"result":{}})).await;
+        let archive = peer.next().await;
+        assert_eq!(archive["method"], "thread/archive");
+        assert_eq!(archive["params"]["threadId"], "abandoned-copy");
+        peer.send(json!({"id":archive["id"],"result":{}})).await;
+        cx.run_until_parked();
+        assert!(connection.fork_preferences.borrow().is_empty());
+        assert!(!connection.sessions.borrow()[&acp::SessionId::new("session")].forking);
+    }
+
+    #[gpui::test]
+    async fn resolved_question_cancels_its_form_without_sending_an_answer(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        peer.send(json!({"id":77,"method":"item/tool/requestUserInput","params":{"threadId":"session","itemId":"ask","questions":[{"id":"answer","header":"Input","question":"What next?","isOther":true,"isSecret":false,"options":null}]}})).await;
+        cx.run_until_parked();
+        let entry = connection
+            .approvals
+            .borrow()
+            .get("77")
+            .unwrap()
+            .elicitation
+            .borrow()
+            .clone()
+            .unwrap();
+        peer.send(json!({"method":"serverRequest/resolved","params":{"threadId":"session","requestId":77}})).await;
+        cx.run_until_parked();
+        assert!(connection.approvals.borrow().is_empty());
+        thread.read_with(cx, |thread, _| {
+            assert!(matches!(
+                thread.elicitation(&entry).unwrap().1.status,
+                acp_thread::ElicitationStatus::Canceled
+            ));
+        });
     }
 }
 
@@ -675,10 +1101,86 @@ impl AgentConnection for NativeCodexConnection {
         work_dirs: PathList,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
-        cx.spawn(async move |cx| self.open(None, project, work_dirs, None, cx).await)
+        self.open_task(None, project, work_dirs, None, cx)
     }
     fn supports_load_session(&self) -> bool {
         true
+    }
+    fn supports_fork_session(&self) -> bool {
+        true
+    }
+    fn supports_message_fork(&self) -> bool {
+        true
+    }
+    fn fork_session(
+        self: Rc<Self>,
+        id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        point: Option<acp_thread::SessionForkPoint>,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        let cleanup = self.clone();
+        let operation = cx.spawn(async move |cx| {
+            ensure!(
+                project.read_with(cx, |project, _| project.is_local()),
+                "Native Codex remote forks are not implemented"
+            );
+            ensure!(
+                work_dirs.paths().len() <= 1,
+                "Native Codex multi-root forks are not implemented"
+            );
+            let guard = forks::SessionGuard::acquire(self.sessions.clone(), id.clone())?;
+            ensure!(
+                self.fork_preferences.borrow().len() < 64,
+                "Too many unopened native forks; reconnect before branching again"
+            );
+            let preferences = self
+                .sessions
+                .borrow()
+                .get(&id)
+                .context("Source session closed")?
+                .preferences
+                .clone();
+            let result = forks::fork(
+                &self.rpc,
+                &id,
+                work_dirs.ordered_paths().next().map(PathBuf::as_path),
+                point.as_ref(),
+            )
+            .await;
+            if let Ok(id) = &result {
+                self.fork_preferences
+                    .borrow_mut()
+                    .insert(id.clone(), preferences);
+            }
+            drop(guard);
+            result
+        });
+        let (sender, receiver) = oneshot::channel();
+        cx.spawn(async move |_| {
+            if let Err(result) = sender.send(operation.await) {
+                match result {
+                    Ok(copy) => {
+                        cleanup.fork_preferences.borrow_mut().remove(&copy);
+                        cleanup
+                            .rpc
+                            .request("thread/archive", json!({"threadId":copy}))
+                            .await
+                            .log_err();
+                    }
+                    Err(error) => {
+                        log::warn!("Cancelled Codex fork completed with an error: {error}")
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |_| {
+            receiver
+                .await
+                .context("Codex fork task ended without a result")?
+        })
     }
     fn load_session(
         self: Rc<Self>,
@@ -689,7 +1191,7 @@ impl AgentConnection for NativeCodexConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         // UI uses history_page after opening; never hydrate the entire stored conversation here.
-        cx.spawn(async move |cx| self.open(Some(id), project, dirs, title, cx).await)
+        self.open_task(Some(id), project, dirs, title, cx)
     }
     fn supports_history_pages(&self) -> bool {
         true
@@ -701,9 +1203,11 @@ impl AgentConnection for NativeCodexConnection {
         cx: &mut App,
     ) -> Task<Result<HistoryPage>> {
         let rpc = self.rpc.clone();
-        cx.spawn(async move |_| {
+        cx.spawn(async move |cx| {
             let response = rpc.request("thread/turns/list", json!({"threadId":id,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"})).await?;
-            crate::codex_history::decode_page(response, cursor.as_deref())
+            cx.background_spawn(async move {
+                crate::codex_history::decode_page(response, cursor.as_deref())
+            }).await
         })
     }
     fn auth_methods(&self) -> &[acp::AuthMethod] {
@@ -728,7 +1232,7 @@ impl AgentConnection for NativeCodexConnection {
         let Some(session) = sessions.get_mut(&params.session_id) else {
             return Task::ready(Err(anyhow::anyhow!("Native Codex session not open")));
         };
-        if session.active.is_some() {
+        if session.active.is_some() || session.forking {
             return Task::ready(Err(anyhow::anyhow!("A Codex turn is already running")));
         }
         if session.uncertain {
@@ -737,15 +1241,29 @@ impl AgentConnection for NativeCodexConnection {
             )));
         }
         let turn_params = session.preferences.turn_params(&params.session_id, input);
+        let thread = session.thread.clone();
         session.active = Some(ActiveTurn {
             id: None,
             completion,
             events: TurnEvents::default(),
             cancel_requested: false,
+            optimistic_message: None,
         });
         let rpc = self.rpc.clone();
         let sessions = self.sessions.clone();
-        cx.spawn(async move |_| {
+        cx.spawn(async move |cx| {
+            // AcpThread calls prompt while updating itself. Defer access until that
+            // update has returned, but bind the draft before sending any RPC.
+            let optimistic_message = thread.upgrade().and_then(|thread| {
+                thread.update(cx, |thread, _| thread.identify_pending_user_message())
+            });
+            if let Some(active) = sessions
+                .borrow_mut()
+                .get_mut(&params.session_id)
+                .and_then(|session| session.active.as_mut())
+            {
+                active.optimistic_message = optimistic_message;
+            }
             let response = match rpc.request("turn/start", turn_params).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -813,7 +1331,7 @@ impl AgentConnection for NativeCodexConnection {
                     .sessions
                     .borrow()
                     .get(&id)
-                    .is_some_and(|session| session.active.is_some()),
+                    .is_some_and(|session| session.active.is_some() || session.forking),
                 "Stop the active turn before closing its session"
             );
             self.rpc
@@ -902,7 +1420,7 @@ impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
                     .get_mut(&self.id)
                     .context("Codex session was closed")?;
                 ensure!(
-                    session.active.is_none() && !session.uncertain,
+                    session.active.is_none() && !session.uncertain && !session.forking,
                     "Stop the turn or reconnect before changing Codex settings"
                 );
                 session.preferences.change(id.0.as_ref(), &value)?;

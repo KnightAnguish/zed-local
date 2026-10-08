@@ -102,6 +102,53 @@ pub(super) struct Preferences {
 }
 
 impl Preferences {
+    pub(super) fn apply_editor_defaults(&mut self, cx: &App) -> Result<()> {
+        let Some(store) = cx.try_global::<::settings::SettingsStore>() else {
+            return Ok(());
+        };
+        let settings = store.get::<project::agent_server_store::AllAgentServersSettings>(None);
+        let Some(agent) = settings.get(crate::CODEX_ID) else {
+            return Ok(());
+        };
+        let defaults = match agent {
+            project::agent_server_store::CustomAgentServerSettings::Custom {
+                default_config_options,
+                ..
+            }
+            | project::agent_server_store::CustomAgentServerSettings::Registry {
+                default_config_options,
+                ..
+            } => default_config_options,
+        };
+        // Model must be selected before validating its effort and Fast capability.
+        for id in ["model", "reasoning-effort", "fast-mode", "mode"] {
+            if let Some(value) = defaults.get(id).or_else(|| {
+                (id == "reasoning-effort")
+                    .then(|| defaults.get("reasoning_effort"))
+                    .flatten()
+            }) {
+                let value = if let Some(value) = value.as_value_id() {
+                    acp::SessionConfigOptionValue::value_id(value.to_owned())
+                } else if let Some(value) = value.as_bool() {
+                    acp::SessionConfigOptionValue::boolean(value)
+                } else {
+                    bail!("Unsupported saved native Codex setting {id}");
+                };
+                self.change(id, &value)
+                    .with_context(|| format!("Cannot apply saved Codex {id}; no turn was sent"))?;
+            }
+        }
+        if !defaults.contains_key("mode") {
+            if let Some(mode) = agent.default_mode() {
+                self.change(
+                    "mode",
+                    &acp::SessionConfigOptionValue::value_id(mode.to_owned()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn from_response(models: Rc<Vec<Model>>, response: &Value) -> Result<Self> {
         Ok(Self {
             models,
@@ -159,7 +206,7 @@ impl Preferences {
             }
             result.push(
                 acp::SessionConfigOption::select(
-                    "reasoning-effort",
+                    "reasoning_effort",
                     "Reasoning effort",
                     current_effort.to_owned(),
                     efforts,
@@ -233,7 +280,7 @@ impl Preferences {
                 self.effort = effort;
                 self.tier = tier;
             }
-            "reasoning-effort" => {
+            "reasoning-effort" | "reasoning_effort" => {
                 let selected = selected()?;
                 if selected == self.effort.as_deref().unwrap_or("inherit") {
                     return Ok(());

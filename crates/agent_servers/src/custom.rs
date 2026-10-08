@@ -266,6 +266,25 @@ impl AgentServer for CustomAgentServer {
                     anyhow::Ok(agent.get_command(vec![], extra_env, &mut cx.to_async()))
                 })??
                 .await?;
+            if agent_id.as_ref() == CODEX_ID
+                && command
+                    .env
+                    .as_ref()
+                    .and_then(|env| env.get("ZED_CODEX_NATIVE"))
+                    .is_some_and(|value| value == "1")
+            {
+                let directory = project.read_with(cx, |project, cx| {
+                    anyhow::ensure!(project.is_local(), "Native Codex requires a local project");
+                    Ok(project
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf()))
+                })?;
+                let connection =
+                    crate::codex_native::NativeCodexConnection::connect(command, directory, cx)
+                        .await?;
+                return Ok(connection as Rc<dyn AgentConnection>);
+            }
             let connection = crate::acp::connect(
                 agent_id,
                 project,

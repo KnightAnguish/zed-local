@@ -7872,6 +7872,12 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_message_context_menu_uses_clicked_content(cx: &mut TestAppContext) {
         init_test(cx);
+        let local_path = if cfg!(windows) {
+            r"C:\Users\DecayScope\Documents\GitHub\Рабочка\README.md"
+        } else {
+            "/tmp/Рабочка/README.md"
+        };
+        let local_url = url::Url::from_file_path(local_path).expect("local file URL");
         let acp::ContentBlock::Image(image) = png_image() else {
             panic!("expected image fixture");
         };
@@ -7882,7 +7888,7 @@ pub(crate) mod tests {
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                "[first](https://one.example/)".into(),
+                format!("[first]({local_url})").into(),
             )),
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(png_image())),
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(linked_image.into())),
@@ -7899,11 +7905,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         for (selector, offset, expected) in [
-            (
-                "message-content-1-0-0",
-                point(px(12.), px(8.)),
-                "https://one.example/",
-            ),
+            ("message-content-1-0-0", point(px(12.), px(8.)), local_path),
             (
                 "message-content-1-0-2",
                 point(px(0.5), px(0.5)),

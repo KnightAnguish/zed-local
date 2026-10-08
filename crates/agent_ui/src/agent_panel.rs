@@ -5614,7 +5614,7 @@ impl AgentPanel {
         let Some(thread_view) = view.root_thread_view() else {
             return;
         };
-        if point.is_some() && !thread_view.read(cx).can_switch_variant(cx) {
+        if point.is_some() && !thread_view.read(cx).can_prepare_variant(cx) {
             Self::show_deferred_toast(
                 &self.workspace,
                 "Finish the current turn and save or clear the draft before editing",
@@ -5649,11 +5649,21 @@ impl AgentPanel {
             cx,
         );
         self.pending_session_fork = true;
+        thread_view.update(cx, |view, cx| {
+            view.set_variant_loading(true, cx);
+        });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = request.await;
             this.update_in(cx, |this, window, cx| {
                 this.pending_session_fork = false;
+                thread_view.update(cx, |view, cx| {
+                    view.set_variant_loading(false, cx);
+                    if result.is_ok() && draft.is_some() {
+                        view.cancel_editing(&Default::default(), window, cx);
+                    }
+                    cx.notify();
+                });
                 match result {
                     Ok(session_id) => {
                         let child_id = ThreadId::new();
@@ -5682,7 +5692,7 @@ impl AgentPanel {
                         let initial_content =
                             draft.map(|blocks| AgentInitialContent::ContentBlock {
                                 blocks,
-                                auto_submit: false,
+                                auto_submit: true,
                             });
                         let thread = this.create_agent_thread_inner(
                             agent,
@@ -9661,6 +9671,130 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    #[gpui::test]
+    async fn native_message_edit_keeps_source_until_send_and_preserves_failed_edit(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_message_fork()
+            .with_supports_load_session(true);
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+        let root = panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let thread = root.read_with(&cx, |view, _| view.thread.clone());
+        thread.update(&mut cx, |thread, cx| {
+            thread
+                .prepend_history(
+                    vec![acp_thread::HistoryMessage {
+                        id: acp::MessageId::new("original-message"),
+                        is_user: true,
+                        content: vec!["Original message".into()],
+                    }],
+                    false,
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        let source = active_thread_id(&panel, &cx);
+        root.update_in(&mut cx, |view, window, cx| {
+            view.begin_message_edit(0, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(active_thread_id(&panel, &cx), source);
+        assert!(connection.fork_requests().is_empty());
+        let editor = root.read_with(&cx, |view, cx| {
+            assert_eq!(view.editing_message, Some(0));
+            assert!(!view.can_switch_variant(cx));
+            assert_eq!(view.thread.read(cx).entries().len(), 1);
+            view.entry_view_state
+                .read(cx)
+                .entry(0)
+                .unwrap()
+                .message_editor()
+                .unwrap()
+                .clone()
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("Revised message", window, cx)
+        });
+        root.update_in(&mut cx, |view, window, cx| {
+            view.cancel_editing(&Default::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(&cx, |editor, cx| editor.text(cx)),
+            "Original message"
+        );
+        assert_eq!(active_thread_id(&panel, &cx), source);
+        root.update_in(&mut cx, |view, window, cx| {
+            view.begin_message_edit(0, window, cx)
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("Retryable edit", window, cx)
+        });
+        root.update_in(&mut cx, |view, window, cx| {
+            view.regenerate(0, editor.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(connection.fork_requests().len(), 1);
+        assert_eq!(active_thread_id(&panel, &cx), source);
+        root.read_with(&cx, |view, cx| {
+            assert_eq!(view.editing_message, Some(0));
+            assert!(!view.is_loading_contents);
+            assert_eq!(editor.read(cx).text(cx), "Retryable edit");
+            assert_eq!(
+                view.thread.read(cx).entries()[0]
+                    .user_message()
+                    .unwrap()
+                    .chunks,
+                vec!["Original message".into()]
+            );
+        });
+        connection.set_fork_succeeds(true);
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Edited reply".into()),
+        )]);
+        root.update_in(&mut cx, |view, window, cx| {
+            view.regenerate(0, editor.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let child = active_thread_id(&panel, &cx);
+        assert_ne!(child, source);
+        assert_eq!(connection.fork_requests().len(), 2);
+        root.read_with(&cx, |view, cx| {
+            assert_eq!(view.editing_message, None);
+            assert_eq!(
+                view.thread.read(cx).entries()[0]
+                    .user_message()
+                    .unwrap()
+                    .chunks,
+                vec!["Original message".into()]
+            );
+        });
+        panel.read_with(&cx, |panel, cx| {
+            let root = panel.active_thread_view(cx).unwrap();
+            let view = root.read(cx);
+            assert!(
+                view.can_switch_variant(cx),
+                "Sent edit must not trap the user in a draft"
+            );
+            assert_eq!(
+                view.thread.read(cx).entries()[0]
+                    .user_message()
+                    .unwrap()
+                    .chunks,
+                vec!["Retryable edit".into()]
+            );
+            assert!(
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .variant_ids(child)
+                    .contains(&source)
+            );
+        });
     }
 
     #[gpui::test]

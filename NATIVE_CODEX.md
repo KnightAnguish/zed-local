@@ -1,18 +1,45 @@
 # Native Codex migration
 
+## Send crash repair (2026-10-02)
+
+The first main-profile trial exposed reentrant AcpThread access in native prompt.
+A regression through AcpThread::send_raw fails before the fix and passes afterward;
+direct connection tests had missed the real caller. Optimistic message identification
+now runs in the foreground task before RPC, after the caller entity update returns.
+Desktop Zed Local targets `builds/native-codex-sendfix-20261002`; user relaunch and
+GUI acceptance remain pending. Pencil/branch actions now share the copy/navigation
+row instead of standalone text buttons. Remaining migration gaps below still apply.
+
 ## Decision and deployment boundary
 
 2026-09-30: the user chose a **complete Rust replacement** of `codex-acp-modern`,
 not bundling the Node/TypeScript adapter. Branch: `decay/native-codex`, based on
 `c5adca403b` (native history stages 1–3). Do not ask this architecture question again.
 
-The replacement is **not production-ready**. `CustomAgentServer::connect` still
-selects the old ACP connector. `codex_native` is compiled and tested, but is not
-reachable from editor routing yet. Do not remove the adapter or switch settings
-until the remaining parity gates below have passed. No account, production profile,
-chat database, installed editor, or adapter bundle is changed by these sources.
+The replacement is **not fully parity-complete**. `CustomAgentServer::connect` defaults
+to the old ACP connector. An explicit `ZED_CODEX_NATIVE=1` in the configured Codex
+agent environment selects the native connector. No automatic fallback to ACP occurs
+after a native connection error. Keep the adapter and previous build for rollback.
+
+2026-10-02 trial deployment exception: after the isolated GUI attempt, the user
+explicitly requested rebuilding and trying the main installation, accepting that
+problems would be reported through Codex. The desktop Zed Local shortcut now targets
+`builds/native-codex-20261002`; the existing profile has only the native opt-in added.
+The Node command remains as backward-compatible configuration for the old executable;
+the new connector ignores it and starts CODEX_PATH directly. This is a manual-restart
+pending trial, NOT proof of GUI acceptance or completion of the remaining gates.
+Settings, shortcut and SQLite online snapshots are backed up under the maintenance
+workspace's `state/backups/native-cutover-20261002`. Account files were not accessed.
 
 ## Structure
+
+2026-10-02 pencil correction: message editing now uses the inline editor on the
+original thread. Opening/cancelling the editor performs no fork or rewind. Sending
+resolves the edited content, forks the session, and auto-submits only in the new
+variant. A fork failure leaves the inline draft available for retry. While the
+request is pending, the editor is read-only; variant switching is blocked until
+editing is cancelled or sent. Existing legacy drafts created by the earlier
+eager-fork UI are not deleted or rewritten by this change.
 
 Deployment clarification (2026-09-30): the user approved using the Zed fork before
 native connector parity. Deploy the editor with the existing ACP connector while
@@ -52,9 +79,9 @@ cutover until restored projects/chats and a fresh adapter connection are checked
   No second registry, no config writes, no automatically reenabled skill. Invalid
   profiles fail visibly. `CODEX_ACP_SKILL_PROFILES=off`/explicit path preserved.
 
-The candidate opens with a read-only sandbox; explicit permission-mode selection now
-changes subsequent turns. Import of Zed's saved defaults is still pending. Do not
-silently route a user's Full Access session to it.
+The candidate opens with a read-only sandbox; explicit permission-mode selection
+changes subsequent turns. Saved editor model/effort/Fast/mode defaults are applied
+before a turn; an unsupported saved value fails visibly rather than being substituted.
 Unknown server requests are rejected, never accepted automatically. Unsupported prompt
 attachments fail explicitly rather than disappearing from a submitted prompt.
 
@@ -65,14 +92,14 @@ attachments fail explicitly rather than disappearing from a submitted prompt.
 | Process/RPC | Implemented; fake-peer race/disconnect tests; real-runtime read-only probe passed | Process shutdown/reconnect/UI smoke |
 | Sessions | Create/resume/list/name/archive/unsubscribe implemented | Resume/open error cleanup; active-turn reattachment; lifecycle/close tests |
 | Chat/history | Streaming, final dedup, initial tail ≤20 turns, page reader | Controller integration with native connector; long-session RSS; no full-history regression |
-| Permissions | Command/file allow-once/reject/cancel UI | Full decision contract, server resolution cleanup, permission profile requests, structured questions, MCP elicitations/auth |
-| Tools | Basic tool lifecycle and completed text output | Terminal streaming/lifetime/output bounds, structured file diffs/action log, MCP output, plans/compaction, subagents/background tasks |
+| Permissions | Command/file/session/policy choices, explicit permission-profile grants; questions and standard MCP forms/URLs; resolution/disconnect cleanup | Real GUI contract; protected secret questions, OpenAI-form variants, URL-completion reconciliation and overlapping callbacks for one tool |
+| Tools | Bounded command output streaming, final replacement, text diffs, MCP and mixed media output, generated images, plans, basic subagent state | Native terminal controls/lifetime, structured file diffs/action log, background task reconciliation and GUI smoke |
 | Skills | Existing registry/catalog/cache merge ported; policy unit tests | Real project profile comparison against adapter; skill mention/completion; multi-root and project MCP bridge |
-| Settings | Paginated catalog, per-session model/effort/Fast/permissions, next-turn overrides, UI watches | Collaboration mode, saved picker choices before a turn, Zed defaults, server-settings reconciliation and GUI tests |
+| Settings | Paginated catalog, per-session model/effort/Fast/permissions, next-turn overrides, UI watches, editor defaults with legacy effort-key compatibility | Collaboration mode, durable unsent per-session picker choices, server-settings reconciliation and GUI tests |
 | Quota | Persistent native RPC, shared formatter, refresh/watch, account/disconnect invalidation | Native GUI smoke and sustained reconnect tests |
 | Auth/provider | Existing account checked through RPC | Login/logout browser/terminal flows, token refresh, gateway/custom providers; do not expose credentials |
-| Forks/edit | Not advertised by replacement | Full fork, message-boundary resolution, empty first-message fork/revert, stable user IDs, grouped variants regression tests |
-| Attachments | Text and inline-image input | Resource/embedded/skill/audio inputs; generated images/artifacts and historical input restoration |
+| Forks/edit | Native full/message-boundary forks; copy-only first-turn revert; live user IDs; in-memory preference inheritance | Native GUI/grouped-variant smoke, attachment drafts, persisted unsent preferences, interrupted-operation reconciliation |
+| Attachments | Text/image/audio, resource links and embedded text/binary media; generated and tool-output images | Skill input/completion, historical input restoration without loading large media eagerly, live/UI smoke |
 | Commands/goals | Not implemented | Command inventory, compact/review/goals/steer, async-task reconciliation |
 | Remote | Explicitly rejected | Remote executable/environment/filesystem routing, or separately agreed unsupported scope |
 
@@ -147,3 +174,59 @@ local stdio transport. Rewriting this layer does not prove that warning is fixed
   Installed runtime schemas take precedence where current documentation differs.
 - Updated real-runtime read-only probe passed in 0.84 s, including model type validation.
   Full Windows dev build passed in 52.42 s. No production switch or manual GUI test.
+
+## Native forks checkpoint (2026-10-02)
+
+- Production still uses the old adapter bundle; it was NOT rebuilt or replaced.
+  The requested end state remains the native Rust connection, not an updated adapter.
+- `codex_native/forks.rs` performs native `thread/fork` and `thread/revert` requests.
+  Message boundaries are resolved one summary page at a time (20 turns), with cursor
+  cycle/page-count guards. First-message edits clear only the new copy and verify it
+  contains no turns. Failed copy preparation archives only that copy; an ID equal to
+  the source is rejected before any revert/archive. Local active/uncertain sessions,
+  concurrent fork/send/close and unsupported remote/multi-root paths are rejected.
+- Native user item events bind their server ID to the exact optimistic entry without
+  echoing its text. A stable local ClientUserMessageId survives history prepends;
+  late events from a different turn cannot bind a new user message.
+  Forks inherit current in-memory model/effort/Fast/permission picks on first load.
+  The existing variant controller owns grouping and per-session context indicators.
+  The legacy unavailable-edit overlay is hidden when message forking is supported.
+- Normal resume/open failures unsubscribe their server session, keep the source and
+  pending fork preferences, and do not register a broken local session. Cancellation
+  while awaiting open/fork still requires lifecycle reconciliation before deployment.
+- Real installed 0.159.2 probe passed: empty first-message fork, final-reply prefix,
+  full copy and unchanged source turns. No inference requests. Three copies per probe
+  archived; the previously archived diagnostic source was restored to its archive.
+  The first attempt only discovered the source was archived and made no copies.
+- The live Rust test is ignored by default. Use the existing explicit runtime/thread
+  environment variables, plus `ZED_CODEX_FORK_TEST_UNARCHIVE=1` ONLY for an archived
+  disposable diagnostic source; it restores archive state after the test.
+- Final suites/build results are recorded in the workspace maintenance log. These
+  changes are not an installed fix: all remaining parity gates and isolated GUI tests
+  still apply. Do not switch the user's profile merely because fork tests pass.
+- Final sequential tests: 159 acp_thread + 75 agent_servers + 469 agent_ui passed;
+  three live tests ignored by default. Current-binary real fork probe separately passed.
+  One earlier parallel UI run had a WSL metadata migration failure; isolated and serial
+  reruns passed, cause not established. Full dev Zed + CLI build passed (9m53s).
+  Candidate was not installed or launched; native GUI interaction remains unverified.
+
+## Native input, permissions and events checkpoint (2026-10-02)
+
+- Added explicit command/file session grants and server-proposed policy amendments;
+  permission-profile choices grant exactly the requested fields for a turn/session.
+  Cancellation never selects an allow option. Permission details are visible in the card.
+- Questions use the existing Zed elicitation form with stable question IDs and validated
+  answers. Server-resolved requests cancel the form. Secret inputs are rejected because
+  the current form path does not guarantee protected entry. Standard MCP forms and URL
+  requests are translated; unsupported form modes fail explicitly.
+- Input resources retain their content/order; audio is no longer discarded. Tool output
+  tails are limited to 64 KiB (plus a marker), UTF-8 safe, with at most 128 live output
+  streams per turn. Completed command output replaces the stream, not appends it.
+  MCP output, generated PNGs, mixed function media, plan updates and subagent summaries
+  are represented in the UI data model. This is not yet a bound on all live chat memory.
+- Open/fork operations finish reconciliation even if their UI waiter is dropped.
+  Abandoned opens unsubscribe; abandoned forks archive only the new copy. Released
+  thread entities remove only their own session generation and unsubscribe.
+- Explicit experimental routing is available for a separate profile; production routing,
+  executable, account and chat store have NOT been changed. Remaining table gates still
+  apply. GPUI/unit tests are not a manual/native GUI acceptance test.

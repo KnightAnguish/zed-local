@@ -207,6 +207,18 @@ struct Turn {
 }
 
 pub(crate) fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result<HistoryPage> {
+    decode_page_in(
+        value,
+        previous_cursor,
+        &acp_thread::attachment_store::root(),
+    )
+}
+
+fn decode_page_in(
+    value: Value,
+    previous_cursor: Option<&str>,
+    attachment_root: &std::path::Path,
+) -> Result<HistoryPage> {
     let page: TurnPage = serde_json::from_value(value)?;
     ensure!(
         page.data.len() <= PAGE_SIZE,
@@ -265,18 +277,63 @@ pub(crate) fn decode_page(value: Value, previous_cursor: Option<&str>) -> Result
                                     .context("History text is missing")?,
                             )))
                         }
-                        // Keep attachment references without eagerly fetching or decoding old images.
+                        // Preserve originals only in the requested page; do not fetch remote
+                        // resources or decode full-resolution pixels into the UI.
                         Some("localImage") => {
                             let path = input.get("path").and_then(Value::as_str).unwrap_or("");
-                            content.push(history_image_link(path).unwrap_or_else(|| {
+                            let original = std::path::Path::new(path);
+                            let saved = if original.is_absolute()
+                                && !path.starts_with("//")
+                                && !path.starts_with(r"\\")
+                                && original.is_file()
+                            {
+                                match acp_thread::attachment_store::import_file(
+                                    attachment_root,
+                                    original,
+                                ) {
+                                    Ok(path) => Some(path),
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Could not preserve local image attachment: {error}"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let saved_path = saved.as_ref().map(|path| path.to_string_lossy());
+                            content.push(
+                                history_image_link(saved_path.as_deref().unwrap_or(path))
+                                    .unwrap_or_else(|| {
+                                        acp::ContentBlock::Text(acp::TextContent::new(
+                                            "[Image attachment unavailable]",
+                                        ))
+                                    }),
+                            );
+                        }
+                        Some("image") => {
+                            let restored =
+                                input.get("url").and_then(Value::as_str).and_then(|url| {
+                                    match acp_thread::attachment_store::save_data_url(
+                                        attachment_root,
+                                        url,
+                                    ) {
+                                        Ok(path) => history_image_link(&path.to_string_lossy()),
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Could not restore image attachment: {error}"
+                                            );
+                                            None
+                                        }
+                                    }
+                                });
+                            content.push(restored.unwrap_or_else(|| {
                                 acp::ContentBlock::Text(acp::TextContent::new(
                                     "[Image attachment unavailable]",
                                 ))
                             }));
                         }
-                        Some("image") => content.push(acp::ContentBlock::Text(
-                            acp::TextContent::new("[Image attachment]"),
-                        )),
                         _ => content.push(acp::ContentBlock::Text(acp::TextContent::new(
                             "[Attachment]",
                         ))),
@@ -332,6 +389,35 @@ fn history_image_link(path: &str) -> Option<acp::ContentBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restores_embedded_history_images_to_permanent_files() {
+        let directory = tempfile::tempdir().expect("store");
+        // A complete 1x1 PNG; the history decoder must not retain its base64 payload.
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=";
+        let page = decode_page_in(
+            json!({"data":[{"items":[{
+                "type":"userMessage","id":"attachment","content":[
+                    {"type":"image","url":format!("data:image/png;base64,{data}")}
+                ]
+            }]}]}),
+            None,
+            directory.path(),
+        )
+        .expect("page");
+        let acp::ContentBlock::ResourceLink(link) = &page.messages[0].content[0] else {
+            panic!("durable link")
+        };
+        assert!(
+            link.uri
+                .contains(directory.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).expect("files").count(),
+            1
+        );
+        assert!(!format!("{:?}", page.messages).contains(data));
+    }
 
     #[test]
     fn codex_history_rpc_errors_are_not_empty_pages() {
@@ -420,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_history_attachment_does_not_load_data_url() {
+    fn codex_history_invalid_attachment_does_not_expose_data_url() {
         let page = decode_page(json!({"data":[{"items":[{"type":"userMessage","id":"image","content":[{"type":"image","url":"data:image/png;base64,secret"}]}]}],"nextCursor":null}), None).expect("page");
         assert!(!format!("{:?}", page.messages).contains("secret"));
     }

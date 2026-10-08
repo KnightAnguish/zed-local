@@ -79,6 +79,8 @@ pub struct MarkdownPreviewView {
     /// Search results depend on the parsed markdown, which lags behind the source while a
     /// background parse is in flight. Tracked so matches can be invalidated once it lands.
     markdown_parse_pending: bool,
+    literary_review: Option<Entity<crate::literary_review::LiteraryReview>>,
+    show_literary_review: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -127,6 +129,25 @@ enum PreviewLinkTarget {
 }
 
 impl MarkdownPreviewView {
+    fn open_literary_review(&mut self, cx: &mut Context<Self>) {
+        if self.literary_review.is_none() {
+            let Some(editor) = self.active_editor.as_ref() else {
+                return;
+            };
+            let Some(buffer) = editor.editor.read(cx).buffer().read(cx).as_singleton() else {
+                return;
+            };
+            let Some(workspace) = self.workspace.upgrade() else {
+                return;
+            };
+            let project = workspace.read(cx).project().clone();
+            self.literary_review =
+                Some(cx.new(|cx| crate::literary_review::LiteraryReview::new(buffer, project, cx)));
+        }
+        self.show_literary_review = true;
+        cx.notify();
+    }
+
     pub fn register(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         cx.default_global::<SuppressedAutoPreviews>();
         let workspace_entity = cx.entity();
@@ -196,6 +217,18 @@ impl MarkdownPreviewView {
                 Self::open_preview_in_pane(workspace, editor, pane, window, cx);
             }
         });
+
+        workspace.register_action(
+            move |workspace, _: &crate::OpenLiteraryReview, window, cx| {
+                if let Some(editor) = Self::resolve_active_item_as_markdown_editor(workspace, cx) {
+                    let pane = workspace.active_pane().clone();
+                    let preview = Self::activate_or_add_preview(
+                        workspace, editor, pane, true, true, window, cx,
+                    );
+                    preview.update(cx, |preview, cx| preview.open_literary_review(cx));
+                }
+            },
+        );
 
         workspace.register_action(move |workspace, _: &OpenPreviewToTheSide, window, cx| {
             if let Some(editor) = Self::resolve_active_item_as_markdown_editor(workspace, cx) {
@@ -417,6 +450,8 @@ impl MarkdownPreviewView {
                 hovered_url: None,
                 mode,
                 markdown_parse_pending: false,
+                literary_review: None,
+                show_literary_review: false,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -558,6 +593,8 @@ impl MarkdownPreviewView {
                         this.update_markdown_from_active_editor(true, false, window, cx);
                     }
                     EditorEvent::FileHandleChanged => {
+                        this.literary_review = None;
+                        this.show_literary_review = false;
                         this.base_directory =
                             Self::get_folder_for_active_editor(editor.read(cx), cx);
                         this.update_markdown_from_active_editor(false, false, window, cx);
@@ -583,6 +620,8 @@ impl MarkdownPreviewView {
 
         self.base_directory = Self::get_folder_for_active_editor(editor.read(cx), cx);
         self.hovered_url = None;
+        self.literary_review = None;
+        self.show_literary_review = false;
         self.active_editor = Some(EditorState {
             editor,
             _subscription: subscription,
@@ -1753,6 +1792,25 @@ impl Item for MarkdownPreviewView {
 
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.show_literary_review
+            && let Some(review) = &self.literary_review
+        {
+            return v_flex()
+                .size_full()
+                .min_h_0()
+                .track_focus(&self.focus_handle)
+                .bg(cx.theme().colors().editor_background)
+                .child(
+                    Button::new("literary-read", "Вернуться к чтению").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_literary_review = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(review.clone())
+                .into_any_element();
+        }
         let preview_theme = self.resolve_preview_theme(cx);
         let bg_color = preview_theme
             .as_ref()
@@ -1796,6 +1854,11 @@ impl Render for MarkdownPreviewView {
                         .track_scroll(&self.scroll_handle)
                         .restrict_scroll_to_axis()
                         .p_4()
+                        .child(
+                            Button::new("literary-open", "Литературные правки").on_click(
+                                cx.listener(|this, _, _, cx| this.open_literary_review(cx)),
+                            ),
+                        )
                         .child({
                             let markdown_element =
                                 self.render_markdown_element(&preview_theme, window, cx);
@@ -1881,6 +1944,7 @@ impl Render for MarkdownPreviewView {
                         .child(LinkPreview::new(hovered_url.as_ref(), cx)),
                 )
             })
+            .into_any_element()
     }
 }
 
