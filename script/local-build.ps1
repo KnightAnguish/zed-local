@@ -29,8 +29,16 @@ try {
     # Explicit selection avoids a machine-specific default selecting an older toolchain without Spectre libraries.
     Import-Module (Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
     Enter-VsDevShell -VsInstallPath $visualStudio -SkipAutomaticLocation -DevCmdArguments "-arch=amd64 -host_arch=amd64 -vcvars_ver=$($toolchain.Name)"
-    & cargo build --locked -p zed -p cli --profile $Profile
-    if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)." }
+    # Windows PowerShell can turn redirected linker warnings into terminating errors.
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & cargo build --locked -p zed -p cli --profile $Profile
+        $cargoExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($cargoExit -ne 0) { throw "Cargo build failed ($cargoExit)." }
 } finally {
     Pop-Location
     $env:CARGO_TARGET_DIR = $previousTarget
