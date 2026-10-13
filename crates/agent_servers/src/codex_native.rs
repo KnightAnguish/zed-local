@@ -5,6 +5,7 @@ mod forks;
 mod permissions;
 mod profiles;
 mod questions;
+mod recovery;
 mod settings;
 mod transport;
 
@@ -31,6 +32,7 @@ struct ActiveTurn {
     events: TurnEvents,
     cancel_requested: bool,
     optimistic_message: Option<acp_thread::ClientUserMessageId>,
+    recovery: recovery::Progress,
 }
 
 struct Session {
@@ -211,6 +213,11 @@ impl NativeCodexConnection {
         }
         if method == "serverRequest/resolved" {
             if let Some(id) = params.get("requestId") {
+                for session in self.sessions.borrow_mut().values_mut() {
+                    if let Some(active) = session.active.as_mut() {
+                        active.recovery.resolve_request(&id.to_string());
+                    }
+                }
                 let approval = self.approvals.borrow_mut().remove(&id.to_string());
                 if let Some(approval) = approval {
                     approval.cancel_ui(cx);
@@ -266,6 +273,7 @@ impl NativeCodexConnection {
                     return Ok(());
                 }
             }
+            active.recovery.observe(method, &params);
             if method == "turn/started" {
                 active.id = Some(text(&params["turn"], "id")?.to_owned());
                 if active.cancel_requested {
@@ -325,6 +333,16 @@ impl NativeCodexConnection {
                 .get(&acp::SessionId::new(id))
                 .map(|session| session.thread.clone())
         });
+        if let Some(id) = params["threadId"].as_str() {
+            if let Some(active) = self
+                .sessions
+                .borrow_mut()
+                .get_mut(&acp::SessionId::new(id))
+                .and_then(|session| session.active.as_mut())
+            {
+                active.recovery.begin_request(key.clone());
+            }
+        }
         let rpc = self.rpc.clone();
         let approval_thread = thread.clone();
         let approval_item = params["itemId"]
@@ -375,6 +393,11 @@ impl NativeCodexConnection {
             .await;
             rpc.respond(id, result).log_err();
             if let Some(connection) = weak.upgrade() {
+                for session in connection.sessions.borrow_mut().values_mut() {
+                    if let Some(active) = session.active.as_mut() {
+                        active.recovery.resolve_request(&task_key);
+                    }
+                }
                 connection.approvals.borrow_mut().remove(&task_key);
             }
         });
@@ -905,6 +928,244 @@ mod tests {
         );
     }
 
+    async fn quiet_prompt(
+        cx: &mut TestAppContext,
+    ) -> (
+        Rc<NativeCodexConnection>,
+        transport::FakePeer,
+        Entity<AcpThread>,
+        Task<Result<acp::PromptResponse>>,
+    ) {
+        let (connection, peer, thread) = session(cx).await;
+        let prompt = cx.update(|cx| {
+            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+        });
+        let request = peer.next().await;
+        peer.send(json!({"id":request["id"],"result":{"turn":{"id":"turn"}}}))
+            .await;
+        cx.run_until_parked();
+        (connection, peer, thread, prompt)
+    }
+
+    fn quiet_minutes(cx: &mut TestAppContext, minutes: usize) {
+        for _ in 0..minutes {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_secs(60));
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn recovery_reads_terminal_state_without_loading_history_or_replay(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        quiet_minutes(cx, 3);
+        let read = peer.next().await;
+        assert_eq!(read["method"], "thread/read");
+        assert_eq!(read["params"]["includeTurns"], false);
+        peer.send(
+            json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"idle"}}}}),
+        )
+        .await;
+        let turns = peer.next().await;
+        assert_eq!(turns["method"], "thread/turns/list");
+        assert_eq!(turns["params"]["itemsView"], "notLoaded");
+        peer.send(json!({"id":turns["id"],"result":{"data":[{"id":"turn","status":"failed","error":{"message":"connection failed"}}]}})).await;
+        assert!(
+            prompt
+                .await
+                .expect_err("failed turn")
+                .to_string()
+                .contains("connection failed")
+        );
+        let sessions = connection.sessions.borrow();
+        let session = &sessions[&acp::SessionId::new("session")];
+        assert!(session.active.is_none());
+        assert!(!session.uncertain);
+    }
+
+    #[gpui::test]
+    async fn recovery_missing_reply_requires_reload_not_false_success(cx: &mut TestAppContext) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        quiet_minutes(cx, 3);
+        let read = peer.next().await;
+        peer.send(
+            json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"idle"}}}}),
+        )
+        .await;
+        let turns = peer.next().await;
+        peer.send(json!({"id":turns["id"],"result":{"data":[{"id":"turn","status":"completed"}]}}))
+            .await;
+        assert!(
+            prompt
+                .await
+                .expect_err("missing reply")
+                .to_string()
+                .contains("load the saved reply")
+        );
+        assert!(connection.sessions.borrow()[&acp::SessionId::new("session")].uncertain);
+        let retry = cx.update(|cx| {
+            connection.prompt(acp::PromptRequest::new("session", vec!["retry".into()]), cx)
+        });
+        assert!(
+            retry
+                .await
+                .expect_err("no automatic replay")
+                .to_string()
+                .contains("unknown outcome")
+        );
+    }
+
+    #[gpui::test]
+    async fn recovery_silent_generation_interrupts_only_its_exact_turn(cx: &mut TestAppContext) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        for minute in 1..=15 {
+            quiet_minutes(cx, 1);
+            if minute >= 3 {
+                let read = peer.next().await;
+                assert_eq!(read["method"], "thread/read");
+                assert_eq!(read["params"]["threadId"], "session");
+                peer.send(json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"active","activeFlags":[]}}}})).await;
+                cx.run_until_parked();
+            }
+        }
+        let interrupt = peer.next().await;
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(
+            interrupt["params"],
+            json!({"threadId":"session","turnId":"turn"})
+        );
+        peer.send(json!({"id":interrupt["id"],"result":{}})).await;
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"interrupted"}}})).await;
+        assert_eq!(
+            prompt.await.expect("cancelled").stop_reason,
+            acp::StopReason::Cancelled
+        );
+        assert!(
+            connection.sessions.borrow()[&acp::SessionId::new("session")]
+                .active
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn recovery_does_not_interrupt_long_tools_or_permission_waits(cx: &mut TestAppContext) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        {
+            let mut sessions = connection.sessions.borrow_mut();
+            let active = sessions
+                .get_mut(&acp::SessionId::new("session"))
+                .expect("session")
+                .active
+                .as_mut()
+                .expect("turn");
+            active.recovery.observe(
+                "item/started",
+                &json!({"item":{"id":"long-command","type":"commandExecution"}}),
+            );
+        }
+        for minute in 1..=18 {
+            quiet_minutes(cx, 1);
+            if minute >= 4 {
+                let read = peer.next().await;
+                assert_eq!(read["method"], "thread/read");
+                peer.send(json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"active","activeFlags":[]}}}})).await;
+                cx.run_until_parked();
+            }
+        }
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        assert_eq!(
+            prompt.await.expect("completed tool").stop_reason,
+            acp::StopReason::EndTurn
+        );
+    }
+
+    #[gpui::test]
+    async fn recovery_rechecks_progress_before_interrupting(cx: &mut TestAppContext) {
+        let (_connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        quiet_minutes(cx, 3);
+        let read = peer.next().await;
+        peer.send(json!({"method":"item/agentMessage/delta","params":{"threadId":"session","turnId":"turn","itemId":"reply","delta":"resumed"}})).await;
+        peer.send(
+            json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"idle"}}}}),
+        )
+        .await;
+        cx.run_until_parked();
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        assert_eq!(
+            prompt.await.expect("resumed").stop_reason,
+            acp::StopReason::EndTurn
+        );
+    }
+
+    #[gpui::test]
+    async fn recovery_backend_approval_wait_does_not_consume_response_deadline(
+        cx: &mut TestAppContext,
+    ) {
+        let (_connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        for minute in 1..=19 {
+            quiet_minutes(cx, 1);
+            if minute % 3 == 0 {
+                let read = peer.next().await;
+                assert_eq!(read["method"], "thread/read");
+                peer.send(json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}})).await;
+                cx.run_until_parked();
+            }
+        }
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        assert_eq!(
+            prompt.await.expect("approval wait").stop_reason,
+            acp::StopReason::EndTurn
+        );
+    }
+
+    #[gpui::test]
+    async fn recovery_manual_stop_does_not_wait_forever_for_completion(cx: &mut TestAppContext) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        cx.update(|cx| connection.cancel(&acp::SessionId::new("session"), cx));
+        let interrupt = peer.next().await;
+        peer.send(json!({"id":interrupt["id"],"result":{}})).await;
+        quiet_minutes(cx, 1);
+        let read = peer.next().await;
+        assert_eq!(read["method"], "thread/read");
+        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"session","status":{"type":"active","activeFlags":[]}}}})).await;
+        assert!(
+            prompt
+                .await
+                .expect_err("unconfirmed stop")
+                .to_string()
+                .contains("not confirmed cancellation")
+        );
+        assert!(connection.sessions.borrow()[&acp::SessionId::new("session")].uncertain);
+    }
+
+    #[gpui::test]
+    async fn recovery_status_failures_release_ui_but_block_unknown_replay(cx: &mut TestAppContext) {
+        let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
+        quiet_minutes(cx, 3);
+        for attempt in 0..3 {
+            if attempt > 0 {
+                quiet_minutes(cx, 1);
+            }
+            let read = peer.next().await;
+            assert_eq!(read["method"], "thread/read");
+            peer.send(json!({"id":read["id"],"error":{"code":-32603,"message":"temporarily unavailable"}})).await;
+            cx.run_until_parked();
+        }
+        assert!(
+            prompt
+                .await
+                .expect_err("unreachable")
+                .to_string()
+                .contains("outcome is unknown")
+        );
+        let sessions = connection.sessions.borrow();
+        let session = &sessions[&acp::SessionId::new("session")];
+        assert!(session.active.is_none());
+        assert!(session.uncertain);
+    }
+
     #[gpui::test]
     async fn completion_before_start_response_and_interleaved_thread_are_safe(
         cx: &mut TestAppContext,
@@ -1251,6 +1512,7 @@ impl AgentConnection for NativeCodexConnection {
             events: TurnEvents::default(),
             cancel_requested: false,
             optimistic_message: None,
+            recovery: recovery::Progress::default(),
         });
         let rpc = self.rpc.clone();
         let sessions = self.sessions.clone();
@@ -1299,7 +1561,23 @@ impl AgentConnection for NativeCodexConnection {
                 )
                 .await?;
             }
-            receiver.await.context("Codex turn completion was lost")?
+            match futures::future::select(
+                Box::pin(receiver),
+                Box::pin(recovery::watch(
+                    rpc,
+                    sessions,
+                    params.session_id,
+                    turn_id,
+                    cx,
+                )),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _)) => {
+                    result.context("Codex turn completion was lost")?
+                }
+                futures::future::Either::Right((result, _)) => result,
+            }
         })
     }
     fn cancel(&self, id: &acp::SessionId, cx: &mut App) {
