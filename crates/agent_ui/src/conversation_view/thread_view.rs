@@ -7336,10 +7336,10 @@ impl ThreadView {
             },
             {
                 let view = view.clone();
-                move |elicitation_id, field_name, value, cx| {
+                move |elicitation_id, field_name, value, window, cx| {
                     view.update(cx, |this, cx| {
                         if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
-                            form.set_single_select(&field_name, value);
+                            form.select_value(&field_name, value, window, cx);
                             cx.notify();
                         }
                     })

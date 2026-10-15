@@ -1783,8 +1783,21 @@ impl ConversationView {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
-            AcpThreadEvent::ElicitationRequested(_) => {
-                self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
+            AcpThreadEvent::ElicitationRequested(id) => {
+                let is_blocking = thread
+                    .read(cx)
+                    .elicitation(id)
+                    .is_none_or(|(_, elicitation)| elicitation.is_blocking());
+                self.notify_with_sound(
+                    if is_blocking {
+                        "Waiting for input"
+                    } else {
+                        "Question from agent"
+                    },
+                    IconName::Info,
+                    window,
+                    cx,
+                );
             }
             AcpThreadEvent::ElicitationResponded(_) => {}
             AcpThreadEvent::Retry(retry) => {
@@ -2665,13 +2678,15 @@ impl ConversationView {
             },
             {
                 let view = view.clone();
-                move |elicitation_id, field_name, value, cx| {
+                move |elicitation_id, field_name, value, window, cx| {
                     view.update(cx, |this, cx| {
-                        this.update_request_elicitation_form_state(
-                            &elicitation_id,
-                            |form| form.set_single_select(&field_name, value),
-                            cx,
-                        );
+                        if let Some(form) = this
+                            .request_elicitation_form_states
+                            .get_mut(&elicitation_id)
+                        {
+                            form.select_value(&field_name, value, window, cx);
+                            this.notify_request_elicitation_renderers(cx);
+                        }
                     })
                     .log_err();
                 }

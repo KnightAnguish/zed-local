@@ -333,7 +333,9 @@ impl NativeCodexConnection {
                 .get(&acp::SessionId::new(id))
                 .map(|session| session.thread.clone())
         });
-        if let Some(id) = params["threadId"].as_str() {
+        if (method != "item/tool/requestUserInput" || questions::is_blocking(&params))
+            && let Some(id) = params["threadId"].as_str()
+        {
             if let Some(active) = self
                 .sessions
                 .borrow_mut()
@@ -1225,7 +1227,7 @@ mod tests {
     #[gpui::test]
     async fn questions_wait_for_input_and_return_the_actual_answer(cx: &mut TestAppContext) {
         let (connection, peer, thread) = session(cx).await;
-        peer.send(json!({"id":"question","method":"item/tool/requestUserInput","params":{"threadId":"session","itemId":"ask","questions":[{"id":"answer","header":"Input","question":"What next?","isOther":true,"isSecret":false,"options":null}]}})).await;
+        peer.send(json!({"id":"question","method":"item/tool/requestUserInput","params":{"threadId":"session","itemId":"ask","isBlocking":false,"questions":[{"id":"answer","header":"Input","question":"What next?","isOther":true,"isSecret":false,"options":null}]}})).await;
         cx.run_until_parked();
         assert_eq!(connection.approvals.borrow().len(), 1);
         let entry = connection
@@ -1237,6 +1239,10 @@ mod tests {
             .borrow()
             .clone()
             .unwrap();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_waiting_for_confirmation());
+            assert!(!thread.elicitation(&entry).unwrap().1.is_blocking());
+        });
         thread.update(cx, |thread, cx| {
             thread.respond_to_elicitation(
                 &entry,
@@ -1256,6 +1262,14 @@ mod tests {
         );
         cx.run_until_parked();
         assert!(connection.approvals.borrow().is_empty());
+        peer.send(json!({"method":"serverRequest/resolved","params":{"threadId":"session","requestId":"question"}})).await;
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(matches!(
+                thread.elicitation(&entry).unwrap().1.status,
+                acp_thread::ElicitationStatus::Accepted
+            ));
+        });
     }
 
     #[gpui::test]

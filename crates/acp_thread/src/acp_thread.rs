@@ -497,11 +497,42 @@ pub enum AgentThreadEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ElicitationEntryId(pub Arc<str>);
 
+pub const CODEX_QUESTION_META_KEY: &str = "zed.dev/codexQuestion";
+pub const ELICITATION_SUGGESTIONS_META_KEY: &str = "zed.dev/inputSuggestions";
+
 #[derive(Debug)]
 pub struct Elicitation {
     pub id: ElicitationEntryId,
     pub request: acp_v1::CreateElicitationRequest,
     pub status: ElicitationStatus,
+}
+
+impl Elicitation {
+    pub fn is_codex_question(&self) -> bool {
+        self.request
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.contains_key(CODEX_QUESTION_META_KEY))
+    }
+
+    pub fn is_blocking(&self) -> bool {
+        self.request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(CODEX_QUESTION_META_KEY))
+            .and_then(|meta| meta.get("isBlocking"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    pub fn submitted_answers(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.request
+            .meta
+            .as_ref()?
+            .get(CODEX_QUESTION_META_KEY)?
+            .get("answers")?
+            .as_object()
+    }
 }
 
 #[derive(Debug)]
@@ -607,6 +638,20 @@ impl ElicitationStore {
         ) else {
             return false;
         };
+        // Keep a lightweight summary, not editor entities, for answered Codex cards.
+        // Secret input is rejected by the native connector before creating a card.
+        if let acp_v1::ElicitationAction::Accept(action) = &response.action
+            && let Some(metadata) = elicitation
+                .request
+                .meta
+                .as_mut()
+                .and_then(|meta| meta.get_mut(CODEX_QUESTION_META_KEY))
+                .and_then(serde_json::Value::as_object_mut)
+            && let Some(content) = &action.content
+            && let Ok(answers) = serde_json::to_value(content)
+        {
+            metadata.insert("answers".to_owned(), answers);
+        }
         if respond_tx.send(response).is_err() {
             log::debug!("Elicitation waiter closed before its response was delivered");
         }
@@ -4078,7 +4123,8 @@ impl AcpThread {
                 AgentThreadEntry::Elicitation(elicitation_id)
                     if self.elicitations.elicitation(elicitation_id).is_some_and(
                         |(_, elicitation)| {
-                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                            elicitation.is_blocking()
+                                && matches!(elicitation.status, ElicitationStatus::Pending { .. })
                         },
                     ) =>
                 {
@@ -15414,6 +15460,72 @@ mod tests {
                 thread.entries(),
                 [AgentThreadEntry::Elicitation(_)]
             ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_codex_question_does_not_block_and_preserves_answer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let (id, response_task) = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp_v1::CreateElicitationRequest::new(
+                        acp_v1::ElicitationFormMode::new(
+                            acp_v1::ElicitationSessionScope::new(session_id),
+                            acp_v1::ElicitationSchema::new().string("answer", true),
+                        ),
+                        "A background question",
+                    )
+                    .meta(acp_v1::Meta::from_iter([(
+                        CODEX_QUESTION_META_KEY.to_owned(),
+                        serde_json::json!({"isBlocking":false}),
+                    )])),
+                    cx,
+                )
+                .unwrap()
+        });
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.is_waiting_for_confirmation());
+            assert!(
+                !thread.is_idle_for_retention(),
+                "a live question must not be evicted"
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &id,
+                acp_v1::CreateElicitationResponse::new(acp_v1::ElicitationAction::Accept(
+                    acp_v1::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([("answer".into(), "My answer".into())]),
+                    ),
+                )),
+                cx,
+            );
+            // Late cancellation or duplicate clicks cannot replace an already submitted answer.
+            thread.cancel_elicitation(&id, cx);
+            thread.respond_to_elicitation(
+                &id,
+                acp_v1::CreateElicitationResponse::new(acp_v1::ElicitationAction::Cancel),
+                cx,
+            );
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp_v1::ElicitationAction::Accept(_)
+        ));
+        thread.read_with(cx, |thread, _| {
+            let (_, entry) = thread.elicitation(&id).unwrap();
+            assert!(matches!(entry.status, ElicitationStatus::Accepted));
+            assert_eq!(entry.submitted_answers().unwrap()["answer"], "My answer");
+            assert_eq!(
+                thread.entries().len(),
+                1,
+                "answering must not create a chat message"
+            );
         });
     }
 

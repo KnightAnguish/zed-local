@@ -204,6 +204,21 @@ impl ElicitationFormState {
         }
     }
 
+    pub(crate) fn select_value(
+        &mut self,
+        field_name: &str,
+        value: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(ElicitationFieldState::Text(editor)) = self.fields.get(field_name) {
+            editor.update(cx, |editor, cx| editor.set_text(value, window, cx));
+            self.field_errors.remove(field_name);
+        } else {
+            self.set_single_select(field_name, value);
+        }
+    }
+
     pub(crate) fn set_multi_select(&mut self, field_name: &str, value: String, selected: bool) {
         if let Some(ElicitationFieldState::MultiSelect(values)) = self.fields.get_mut(field_name) {
             if selected {
@@ -426,9 +441,14 @@ mod tests {
                     })
                 },
                 on_single_select_change: {
-                    let events = self.events.clone();
-                    Rc::new(move |_, name, value, _| {
-                        events.borrow_mut().push(format!("{name}: {value}"));
+                    let view = cx.entity().downgrade();
+                    Rc::new(move |_, name, value, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.events.borrow_mut().push(format!("{name}: {value}"));
+                            view.form_state.select_value(&name, value, window, cx);
+                            cx.notify();
+                        })
+                        .expect("test form should still be open");
                     })
                 },
                 on_multi_select_change: {
@@ -630,6 +650,46 @@ mod tests {
                 "submit",
             ]
         );
+    }
+
+    #[gpui::test]
+    fn suggested_choice_buttons_fill_the_answer_without_sending_a_chat_message(
+        cx: &mut TestAppContext,
+    ) {
+        init_keyboard_test(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            TestElicitationView::new(
+                acp::ElicitationSchema::new().property(
+                    "answer",
+                    acp::StringPropertySchema::new()
+                        .default_value("First")
+                        .meta(acp::Meta::from_iter([(
+                            acp_thread::ELICITATION_SUGGESTIONS_META_KEY.to_owned(),
+                            serde_json::json!([
+                                {"const":"First","title":"First"},
+                                {"const":"Second","title":"Second"},
+                            ]),
+                        )])),
+                    true,
+                ),
+                window,
+                cx,
+            )
+        });
+        let (editor, events) =
+            view.read_with(cx, |view, _| (view.editor("answer"), view.events.clone()));
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+        press_keys(cx, "shift-tab enter");
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "Second");
+        assert_eq!(*events.borrow(), ["answer: Second"]);
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("My own answer", window, cx)
+            });
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        press_keys(cx, "enter");
+        assert_eq!(*events.borrow(), ["answer: Second", "submit"]);
     }
 
     #[gpui::test]
@@ -844,6 +904,55 @@ mod tests {
             status: pending_status(),
         };
         assert!(!should_render_elicitation(&pending_unknown));
+    }
+
+    #[test]
+    fn resolved_codex_questions_remain_visible_without_input_controls() {
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(preview_request_scope(0), acp::ElicitationSchema::new()),
+            "Codex question",
+        )
+        .meta(acp::Meta::from_iter([(
+            acp_thread::CODEX_QUESTION_META_KEY.to_owned(),
+            serde_json::json!({"isBlocking":false}),
+        )]));
+        for status in [
+            ElicitationStatus::Accepted,
+            ElicitationStatus::Canceled,
+            ElicitationStatus::Declined,
+        ] {
+            let entry = Elicitation {
+                id: ElicitationEntryId("codex".into()),
+                request: request.clone(),
+                status,
+            };
+            assert!(should_render_elicitation(&entry));
+        }
+    }
+
+    #[gpui::test]
+    fn suggested_choices_fill_the_editable_answer_without_submitting(cx: &mut TestAppContext) {
+        crate::conversation_view::tests::init_test(cx);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let schema = acp::ElicitationSchema::new().property(
+                "answer",
+                acp::StringPropertySchema::new().meta(acp::Meta::from_iter([(
+                    acp_thread::ELICITATION_SUGGESTIONS_META_KEY.to_owned(),
+                    serde_json::json!([{"const":"First","title":"First","description":"Recommended"}]),
+                )])),
+                true,
+            );
+            let suggestions = text_suggestions(&schema.properties["answer"]);
+            assert_eq!(suggestions.len(), 1);
+            assert_eq!(suggestions[0].description.as_deref(), Some("Recommended"));
+            let mut form = ElicitationFormState::new(&schema, window, cx);
+            form.select_value("answer", "First".into(), window, cx);
+            assert!(!form.is_submitting);
+            assert_eq!(form.collect(&schema, cx).unwrap()["answer"], acp::ElicitationContentValue::from("First"));
+            form.select_value("answer", "My own answer".into(), window, cx);
+            assert_eq!(form.collect(&schema, cx).unwrap()["answer"], acp::ElicitationContentValue::from("My own answer"));
+        });
     }
 
     #[test]
@@ -1406,6 +1515,25 @@ fn single_select_options(schema: &acp::StringPropertySchema) -> Vec<ElicitationO
         .collect()
 }
 
+fn text_suggestions(property: &acp::ElicitationPropertySchema) -> Vec<ElicitationOption> {
+    let acp::ElicitationPropertySchema::String(schema) = property else {
+        return Vec::new();
+    };
+    schema
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(acp_thread::ELICITATION_SUGGESTIONS_META_KEY))
+        .and_then(|value| serde_json::from_value::<Vec<acp::EnumOption>>(value.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|option| ElicitationOption {
+            value: option.value,
+            label: option.title.into(),
+            description: option.description.map(SharedString::from),
+        })
+        .collect()
+}
+
 fn single_select_default_value(
     schema: &acp::StringPropertySchema,
     options: &[ElicitationOption],
@@ -1657,7 +1785,7 @@ fn property_description(property: &acp::ElicitationPropertySchema) -> Option<Sha
 type RespondHandler = Rc<dyn Fn(ElicitationEntryId, &mut Window, &mut App)>;
 type OpenUrlHandler = Rc<dyn Fn(ElicitationEntryId, String, &mut Window, &mut App)>;
 type BooleanHandler = Rc<dyn Fn(ElicitationEntryId, String, bool, &mut App)>;
-type SelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, &mut App)>;
+type SelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, &mut Window, &mut App)>;
 type MultiSelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, bool, &mut App)>;
 
 #[derive(Clone)]
@@ -1680,7 +1808,8 @@ impl ElicitationCardHandlers {
         on_dismiss_url: impl Fn(ElicitationEntryId, &mut Window, &mut App) + 'static,
         on_open_url: impl Fn(ElicitationEntryId, String, &mut Window, &mut App) + 'static,
         on_boolean_change: impl Fn(ElicitationEntryId, String, bool, &mut App) + 'static,
-        on_single_select_change: impl Fn(ElicitationEntryId, String, String, &mut App) + 'static,
+        on_single_select_change: impl Fn(ElicitationEntryId, String, String, &mut Window, &mut App)
+        + 'static,
         on_multi_select_change: impl Fn(ElicitationEntryId, String, String, bool, &mut App) + 'static,
     ) -> Self {
         Self {
@@ -1703,13 +1832,18 @@ impl ElicitationCardHandlers {
             |_, _, _| {},
             |_, _, _, _| {},
             |_, _, _, _| {},
-            |_, _, _, _| {},
+            |_, _, _, _, _| {},
             |_, _, _, _, _| {},
         )
     }
 }
 
 pub(crate) fn should_render_elicitation(elicitation: &Elicitation) -> bool {
+    if elicitation.is_codex_question()
+        && matches!(elicitation.request.mode, acp::ElicitationMode::Form(_))
+    {
+        return true;
+    }
     matches!(
         (&elicitation.status, &elicitation.request.mode),
         (
@@ -1809,6 +1943,9 @@ impl<'a> ElicitationCard<'a> {
             (ElicitationStatus::Accepted, acp::ElicitationMode::Url(_))
         );
         let (status_label, status_icon, status_color) = match &self.elicitation.status {
+            ElicitationStatus::Pending { .. } if !self.elicitation.is_blocking() => {
+                ("Agent can continue", IconName::Info, Color::Info)
+            }
             ElicitationStatus::Pending { .. } => ("Waiting for input", IconName::Info, Color::Info),
             ElicitationStatus::Accepted if is_accepted_url => {
                 ("Waiting for completion", IconName::Info, Color::Info)
@@ -1832,6 +1969,26 @@ impl<'a> ElicitationCard<'a> {
             }
             _ => body,
         };
+        let body =
+            body.when(!is_pending, |body| {
+                body.children(self.elicitation.submitted_answers().into_iter().flat_map(
+                    |answers| {
+                        answers.iter().filter_map(|(id, answer)| {
+                            let answer = answer.as_str()?;
+                            let title = match &self.elicitation.request.mode {
+                                acp::ElicitationMode::Form(mode) => mode
+                                    .requested_schema
+                                    .properties
+                                    .get(id)
+                                    .map(|property| property_title(id, property)),
+                                _ => None,
+                            }
+                            .unwrap_or_else(|| id.clone().into());
+                            Some(Label::new(format!("{title}: {answer}")).size(LabelSize::Small))
+                        })
+                    },
+                ))
+            });
 
         v_flex()
             .key_context("Elicitation")
@@ -2012,7 +2169,9 @@ impl<'a> ElicitationCard<'a> {
                     let elicitation_id = self.elicitation.id.clone();
                     let is_submitting = self.form_state.is_some_and(|state| state.is_submitting);
 
-                    div()
+                    let suggestions = text_suggestions(property);
+                    let selected = editor.read(cx).text(cx);
+                    let input = div()
                         .track_focus(&editor.focus_handle(cx).tab_stop(true))
                         .on_action(move |_: &menu::Confirm, window, cx| {
                             if !is_submitting {
@@ -2027,7 +2186,24 @@ impl<'a> ElicitationCard<'a> {
                         .px_1()
                         .py_0p5()
                         .text_xs()
-                        .child(editor.clone().into_any_element())
+                        .child(editor.clone().into_any_element());
+                    v_flex()
+                        .gap_1()
+                        .when(!suggestions.is_empty(), |this| {
+                            this.child(self.render_single_select(
+                                field_name,
+                                Some(&selected),
+                                suggestions,
+                                error.is_some(),
+                                cx,
+                            ))
+                            .child(
+                                Label::new("Or enter your own answer:")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .child(input)
                         .into_any_element()
                 }
                 ElicitationFieldState::Boolean(_) => Empty.into_any_element(),
@@ -2161,11 +2337,12 @@ impl<'a> ElicitationCard<'a> {
                     .py_1()
                     .hover(move |this| this.bg(hover_background).cursor_pointer())
                     .focus_visible(|this| this.border_color(cx.theme().colors().border_focused))
-                    .on_click(move |_, _window, cx| {
+                    .on_click(move |_, window, cx| {
                         on_single_select_change(
                             elicitation_id.clone(),
                             field_name.clone(),
                             option_value.clone(),
+                            window,
                             cx,
                         );
                     })

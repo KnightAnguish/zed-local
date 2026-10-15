@@ -3,6 +3,11 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 
+pub(super) fn is_blocking(params: &Value) -> bool {
+    // Older app-server versions did not send this field. Preserve their blocking behavior.
+    params["isBlocking"].as_bool().unwrap_or(true)
+}
+
 pub(super) fn request(params: &Value) -> Result<acp::CreateElicitationRequest> {
     let questions = params["questions"]
         .as_array()
@@ -20,31 +25,25 @@ pub(super) fn request(params: &Value) -> Result<acp::CreateElicitationRequest> {
         );
         let id = text(question, "id")?;
         ensure!(!properties.contains_key(id), "Duplicate Codex question id");
-        let mut field = json!({"type":"string","title":text(question,"header")?,"description":text(question,"question")?});
+        let mut field = json!({"type":"string","minLength":1,"title":text(question,"header")?,"description":text(question,"question")?});
         if let Some(options) = question["options"]
             .as_array()
             .filter(|options| !options.is_empty())
         {
-            if question["isOther"].as_bool() != Some(true) {
-                let labels: Vec<&str> = options
-                    .iter()
-                    .map(|option| text(option, "label"))
-                    .collect::<Result<_>>()?;
-                field["enum"] = json!(labels);
-            }
-            let descriptions = options
+            let choices = options
                 .iter()
                 .map(|option| {
-                    Ok(format!(
-                        "{}: {}",
-                        text(option, "label")?,
-                        text(option, "description")?
-                    ))
+                    let label = text(option, "label")?;
+                    Ok(json!({"const":label,"title":label,"description":text(option,"description")?}))
                 })
-                .collect::<Result<Vec<_>>>()?
-                .join("\n");
-            field["description"] =
-                json!(format!("{}\n{descriptions}", text(question, "question")?));
+                .collect::<Result<Vec<_>>>()?;
+            if question["isOther"].as_bool() == Some(true) {
+                // Suggestions are not a JSON Schema enum: a custom answer remains valid.
+                field["_meta"] = json!({acp_thread::ELICITATION_SUGGESTIONS_META_KEY:choices});
+                field["default"] = json!(text(&options[0], "label")?);
+            } else {
+                field["oneOf"] = json!(choices);
+            }
         }
         properties.insert(id.to_owned(), field);
         required.push(id);
@@ -58,7 +57,11 @@ pub(super) fn request(params: &Value) -> Result<acp::CreateElicitationRequest> {
             schema,
         ),
         "Codex needs your input",
-    ))
+    )
+    .meta(acp::Meta::from_iter([(
+        acp_thread::CODEX_QUESTION_META_KEY.to_owned(),
+        json!({"isBlocking":is_blocking(params)}),
+    )])))
 }
 
 pub(super) fn mcp_request(params: &Value) -> Result<acp::CreateElicitationRequest> {
@@ -122,6 +125,7 @@ pub(super) fn response(params: &Value, response: acp::CreateElicitationResponse)
             let Some(acp::ElicitationContentValue::String(answer)) = content.get(id) else {
                 anyhow::bail!("Missing or invalid answer to {id}");
             };
+            ensure!(!answer.trim().is_empty(), "Empty answer to {id}");
             if question["isOther"].as_bool() != Some(true) {
                 if let Some(options) = question["options"]
                     .as_array()
@@ -149,8 +153,12 @@ mod tests {
         let params = json!({"threadId":"thread","questions":[{"id":"choice","header":"Choose","question":"Which?","isOther":false,"isSecret":false,"options":[{"label":"One","description":"First"}]}]});
         let form = serde_json::to_value(request(&params).unwrap()).unwrap();
         assert_eq!(
-            form["requestedSchema"]["properties"]["choice"]["enum"],
-            json!(["One"])
+            form["requestedSchema"]["properties"]["choice"]["oneOf"],
+            json!([{"const":"One","title":"One","description":"First"}])
+        );
+        assert_eq!(
+            form["_meta"][acp_thread::CODEX_QUESTION_META_KEY]["isBlocking"],
+            true
         );
         let accepted = acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
             acp::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from([(
@@ -170,6 +178,49 @@ mod tests {
             .unwrap(),
             json!({"answers":{}})
         );
+    }
+    #[test]
+    fn background_questions_keep_suggestions_and_accept_custom_answers() {
+        let params = json!({"threadId":"thread","isBlocking":false,"questions":[{"id":"choice","header":"Choose","question":"Which?","isOther":true,"options":[{"label":"One","description":"First"},{"label":"Two","description":"Second"}]}]});
+        let form = serde_json::to_value(request(&params).unwrap()).unwrap();
+        let field = &form["requestedSchema"]["properties"]["choice"];
+        assert_eq!(
+            form["_meta"][acp_thread::CODEX_QUESTION_META_KEY]["isBlocking"],
+            false
+        );
+        assert_eq!(field["default"], "One");
+        assert_eq!(
+            field["_meta"][acp_thread::ELICITATION_SUGGESTIONS_META_KEY][1]["const"],
+            "Two"
+        );
+        assert!(field.get("enum").is_none());
+        assert!(field.get("oneOf").is_none());
+        for answer in ["Two", "Something else"] {
+            let accepted = acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                acp::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from([(
+                    "choice".to_owned(),
+                    answer.into(),
+                )])),
+            ));
+            assert_eq!(
+                response(&params, accepted).unwrap()["answers"]["choice"]["answers"],
+                json!([answer])
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_choices_reject_custom_and_empty_answers() {
+        let params = json!({"threadId":"thread","questions":[{"id":"choice","isOther":false,"options":[{"label":"One"}]}]});
+        for answer in ["Other", " "] {
+            let accepted = acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                acp::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from([(
+                    "choice".to_owned(),
+                    answer.into(),
+                )])),
+            ));
+            assert!(response(&params, accepted).is_err());
+        }
     }
     #[test]
     fn secret_input_is_not_rendered_as_plain_text() {
