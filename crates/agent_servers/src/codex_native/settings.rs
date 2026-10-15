@@ -1,5 +1,5 @@
 use super::transport::Rpc;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1, v2 as acp};
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{App, Task};
 use serde::Deserialize;
@@ -128,7 +128,7 @@ impl Preferences {
                     .flatten()
             }) {
                 let value = if let Some(value) = value.as_value_id() {
-                    acp::SessionConfigOptionValue::value_id(value.to_owned())
+                    acp::SessionConfigOptionValue::id(value.to_owned())
                 } else if let Some(value) = value.as_bool() {
                     acp::SessionConfigOptionValue::boolean(value)
                 } else {
@@ -140,10 +140,7 @@ impl Preferences {
         }
         if !defaults.contains_key("mode") {
             if let Some(mode) = agent.default_mode() {
-                self.change(
-                    "mode",
-                    &acp::SessionConfigOptionValue::value_id(mode.to_owned()),
-                )?;
+                self.change("mode", &acp::SessionConfigOptionValue::id(mode.to_owned()))?;
             }
         }
         Ok(())
@@ -245,7 +242,7 @@ impl Preferences {
     pub(super) fn change(&mut self, id: &str, value: &acp::SessionConfigOptionValue) -> Result<()> {
         let selected = || {
             value
-                .as_value_id()
+                .as_id()
                 .map(|value| value.0.as_ref())
                 .context("Expected a selection value")
         };
@@ -318,7 +315,7 @@ impl Preferences {
         Ok(())
     }
 
-    pub(super) fn turn_params(&self, thread_id: &acp::SessionId, input: Vec<Value>) -> Value {
+    pub(super) fn turn_params(&self, thread_id: &v1::SessionId, input: Vec<Value>) -> Value {
         let mut params = json!({"threadId":thread_id,"input":input,"model":self.model});
         if let Some(effort) = &self.effort {
             params["effort"] = json!(effort);
@@ -469,7 +466,7 @@ mod tests {
     #[test]
     fn permissions_are_only_overridden_when_explicitly_selected() {
         let mut preferences = preferences();
-        let id = acp::SessionId::new("t");
+        let id = v1::SessionId::new("t");
         assert!(
             preferences
                 .turn_params(&id, vec![])
@@ -495,7 +492,7 @@ mod tests {
         let mut preferences = preferences();
         assert_eq!(preferences.options().len(), 4);
         preferences.change("fast-mode", &false.into()).unwrap();
-        let params = preferences.turn_params(&acp::SessionId::new("t"), vec![]);
+        let params = preferences.turn_params(&v1::SessionId::new("t"), vec![]);
         assert!(params.get("serviceTier").unwrap().is_null());
     }
     #[gpui::test]

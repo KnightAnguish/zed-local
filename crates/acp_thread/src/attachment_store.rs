@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -107,7 +107,7 @@ pub fn prepare(directory: &Path, blocks: Vec<acp::ContentBlock>) -> Result<Vec<a
                 output.push(block);
                 continue;
             }
-            let path = save_image(directory, &image.data, &image.mime_type)?;
+            let path = save_image(directory, &image.data, image.mime_type.as_ref())?;
             let uri = url::Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("Invalid attachment path"))?
                 .to_string();

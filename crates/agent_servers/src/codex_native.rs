@@ -15,7 +15,7 @@ use acp_thread::{
     PermissionOptions, RequestPermissionOutcome,
 };
 use action_log::ActionLog;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use anyhow::{Context as _, Result, ensure};
 use events::{TurnEvents, text};
 use futures::channel::oneshot;
@@ -48,22 +48,22 @@ struct Session {
 struct Approval {
     _task: Task<()>,
     thread: Option<WeakEntity<AcpThread>>,
-    item_id: Option<acp::ToolCallId>,
+    permission: Rc<RefCell<Option<acp_thread::PermissionRequestId>>>,
     elicitation: Rc<RefCell<Option<acp_thread::ElicitationEntryId>>>,
 }
 
 impl Approval {
     fn cancel_ui(&self, cx: &mut AsyncApp) {
-        if let (Some(thread), Some(id)) = (&self.thread, self.elicitation.borrow_mut().take()) {
+        let elicitation = self.elicitation.borrow_mut().take();
+        if let (Some(thread), Some(id)) = (&self.thread, elicitation) {
             thread
                 .update(cx, |thread, cx| thread.cancel_elicitation(&id, cx))
                 .log_err();
         }
-        if let (Some(thread), Some(item_id)) = (&self.thread, &self.item_id) {
+        let permission = self.permission.borrow_mut().take();
+        if let (Some(thread), Some(id)) = (&self.thread, permission) {
             thread
-                .update(cx, |thread, cx| {
-                    thread.cancel_tool_call_authorization(item_id, cx)
-                })
+                .update(cx, |thread, cx| thread.cancel_permission_request(id, cx))
                 .log_err();
         }
     }
@@ -347,9 +347,8 @@ impl NativeCodexConnection {
         }
         let rpc = self.rpc.clone();
         let approval_thread = thread.clone();
-        let approval_item = params["itemId"]
-            .as_str()
-            .map(|id| acp::ToolCallId::new(id.to_owned()));
+        let permission = Rc::new(RefCell::new(None));
+        let task_permission = permission.clone();
         let weak = Rc::downgrade(self);
         let task_key = key.clone();
         let elicitation = Rc::new(RefCell::new(None));
@@ -376,16 +375,17 @@ impl NativeCodexConnection {
                     "toolCallId":item_id,"title":title,"status":"pending",
                     "content":[{"type":"content","content":{"type":"text","text":serde_json::to_string_pretty(&params)?}}]
                 }))?;
-                let outcome = thread
+                let (permission_id, response) = thread
                     .update(cx, |thread, cx| {
-                        thread.request_tool_call_authorization(
+                        thread.request_tool_call_authorization_with_id(
                             tool,
                             PermissionOptions::Flat(choices.options.clone()),
                             AuthorizationKind::PermissionGrant,
                             cx,
                         )
-                    })??
-                    .await;
+                    })??;
+                *task_permission.borrow_mut() = Some(permission_id);
+                let outcome = response.await;
                 match outcome {
                     RequestPermissionOutcome::Selected(outcome) => choices.reply(Some(outcome.option_id.0.as_ref())),
                     RequestPermissionOutcome::Cancelled
@@ -408,7 +408,7 @@ impl NativeCodexConnection {
             Approval {
                 _task: task,
                 thread: approval_thread,
-                item_id: approval_item,
+                permission,
                 elicitation,
             },
         );
@@ -552,12 +552,12 @@ impl NativeCodexConnection {
                     project,
                     action_log,
                     id.clone(),
-                    watch::Receiver::constant(
+                    watch::Receiver::constant(acp_thread::prompt_capabilities::from_v1(
                         acp::PromptCapabilities::new()
                             .image(true)
                             .audio(true)
                             .embedded_context(true),
-                    ),
+                    )),
                     cx,
                 )
             });
@@ -656,17 +656,20 @@ mod tests {
         for (key, value) in [
             (
                 "reasoning-effort",
-                acp::SessionConfigOptionValue::from("high"),
+                acp_v2::SessionConfigOptionValue::from("high"),
             ),
             ("mode", "agent-full-access".into()),
             ("fast-mode", true.into()),
         ] {
-            cx.update(|cx| options.set_config_option(acp::SessionConfigId::new(key), value, cx))
+            cx.update(|cx| options.set_config_option(acp_v2::SessionConfigId::new(key), value, cx))
                 .await
                 .unwrap();
         }
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let request = peer.next().await;
         assert_eq!(request["method"], "turn/start");
@@ -678,7 +681,7 @@ mod tests {
         );
         assert!(
             cx.update(|cx| options.set_config_option(
-                acp::SessionConfigId::new("mode"),
+                acp_v2::SessionConfigId::new("mode"),
                 "native-read-only".into(),
                 cx
             ))
@@ -691,7 +694,7 @@ mod tests {
         prompt.await.unwrap();
         assert!(
             cx.update(|cx| options.set_config_option(
-                acp::SessionConfigId::new("mode"),
+                acp_v2::SessionConfigId::new("mode"),
                 "native-read-only".into(),
                 cx
             ))
@@ -825,7 +828,10 @@ mod tests {
             )
         });
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let start = peer.next().await;
         peer.send(json!({"id":start["id"],"result":{"turn":{"id":"turn"}}}))
@@ -858,7 +864,10 @@ mod tests {
         assert!(forks::SessionGuard::acquire(connection.sessions.clone(), id.clone()).is_err());
         let prompt = cx.update(|cx| {
             connection.prompt(
-                acp::PromptRequest::new(id.clone(), vec!["hello".into()]),
+                acp_v2::PromptRequest::new(
+                    acp_v2::SessionId::new(id.0.clone()),
+                    vec!["hello".into()],
+                ),
                 cx,
             )
         });
@@ -874,7 +883,10 @@ mod tests {
     async fn cancellation_before_turn_start_is_forwarded(cx: &mut TestAppContext) {
         let (connection, peer, _thread) = session(cx).await;
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let request = peer.next().await;
         assert_eq!(request["method"], "turn/start");
@@ -905,7 +917,10 @@ mod tests {
     async fn disconnect_fails_prompt_without_replaying_it(cx: &mut TestAppContext) {
         let (connection, peer, _thread) = session(cx).await;
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let request = peer.next().await;
         peer.send(json!({"id":request["id"],"result":{"turn":{"id":"turn"}}}))
@@ -919,7 +934,10 @@ mod tests {
                 .contains("disconnected")
         );
         let retry = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["again".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["again".into()]),
+                cx,
+            )
         });
         assert!(
             retry
@@ -940,7 +958,10 @@ mod tests {
     ) {
         let (connection, peer, thread) = session(cx).await;
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let request = peer.next().await;
         peer.send(json!({"id":request["id"],"result":{"turn":{"id":"turn"}}}))
@@ -1008,7 +1029,10 @@ mod tests {
         );
         assert!(connection.sessions.borrow()[&acp::SessionId::new("session")].uncertain);
         let retry = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["retry".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["retry".into()]),
+                cx,
+            )
         });
         assert!(
             retry
@@ -1174,7 +1198,10 @@ mod tests {
     ) {
         let (connection, peer, thread) = session(cx).await;
         let prompt = cx.update(|cx| {
-            connection.prompt(acp::PromptRequest::new("session", vec!["hello".into()]), cx)
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["hello".into()]),
+                cx,
+            )
         });
         let request = peer.next().await;
         peer.send(json!({"method":"item/agentMessage/delta","params":{"threadId":"other","turnId":"other-turn","itemId":"other-item","delta":"not our message"}})).await;
@@ -1225,6 +1252,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn stale_approval_cleanup_does_not_cancel_a_replacement_request(cx: &mut TestAppContext) {
+        let (connection, peer, thread) = session(cx).await;
+        peer.send(json!({"id":"old-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"session","turnId":"turn","itemId":"tool","command":"echo first"}})).await;
+        cx.run_until_parked();
+        let permission = connection
+            .approvals
+            .borrow()
+            .get("\"old-approval\"")
+            .expect("old approval")
+            .permission
+            .clone();
+        let old_id = permission.borrow().expect("old request ID");
+        let stale = Approval {
+            _task: Task::ready(()),
+            thread: Some(thread.downgrade()),
+            permission,
+            elicitation: Rc::new(RefCell::new(None)),
+        };
+        peer.send(json!({"id":"new-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"session","turnId":"turn","itemId":"tool","command":"echo second"}})).await;
+        cx.run_until_parked();
+        let old_reply = peer.next().await;
+        assert_eq!(old_reply["id"], "old-approval");
+        let new_id = thread.read_with(cx, |thread, _| {
+            thread
+                .tool_call(&acp::ToolCallId::new("tool"))
+                .expect("tool")
+                .1
+                .authorization_id()
+                .expect("replacement authorization")
+        });
+        assert_ne!(old_id, new_id);
+        stale.cancel_ui(&mut cx.to_async());
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread
+                    .tool_call(&acp::ToolCallId::new("tool"))
+                    .expect("tool")
+                    .1
+                    .authorization_id(),
+                Some(new_id)
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                acp::ToolCallId::new("tool"),
+                acp_thread::SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new("2"),
+                    acp::PermissionOptionKind::RejectOnce,
+                ),
+                cx,
+            );
+        });
+        let reply = peer.next().await;
+        assert_eq!(reply["id"], "new-approval");
+        assert_eq!(reply["result"]["decision"], "decline");
+    }
+
+    #[gpui::test]
     async fn questions_wait_for_input_and_return_the_actual_answer(cx: &mut TestAppContext) {
         let (connection, peer, thread) = session(cx).await;
         peer.send(json!({"id":"question","method":"item/tool/requestUserInput","params":{"threadId":"session","itemId":"ask","isBlocking":false,"questions":[{"id":"answer","header":"Input","question":"What next?","isOther":true,"isSecret":false,"options":null}]}})).await;
@@ -1246,10 +1331,13 @@ mod tests {
         thread.update(cx, |thread, cx| {
             thread.respond_to_elicitation(
                 &entry,
-                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
-                    acp::ElicitationAcceptAction::new().content(std::collections::BTreeMap::from(
-                        [("answer".to_owned(), "Continue testing".into())],
-                    )),
+                acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                    acp_v2::ElicitationAcceptAction::new().content(
+                        std::collections::BTreeMap::from([(
+                            "answer".to_owned(),
+                            "Continue testing".into(),
+                        )]),
+                    ),
                 )),
                 cx,
             )
@@ -1488,19 +1576,27 @@ impl AgentConnection for NativeCodexConnection {
             }).await
         })
     }
-    fn auth_methods(&self) -> &[acp::AuthMethod] {
+    fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
         &[]
     }
-    fn authenticate(&self, _: acp::AuthMethodId, _: &mut App) -> Task<Result<()>> {
+    fn authenticate(&self, _: acp_v2::AuthMethodId, _: &mut App) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
             "Native login UI is not implemented; use the configured Codex CLI"
         )))
     }
+    fn validate_prompt_content(&self, content: &[acp_v2::ContentBlock]) -> Result<()> {
+        acp_thread::content::validate_prompt_content_for_v1(content)
+    }
+
     fn prompt(
         &self,
-        params: acp::PromptRequest,
+        params: acp_v2::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
+        let params = match acp_thread::content::prompt_to_v1(params) {
+            Ok(params) => params,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let input = match events::input(&params.prompt) {
             Ok(input) => input,
             Err(error) => return Task::ready(Err(error)),
@@ -1676,7 +1772,7 @@ struct ConfigOptions {
     quota_watch: RefCell<Option<Task<()>>>,
 }
 impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
-    fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+    fn config_options(&self) -> Vec<acp_v2::SessionConfigOption> {
         let mut options = self
             .sessions
             .upgrade()
@@ -1692,15 +1788,15 @@ impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
     }
     fn set_config_option(
         &self,
-        id: acp::SessionConfigId,
-        value: acp::SessionConfigOptionValue,
+        id: acp_v2::SessionConfigId,
+        value: acp_v2::SessionConfigOptionValue,
         cx: &mut App,
-    ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
+    ) -> Task<Result<Vec<acp_v2::SessionConfigOption>>> {
         let result = (|| {
             if id.0.as_ref() == "weekly-usage" {
                 ensure!(
                     value
-                        .as_value_id()
+                        .as_id()
                         .is_some_and(|value| matches!(value.0.as_ref(), "refresh" | "status")),
                     "Invalid quota action"
                 );

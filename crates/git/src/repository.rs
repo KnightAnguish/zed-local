@@ -7,6 +7,7 @@ use crate::{Oid, RunHook, SHA256_HEX_LENGTH, SHORT_SHA_LENGTH};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender;
 use collections::HashMap;
+use file_content::{ByteContent, decode_byte_header};
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::io::BufWriter;
@@ -569,8 +570,6 @@ impl CommitDetails {
     }
 }
 
-/// Detects if content is binary by checking for NUL bytes in the first 8000 bytes.
-/// This matches git's binary detection heuristic.
 pub fn is_binary_content(content: &[u8]) -> bool {
     let check_len = content.len().min(8000);
     content[..check_len].contains(&0)
@@ -598,7 +597,8 @@ async fn read_commit_blob<R: smol::io::AsyncBufRead + Unpin>(
     stdout.read_exact(&mut bytes).await?;
     stdout.read_exact(newline).await?;
 
-    let is_binary = is_binary_content(&bytes);
+    let is_binary =
+        is_binary_content(&bytes) || decode_byte_header(&bytes).1 == ByteContent::Binary;
     Ok(LoadedCommitObject {
         content: bytes,
         is_binary,
@@ -1132,6 +1132,7 @@ pub trait GitRepository: Send + Sync {
 
     fn commit_data_reader(&self) -> Result<CommitDataReader>;
 
+    fn create_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>>;
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>>;
 
     fn delete_ref(&self, ref_name: String) -> BoxFuture<'_, Result<()>>;
@@ -1181,6 +1182,7 @@ pub struct RealGitRepository {
 
 #[derive(Debug)]
 pub enum RefEdit {
+    Create { ref_name: String, commit: String },
     Update { ref_name: String, commit: String },
     Delete { ref_name: String },
 }
@@ -1188,6 +1190,14 @@ pub enum RefEdit {
 impl RefEdit {
     fn into_args(self) -> Vec<OsString> {
         match self {
+            Self::Create { ref_name, commit } => {
+                vec![
+                    "update-ref".into(),
+                    ref_name.into(),
+                    commit.into(),
+                    "".into(),
+                ]
+            }
             Self::Update { ref_name, commit } => {
                 vec!["update-ref".into(), ref_name.into(), commit.into()]
             }
@@ -2794,6 +2804,10 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn create_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
+        self.edit_ref(RefEdit::Create { ref_name, commit })
+    }
+
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
         self.edit_ref(RefEdit::Update { ref_name, commit })
     }
@@ -3847,6 +3861,7 @@ async fn add_files_to_index(git: &GitBinary, files: &[String]) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
 
     let mut stdin = BufWriter::new(
@@ -3855,14 +3870,19 @@ async fn add_files_to_index(git: &GitBinary, files: &[String]) -> Result<()> {
             .take()
             .context("no stdin for git update-index subprocess")?,
     );
-    for file in files {
-        stdin.write_all(file.as_bytes()).await?;
-        stdin.write_all(b"\0").await?;
-    }
-    stdin.flush().await?;
-    drop(stdin);
-
-    let output = process.output().await?;
+    // Git can fill stderr with conversion warnings before reading all paths.
+    // Drain output while writing stdin so neither pipe can block the other.
+    let write_files = async move {
+        for file in files {
+            stdin.write_all(file.as_bytes()).await?;
+            stdin.write_all(b"\0").await?;
+        }
+        stdin.flush().await?;
+        drop(stdin);
+        anyhow::Ok(())
+    };
+    let (write_result, output_result) = futures::join!(write_files, process.output());
+    let output = output_result?;
     anyhow::ensure!(
         output.status.success(),
         GitBinaryCommandError {
@@ -3871,6 +3891,8 @@ async fn add_files_to_index(git: &GitBinary, files: &[String]) -> Result<()> {
             status: output.status,
         }
     );
+    // Prefer Git's stderr over a broken stdin pipe when Git exits early.
+    write_result?;
     Ok(())
 }
 
@@ -4295,6 +4317,18 @@ mod tests {
     use gpui::TestAppContext;
 
     #[test]
+    fn test_create_ref_requires_ref_to_not_exist() {
+        assert_eq!(
+            RefEdit::Create {
+                ref_name: "refs/tags/v1.0.0".to_string(),
+                commit: "abcdef".to_string(),
+            }
+            .into_args(),
+            ["update-ref", "refs/tags/v1.0.0", "abcdef", ""].map(OsString::from)
+        );
+    }
+
+    #[test]
     fn test_commit_hash_search_query_accepts_sha1_and_sha256_hashes() {
         assert_eq!(
             commit_hash_search_query("0123456789abcdef0123456789abcdef01234567"),
@@ -4631,6 +4665,43 @@ mod tests {
                 )]),
             }
         );
+    }
+
+    #[test]
+    fn test_read_commit_blob_binary_detection() {
+        let mut pickle = b"\x80\x02X\0\x04\0\0".to_vec();
+        pickle.extend_from_slice(&b"A\0".repeat(512));
+        pickle.extend_from_slice(b"q\0.");
+        let mut cases = vec![
+            (pickle, true),
+            (b"hello\n".to_vec(), false),
+            (b"\xFF\xFEH\0e\0l\0l\0o\0\n\0".to_vec(), true),
+            (b"\xFE\xFF\0H\0e\0l\0l\0o\0\n".to_vec(), true),
+            (b"H\0e\0l\0l\0o\0\n\0".to_vec(), true),
+            (b"\0H\0e\0l\0l\0o\0\n".to_vec(), true),
+            (b"\xEF\xBB\xBFhello\0".to_vec(), true),
+            (b"\x89PNG\r\n\x1a\n".to_vec(), true),
+        ];
+        for offset in [4096, 7999, 8000] {
+            let mut bytes = vec![b'a'; offset];
+            bytes.push(0);
+            cases.push((bytes, offset < 8000));
+        }
+
+        for (bytes, expected_binary) in cases {
+            let mut output = format!("{}\n", bytes.len()).into_bytes();
+            output.extend_from_slice(&bytes);
+            output.push(b'\n');
+            let object = smol::block_on(read_commit_blob(
+                &mut smol::io::Cursor::new(output),
+                &mut String::new(),
+                &mut [0],
+            ))
+            .unwrap();
+
+            assert_eq!(object.is_binary, expected_binary);
+            assert_eq!(object.content, bytes);
+        }
     }
 
     #[gpui::test]
@@ -5636,6 +5707,89 @@ mod tests {
             path,
             git_directory.join(format!("index-{}.tmp", Uuid::nil()))
         );
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_many_autocrlf_warnings(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("temporary repository");
+        git_init_repo(repo_dir.path());
+        git_command(repo_dir.path(), ["config", "core.autocrlf", "true"]);
+        git_command(repo_dir.path(), ["config", "core.safecrlf", "warn"]);
+        for index in 0..1000 {
+            let name = format!("fixture-{index:04}-{}.txt", "x".repeat(120));
+            smol::fs::write(repo_dir.path().join(name), "first line\nsecond line\n")
+                .await
+                .expect("write LF fixture");
+        }
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("open temporary repository");
+
+        let checkpoint = repo.checkpoint().fuse();
+        let timeout = cx
+            .executor()
+            .timer(std::time::Duration::from_secs(30))
+            .fuse();
+        futures::pin_mut!(checkpoint, timeout);
+        let checkpoint = select_biased! {
+            result = checkpoint => result.expect("checkpoint with many conversion warnings"),
+            _ = timeout => panic!("checkpoint deadlocked while writing paths and draining Git warnings"),
+        };
+        let files = git_command_output(
+            repo_dir.path(),
+            [
+                "ls-tree",
+                "-r",
+                "--name-only",
+                &checkpoint.commit_sha.to_string(),
+            ],
+        );
+        assert_eq!(files.lines().count(), 1000);
+        assert!(
+            !repo_dir.path().join(".git/index").exists(),
+            "checkpoint must not stage files in the real index"
+        );
+        assert!(
+            !repo_dir.path().join(".git/refs/heads/main").exists(),
+            "checkpoint must not create a user commit"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_add_files_to_index_preserves_git_error(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().expect("temporary repository");
+        git_init_repo(repo_dir.path());
+        let git = GitBinary::new(
+            PathBuf::from("git"),
+            repo_dir.path().to_path_buf(),
+            repo_dir.path().join(".git"),
+            cx.executor(),
+            true,
+        );
+        let files = vec![format!("missing-{}.txt", "x".repeat(120)); 1000];
+        let operation = add_files_to_index(&git, &files).fuse();
+        let timeout = cx
+            .executor()
+            .timer(std::time::Duration::from_secs(30))
+            .fuse();
+        futures::pin_mut!(operation, timeout);
+        let error = select_biased! {
+            result = operation => result.expect_err("missing files should fail"),
+            _ = timeout => panic!("early Git failure left stdin or output blocked"),
+        };
+        let git_error = error
+            .downcast_ref::<GitBinaryCommandError>()
+            .expect("report Git's error rather than a broken stdin pipe");
+        assert!(git_error.stderr.contains(&files[0]));
     }
 
     #[gpui::test]

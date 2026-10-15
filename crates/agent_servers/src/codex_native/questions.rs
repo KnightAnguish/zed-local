@@ -1,5 +1,5 @@
 use super::events::text;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 

@@ -1,5 +1,5 @@
 use crate::codex_history::CodexHistory;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use gpui::{App, AppContext as _, Task};
 use serde_json::Value;
 use std::{
@@ -93,7 +93,7 @@ impl NativeUsage {
         &self,
         mut options: Vec<acp::SessionConfigOption>,
     ) -> Vec<acp::SessionConfigOption> {
-        options.retain(|option| !Self::owns(&option.id));
+        options.retain(|option| !Self::owns(&option.config_id));
         let state = self.state.borrow();
         options.push(usage_option(
             state.response.as_ref(),
