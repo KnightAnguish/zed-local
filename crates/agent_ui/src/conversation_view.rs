@@ -10213,6 +10213,11 @@ pub(crate) mod tests {
                 gpui::MouseButton::Right,
                 gpui::Modifiers::default(),
             );
+            assert_eq!(
+                cx.debug_bounds("MENU_ITEM-Open with Default App").is_some(),
+                expected == local_path,
+                "Only local file links should offer system opening",
+            );
             let copy = cx.debug_bounds("MENU_ITEM-Copy Link").expect("Copy Link");
             cx.simulate_click(copy.center(), gpui::Modifiers::default());
             let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
@@ -10233,6 +10238,7 @@ pub(crate) mod tests {
             gpui::Modifiers::default(),
         );
         assert!(cx.debug_bounds("MENU_ITEM-Copy Link").is_none());
+        assert!(cx.debug_bounds("MENU_ITEM-Open with Default App").is_none());
         assert!(
             cx.debug_bounds("MENU_ITEM-Copy This Agent Response")
                 .is_some()

@@ -778,7 +778,7 @@ impl Platform for WindowsPlatform {
         let url_string = url.to_string();
         self.background_executor()
             .spawn(async move {
-                open_target(&url_string)
+                open_target(&url_string, None)
                     .with_context(|| format!("Opening url: {}", url_string))
                     .log_err();
             })
@@ -844,7 +844,7 @@ impl Platform for WindowsPlatform {
         let path = path.to_path_buf();
         self.background_executor()
             .spawn(async move {
-                open_target(&path)
+                open_target(&path, path.parent())
                     .with_context(|| format!("Opening {} with system", path.display()))
                     .log_err();
             })
@@ -1427,15 +1427,20 @@ fn has_package_identity() -> bool {
     }
 }
 
-fn open_target(target: impl AsRef<OsStr>) -> Result<()> {
+fn open_target(target: impl AsRef<OsStr>, working_directory: Option<&Path>) -> Result<()> {
     let target = target.as_ref();
+    let working_directory = working_directory.map(|path| HSTRING::from(path.as_os_str()));
     let ret = unsafe {
         ShellExecuteW(
             None,
             windows::core::w!("open"),
             &HSTRING::from(target),
             None,
-            None,
+            working_directory
+                .as_ref()
+                .map_or(windows::core::PCWSTR::null(), |path| {
+                    windows::core::PCWSTR(path.as_ptr())
+                }),
             SW_SHOWDEFAULT,
         )
     };
@@ -1483,7 +1488,7 @@ fn open_target_in_explorer(target: &Path) -> Result<()> {
             // On some systems, the above call mysteriously fails with "file not
             // found" even though the file is there.  In these cases, ShellExecute()
             // seems to work as a fallback (although it won't select the file).
-            open_target(dir).context("Opening target parent folder")
+            open_target(dir, None).context("Opening target parent folder")
         } else {
             Err(anyhow::anyhow!("Can not open target path: {}", err))
         }

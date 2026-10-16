@@ -8709,6 +8709,11 @@ impl ThreadView {
                     let markdown = markdown.as_ref().map(|markdown| markdown.read(cx));
                     let context_menu_link =
                         markdown.and_then(|markdown| markdown.context_menu_link().cloned());
+                    let system_link = context_menu_link.as_ref().filter(|link| {
+                        let project = this.thread.read(cx).project().read(cx);
+                        project.is_local()
+                            && system_link_candidates(link, project.path_style(cx)).is_some()
+                    });
                     let selected_text = markdown
                         .and_then(|markdown| markdown.context_menu_selected_text().cloned());
                     let selected_markdown = markdown
@@ -8765,6 +8770,14 @@ impl ThreadView {
                         });
 
                     menu.when_some(focus, |menu, focus| menu.context(focus))
+                        .when_some(system_link.cloned(), |menu, link| {
+                            let entity = entity.clone();
+                            menu.entry("Open with Default App", None, move |_, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_link_with_system(link.clone(), cx);
+                                });
+                            })
+                        })
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -8798,6 +8811,41 @@ impl ThreadView {
                 })
             })
             .into_any_element()
+    }
+
+    fn open_link_with_system(&self, link: SharedString, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        let project = thread.project().read(cx);
+        if !project.is_local() {
+            return;
+        }
+        let path_style = project.path_style(cx);
+        let Some(candidates) = system_link_candidates(&link, path_style) else {
+            return;
+        };
+        let roots = system_link_roots(thread.work_dirs(), &project, cx);
+        let fs = project.fs().clone();
+        cx.spawn(async move |this, cx| {
+            match resolve_system_link(candidates, &roots, path_style, fs.as_ref()).await {
+                Ok(path) => cx.update(|cx| cx.open_with_system(&path)),
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!(
+                                        "Could not open {link} with the default app: {error:#}"
+                                    ),
+                                    cx,
+                                );
+                            });
+                        }
+                    })?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn get_agent_message_content(
@@ -14098,6 +14146,88 @@ pub(super) fn link_clipboard_text(link: &str) -> String {
         .unwrap_or_else(|| link.to_owned())
 }
 
+fn system_link_candidates(link: &str, path_style: PathStyle) -> Option<Vec<PathBuf>> {
+    let link = link.trim();
+    let link = ['`', '"', '\'']
+        .into_iter()
+        .find_map(|quote| link.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(link);
+    if link.is_empty() {
+        return None;
+    }
+    if let Ok(url) = Url::parse(link)
+        && url.scheme() == "file"
+    {
+        return Some(vec![url.to_file_path().ok()?]);
+    }
+    let (path, fragment) = file_link_parts(link, path_style)?;
+    if path.is_empty() {
+        return None;
+    }
+    let fragment_point = fragment
+        .and_then(source_position_from_fragment)
+        .map(|(row, column)| Point::new(row, column));
+    let candidates = file_link_candidates(path, fragment_point, path_style)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+fn system_link_roots(work_dirs: Option<&PathList>, project: &Project, cx: &App) -> Vec<PathBuf> {
+    if let Some(work_dirs) = work_dirs.filter(|paths| !paths.is_empty()) {
+        // A chat may use a different root than the active editor or the first worktree.
+        return work_dirs.ordered_paths().cloned().collect();
+    }
+    project
+        .visible_worktrees(cx)
+        .filter_map(|worktree| {
+            let worktree = worktree.read(cx);
+            (!worktree.is_single_file()).then(|| worktree.abs_path().to_path_buf())
+        })
+        .collect()
+}
+
+async fn resolve_system_link(
+    candidates: Vec<PathBuf>,
+    roots: &[PathBuf],
+    path_style: PathStyle,
+    fs: &dyn Fs,
+) -> Result<PathBuf> {
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        let paths = if path_style.is_absolute(&candidate.to_string_lossy()) {
+            vec![candidate]
+        } else {
+            roots
+                .iter()
+                .flat_map(|root| {
+                    let unprefixed = root
+                        .file_name()
+                        .and_then(|name| candidate.strip_prefix(name).ok());
+                    unprefixed
+                        .into_iter()
+                        .chain(std::iter::once(candidate.as_path()))
+                        .filter_map(move |path| {
+                            path_style.join_path_preserving_components(root, path).ok()
+                        })
+                })
+                .collect()
+        };
+        for path in paths {
+            match fs.metadata(&path).await {
+                Ok(Some(_)) => return Ok(path),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("{}: {error:#}", path.display())),
+            }
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("; "));
+    }
+    anyhow::bail!("File or folder not found in this chat's working directories")
+}
+
 pub(crate) fn open_link(
     url: SharedString,
     workspace: &WeakEntity<Workspace>,
@@ -14477,6 +14607,183 @@ mod tests {
     use std::sync::Once;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_system_link_candidates() {
+        for link in [
+            "https://example.com/file.cmd",
+            "mailto:user@example.com",
+            "javascript:alert(1)",
+            "zed:///agent/123",
+            "data:text/plain,hello",
+            "",
+            "#L2",
+        ] {
+            assert!(
+                system_link_candidates(link, PathStyle::Windows).is_none(),
+                "{link}"
+            );
+        }
+        for link in [
+            "Water air study.cmd",
+            "`Water air study.cmd`",
+            "\"Water air study.cmd\"",
+        ] {
+            assert_eq!(
+                system_link_candidates(link, PathStyle::Windows)
+                    .unwrap()
+                    .first(),
+                Some(&PathBuf::from("Water air study.cmd")),
+            );
+        }
+        assert_eq!(
+            system_link_candidates(r"Архивы\vk-music-saver-local.zip", PathStyle::Windows)
+                .unwrap()
+                .first(),
+            Some(&PathBuf::from("Архивы/vk-music-saver-local.zip")),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_system_link_resolution(cx: &mut gpui::TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/first"),
+            json!({"Water air study.cmd": "wrong project", "first-only.cmd": "not in this chat"}),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/second"),
+            json!({
+                "Water air study.cmd": "right project",
+                "a b.md": "decoded",
+                "a%20b.md": "literal",
+                "literal%20space.md": "literal fallback",
+                "Русский текст.md": "unicode",
+                "folder": {"file.txt": "inside"},
+            }),
+        )
+        .await;
+        let roots = vec![PathBuf::from(path!("/second"))];
+        let style = PathStyle::local();
+        let file_url = Url::from_file_path(path!("/second/a%20b.md")).unwrap();
+        for (link, expected) in [
+            (
+                "Water air study.cmd".to_string(),
+                path!("/second/Water air study.cmd"),
+            ),
+            (
+                "./Water air study.cmd".to_string(),
+                path!("/second/Water air study.cmd"),
+            ),
+            (
+                "second/Water air study.cmd".to_string(),
+                path!("/second/Water air study.cmd"),
+            ),
+            ("a%20b.md#L2".to_string(), path!("/second/a b.md")),
+            (
+                "literal%20space.md".to_string(),
+                path!("/second/literal%20space.md"),
+            ),
+            (format!("{file_url}#L2"), path!("/second/a%20b.md")),
+            (
+                "Русский%20текст.md".to_string(),
+                path!("/second/Русский текст.md"),
+            ),
+            (
+                "folder/file.txt:2:1".to_string(),
+                path!("/second/folder/file.txt"),
+            ),
+            ("folder".to_string(), path!("/second/folder")),
+            (
+                path!("/first/Water air study.cmd").to_string(),
+                path!("/first/Water air study.cmd"),
+            ),
+        ] {
+            let candidates = system_link_candidates(&link, style).expect("file link");
+            let resolved = resolve_system_link(candidates, &roots, style, fs.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                fs.canonicalize(&resolved).await.unwrap(),
+                PathBuf::from(expected),
+                "{link}"
+            );
+        }
+        let candidates = system_link_candidates("missing.cmd", style).unwrap();
+        assert!(
+            resolve_system_link(candidates, &roots, style, fs.as_ref())
+                .await
+                .is_err()
+        );
+        let candidates = system_link_candidates("first-only.cmd", style).unwrap();
+        assert!(
+            resolve_system_link(candidates, &roots, style, fs.as_ref())
+                .await
+                .is_err()
+        );
+        let candidates = system_link_candidates("Water air study.cmd", style).unwrap();
+        assert!(
+            resolve_system_link(candidates, &[], style, fs.as_ref())
+                .await
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_system_link_roots_follow_chat_not_worktree_order(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/first"), json!({})).await;
+        fs.insert_tree(path!("/second"), json!({})).await;
+        let project = Project::test(
+            fs,
+            [Path::new(path!("/first")), Path::new(path!("/second"))],
+            cx,
+        )
+        .await;
+        project.read_with(cx, |project, cx| {
+            let work_dirs = PathList::new(&[path!("/second"), path!("/first")]);
+            assert_eq!(
+                system_link_roots(Some(&work_dirs), project, cx),
+                [
+                    PathBuf::from(path!("/second")),
+                    PathBuf::from(path!("/first"))
+                ]
+            );
+            let work_dirs = PathList::new(&[path!("/second/subdir")]);
+            assert_eq!(
+                system_link_roots(Some(&work_dirs), project, cx),
+                [PathBuf::from(path!("/second/subdir"))]
+            );
+            assert_eq!(
+                system_link_roots(None, project, cx),
+                [
+                    PathBuf::from(path!("/first")),
+                    PathBuf::from(path!("/second"))
+                ]
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_system_link_windows_absolute_paths() {
+        for link in [
+            "C:/Users/DecayScope/Documents/GitHub/Terrarium/Water air study.cmd",
+            r"C:\Users\DecayScope\Documents\GitHub\Terrarium\Water air study.cmd",
+            "file:///C:/Users/DecayScope/Documents/GitHub/Terrarium/Water%20air%20study.cmd#L2",
+        ] {
+            assert_eq!(
+                system_link_candidates(link, PathStyle::Windows)
+                    .unwrap()
+                    .first(),
+                Some(&PathBuf::from(
+                    r"C:\Users\DecayScope\Documents\GitHub\Terrarium\Water air study.cmd"
+                ))
+            );
+        }
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {
