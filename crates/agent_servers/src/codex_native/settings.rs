@@ -1,5 +1,5 @@
 use super::transport::Rpc;
-use agent_client_protocol::schema::{v1, v2 as acp};
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{App, Task};
 use serde::Deserialize;
@@ -329,7 +329,7 @@ impl Preferences {
         Ok(())
     }
 
-    pub(super) fn turn_params(&self, thread_id: &v1::SessionId, input: Vec<Value>) -> Value {
+    pub(super) fn turn_params(&self, thread_id: &acp::SessionId, input: Vec<Value>) -> Value {
         let mut params = json!({"threadId":thread_id,"input":input,"model":self.model});
         if let Some(effort) = &self.effort {
             params["effort"] = json!(effort);
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn permissions_are_only_overridden_when_explicitly_selected() {
         let mut preferences = preferences();
-        let id = v1::SessionId::new("t");
+        let id = acp::SessionId::new("t");
         assert!(
             preferences
                 .turn_params(&id, vec![])
@@ -506,7 +506,7 @@ mod tests {
         let mut preferences = preferences();
         assert_eq!(preferences.options().len(), 4);
         preferences.change("fast-mode", &false.into()).unwrap();
-        let params = preferences.turn_params(&v1::SessionId::new("t"), vec![]);
+        let params = preferences.turn_params(&acp::SessionId::new("t"), vec![]);
         assert!(params.get("serviceTier").unwrap().is_null());
     }
     #[gpui::test]

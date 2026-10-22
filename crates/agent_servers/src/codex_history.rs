@@ -1,5 +1,5 @@
 use acp_thread::{HistoryMessage, HistoryPage};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use anyhow::{Context as _, Result, bail, ensure};
 use futures::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, io::BufReader};
 use project::agent_server_store::AgentServerCommand;
@@ -55,7 +55,7 @@ impl CodexHistory {
 
     pub(crate) async fn page(
         &self,
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         cursor: Option<String>,
     ) -> Result<HistoryPage> {
         decode_page(
@@ -453,7 +453,7 @@ mod tests {
             environment: Default::default(),
             directory: None,
         };
-        let page = futures::executor::block_on(history.page(acp::SessionId::new(session), None))
+        let page = futures::executor::block_on(history.page(acp_v2::SessionId::new(session), None))
             .expect("read-only page");
         assert!(!page.messages.is_empty());
         let usage =

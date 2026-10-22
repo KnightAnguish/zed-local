@@ -1,6 +1,8 @@
 use super::{Session, events::text, transport::Rpc};
 use acp_thread::SessionForkPoint;
+#[cfg(test)]
 use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -11,14 +13,14 @@ use std::{
 };
 
 pub(super) struct SessionGuard {
-    sessions: Rc<RefCell<HashMap<acp::SessionId, Session>>>,
-    id: acp::SessionId,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, Session>>>,
+    id: acp_v2::SessionId,
 }
 
 impl SessionGuard {
     pub(super) fn acquire(
-        sessions: Rc<RefCell<HashMap<acp::SessionId, Session>>>,
-        id: acp::SessionId,
+        sessions: Rc<RefCell<HashMap<acp_v2::SessionId, Session>>>,
+        id: acp_v2::SessionId,
     ) -> Result<Self> {
         {
             let mut sessions = sessions.borrow_mut();
@@ -97,7 +99,7 @@ fn boundary(
     }
 }
 
-async fn resolve(rpc: &Rpc, id: &acp::SessionId, point: &SessionForkPoint) -> Result<Boundary> {
+async fn resolve(rpc: &Rpc, id: &acp_v2::SessionId, point: &SessionForkPoint) -> Result<Boundary> {
     ensure!(
         !point.message_id.0.trim().is_empty(),
         "Missing fork message ID"
@@ -137,10 +139,10 @@ async fn resolve(rpc: &Rpc, id: &acp::SessionId, point: &SessionForkPoint) -> Re
 
 pub(super) async fn fork(
     rpc: &Rpc,
-    source: &acp::SessionId,
+    source: &acp_v2::SessionId,
     cwd: Option<&Path>,
     point: Option<&SessionForkPoint>,
-) -> Result<acp::SessionId> {
+) -> Result<acp_v2::SessionId> {
     let source_state = rpc
         .request(
             "thread/read",
@@ -170,7 +172,7 @@ pub(super) async fn fork(
         params["lastTurnId"] = json!(boundary.last_turn);
     }
     let response = rpc.request("thread/fork", params).await?;
-    let id = acp::SessionId::new(text(&response["thread"], "id")?);
+    let id = acp_v2::SessionId::new(text(&response["thread"], "id")?);
     ensure!(
         id != *source && !id.0.is_empty(),
         "Codex did not return a separate fork"
@@ -222,7 +224,7 @@ mod tests {
         cx.background_executor.allow_parking();
         let executable =
             std::path::PathBuf::from(std::env::var("ZED_CODEX_HISTORY_TEST_EXE").expect("runtime"));
-        let source = acp::SessionId::new(
+        let source = acp_v2::SessionId::new(
             std::env::var("ZED_CODEX_HISTORY_TEST_THREAD").expect("disposable diagnostic source"),
         );
         let (rpc, events) = Rpc::start(
@@ -365,7 +367,7 @@ mod tests {
         let task = cx.background_executor.spawn(async move {
             fork(
                 &rpc,
-                &acp::SessionId::new("source"),
+                &acp_v2::SessionId::new("source"),
                 None,
                 Some(&point("u", true)),
             )
@@ -398,14 +400,14 @@ mod tests {
             reply(&peer, "thread/unsubscribe", json!({})).await["threadId"],
             "copy"
         );
-        assert_eq!(task.await.unwrap(), acp::SessionId::new("copy"));
+        assert_eq!(task.await.unwrap(), acp_v2::SessionId::new("copy"));
     }
     #[gpui::test]
     async fn source_id_returned_as_fork_is_never_modified(cx: &mut gpui::TestAppContext) {
         let (rpc, peer, _events) = Rpc::fake(cx.background_executor.clone());
         let task = cx
             .background_executor
-            .spawn(async move { fork(&rpc, &acp::SessionId::new("source"), None, None).await });
+            .spawn(async move { fork(&rpc, &acp_v2::SessionId::new("source"), None, None).await });
         reply(
             &peer,
             "thread/read",
@@ -421,7 +423,7 @@ mod tests {
         let task = cx.background_executor.spawn(async move {
             fork(
                 &rpc,
-                &acp::SessionId::new("source"),
+                &acp_v2::SessionId::new("source"),
                 None,
                 Some(&point("u", true)),
             )
@@ -452,7 +454,7 @@ mod tests {
     async fn boundary_keeps_previous_turn_across_pages(cx: &mut gpui::TestAppContext) {
         let (rpc, peer, _events) = Rpc::fake(cx.background_executor.clone());
         let task = cx.background_executor.spawn(async move {
-            resolve(&rpc, &acp::SessionId::new("source"), &point("u", true)).await
+            resolve(&rpc, &acp_v2::SessionId::new("source"), &point("u", true)).await
         });
         let params = reply(
             &peer,

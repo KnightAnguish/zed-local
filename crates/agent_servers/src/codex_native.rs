@@ -74,14 +74,14 @@ impl Approval {
 
 pub(crate) struct NativeCodexConnection {
     rpc: Rpc,
-    sessions: Rc<RefCell<HashMap<acp::SessionId, Session>>>,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, Session>>>,
     approvals: RefCell<HashMap<String, Approval>>,
     event_task: RefCell<Option<Task<()>>>,
     profile_home: RefCell<Option<PathBuf>>,
     profile_override: RefCell<Option<String>>,
     models: RefCell<Rc<Vec<settings::Model>>>,
     quota: Rc<settings::Quota>,
-    fork_preferences: RefCell<HashMap<acp::SessionId, settings::Preferences>>,
+    fork_preferences: RefCell<HashMap<acp_v2::SessionId, settings::Preferences>>,
 }
 
 #[derive(Clone)]
@@ -95,7 +95,7 @@ struct SessionRuntime {
 impl SessionRuntime {
     async fn restore(
         &self,
-        id: &acp::SessionId,
+        id: &acp_v2::SessionId,
         work_dirs: &PathList,
         cx: &mut AsyncApp,
     ) -> Result<settings::Preferences> {
@@ -147,7 +147,7 @@ impl NativeCodexConnection {
     }
     fn open_task(
         self: Rc<Self>,
-        id: Option<acp::SessionId>,
+        id: Option<acp_v2::SessionId>,
         project: Entity<Project>,
         directories: PathList,
         title: Option<SharedString>,
@@ -306,7 +306,7 @@ impl NativeCodexConnection {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
             return Ok(());
         };
-        let id = acp::SessionId::new(thread_id);
+        let id = acp_v2::SessionId::new(thread_id);
         if self
             .sessions
             .borrow()
@@ -416,7 +416,7 @@ impl NativeCodexConnection {
         let thread = params["threadId"].as_str().and_then(|id| {
             self.sessions
                 .borrow()
-                .get(&acp::SessionId::new(id))
+                .get(&acp_v2::SessionId::new(id))
                 .filter(|session| session.attached)
                 .map(|session| session.thread.clone())
         });
@@ -426,7 +426,7 @@ impl NativeCodexConnection {
             if let Some(active) = self
                 .sessions
                 .borrow_mut()
-                .get_mut(&acp::SessionId::new(id))
+                .get_mut(&acp_v2::SessionId::new(id))
                 .and_then(|session| session.active.as_mut())
             {
                 active.recovery.begin_request(key.clone());
@@ -506,7 +506,7 @@ impl NativeCodexConnection {
         profile_home: Option<PathBuf>,
         profile_override: Option<String>,
         work_dirs: &PathList,
-        session_id: Option<&acp::SessionId>,
+        session_id: Option<&acp_v2::SessionId>,
         cx: &mut AsyncApp,
     ) -> Result<Value> {
         let account = rpc
@@ -547,7 +547,7 @@ impl NativeCodexConnection {
 
     async fn open(
         self: Rc<Self>,
-        session_id: Option<acp::SessionId>,
+        session_id: Option<acp_v2::SessionId>,
         project: Entity<Project>,
         work_dirs: PathList,
         title: Option<SharedString>,
@@ -585,7 +585,7 @@ impl NativeCodexConnection {
             )
             .await?
         };
-        let id = acp::SessionId::new(text(&response["thread"], "id")?);
+        let id = acp_v2::SessionId::new(text(&response["thread"], "id")?);
         ensure!(
             !id.0.is_empty() && session_id.as_ref().is_none_or(|expected| expected == &id),
             "Codex returned an unexpected session identity"
@@ -780,7 +780,7 @@ mod tests {
     #[gpui::test]
     async fn settings_reach_only_next_turn_and_cannot_change_active_turn(cx: &mut TestAppContext) {
         let (connection, peer, _thread) = session(cx).await;
-        let id = acp::SessionId::new("session");
+        let id = acp_v2::SessionId::new("session");
         let options = cx
             .update(|cx| connection.session_config_options(&id, cx))
             .unwrap();
@@ -880,7 +880,7 @@ mod tests {
         let connection = NativeCodexConnection::from_rpc(rpc, events, &mut cx.to_async());
         let thread = stored(&connection, &peer, project, cx).await;
         assert!(connection.models.borrow().is_empty());
-        assert!(!connection.sessions.borrow()[&acp::SessionId::new("stored")].attached);
+        assert!(!connection.sessions.borrow()[&acp_v2::SessionId::new("stored")].attached);
         thread.read_with(cx, |thread, _| {
             assert_eq!(thread.entries().len(), 1);
             assert_eq!(thread.notices().len(), 1);
@@ -900,18 +900,23 @@ mod tests {
         let (rpc, peer, events) = Rpc::fake(cx.background_executor.clone());
         let connection = NativeCodexConnection::from_rpc(rpc, events, &mut cx.to_async());
         let load = cx.update(|cx| {
-            connection.clone().load_session("stored".into(), project, PathList::default(), None, cx)
+            connection
+                .clone()
+                .load_session("stored".into(), project, PathList::default(), None, cx)
         });
         let read = peer.next().await;
         assert_eq!(read["method"], "thread/read");
         assert_eq!(read["params"]["includeTurns"], false);
-        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}})).await;
+        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}}))
+            .await;
         let models = peer.next().await;
         assert_eq!(models["method"], "model/list");
-        peer.send(json!({"id":models["id"],"result":{"data":[{"model":"a","displayName":"A"}]}})).await;
+        peer.send(json!({"id":models["id"],"result":{"data":[{"model":"a","displayName":"A"}]}}))
+            .await;
         let account = peer.next().await;
         assert_eq!(account["method"], "account/read");
-        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}})).await;
+        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
+            .await;
         let resume = peer.next().await;
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "stored");
@@ -921,13 +926,26 @@ mod tests {
         assert_eq!(page["method"], "thread/turns/list");
         assert_eq!(page["params"]["limit"], 20);
         assert_eq!(page["params"]["itemsView"], "summary");
-        peer.send(json!({"id":page["id"],"result":{"data":[],"nextCursor":null}})).await;
+        peer.send(json!({"id":page["id"],"result":{"data":[],"nextCursor":null}}))
+            .await;
         let thread = load.await.expect("connected chat");
-        assert!(connection.sessions.borrow()[&acp::SessionId::new("stored")].attached);
+        assert!(connection.sessions.borrow()[&acp_v2::SessionId::new("stored")].attached);
         thread.read_with(cx, |thread, _| assert!(thread.notices().is_empty()));
-        let options = cx.update(|cx| connection.session_config_options(&"stored".into(), cx)).unwrap();
-        assert!(options.config_options().iter().any(|option| option.config_id.0.as_ref() == "model"));
-        assert!(!options.config_options().iter().any(|option| option.config_id.0.as_ref() == "local-history"));
+        let options = cx
+            .update(|cx| connection.session_config_options(&"stored".into(), cx))
+            .unwrap();
+        assert!(
+            options
+                .config_options()
+                .iter()
+                .any(|option| option.config_id.0.as_ref() == "model")
+        );
+        assert!(
+            !options
+                .config_options()
+                .iter()
+                .any(|option| option.config_id.0.as_ref() == "local-history")
+        );
         let quota = peer.next().await;
         assert_eq!(quota["method"], "account/rateLimits/read");
         peer.send(json!({"id":quota["id"],"result":{}})).await;
@@ -944,22 +962,29 @@ mod tests {
         let (connection, peer, source) = session(cx).await;
         let project = source.read_with(cx, |thread, _| thread.project().clone());
         let load = cx.update(|cx| {
-            connection.clone().load_session("stored".into(), project, PathList::default(), None, cx)
+            connection
+                .clone()
+                .load_session("stored".into(), project, PathList::default(), None, cx)
         });
         let read = peer.next().await;
         assert_eq!(read["method"], "thread/read");
-        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}})).await;
+        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}}))
+            .await;
         let account = peer.next().await;
         assert_eq!(account["method"], "account/read");
-        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}})).await;
+        peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
+            .await;
         let resume = peer.next().await;
         assert_eq!(resume["method"], "thread/resume");
-        peer.send(json!({"id":resume["id"],"error":{"code":-32603,"message":"network unavailable"}})).await;
+        peer.send(
+            json!({"id":resume["id"],"error":{"code":-32603,"message":"network unavailable"}}),
+        )
+        .await;
         let page = peer.next().await;
         assert_eq!(page["method"], "thread/turns/list");
         peer.send(json!({"id":page["id"],"result":{"data":[{"items":[{"id":"reply","type":"agentMessage","text":"Saved locally"}]}]}})).await;
         let thread = load.await.expect("offline fallback");
-        assert!(!connection.sessions.borrow()[&acp::SessionId::new("stored")].attached);
+        assert!(!connection.sessions.borrow()[&acp_v2::SessionId::new("stored")].attached);
         thread.read_with(cx, |thread, _| {
             assert_eq!(thread.entries().len(), 1);
             assert_eq!(thread.notices().len(), 1);
@@ -974,21 +999,27 @@ mod tests {
         let (rpc, peer, events) = Rpc::fake(cx.background_executor.clone());
         let connection = NativeCodexConnection::from_rpc(rpc, events, &mut cx.to_async());
         let load = cx.update(|cx| {
-            connection.clone().load_session("stored".into(), project, PathList::default(), None, cx)
+            connection
+                .clone()
+                .load_session("stored".into(), project, PathList::default(), None, cx)
         });
         let read = peer.next().await;
-        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}})).await;
+        peer.send(json!({"id":read["id"],"result":{"thread":{"id":"stored"}}}))
+            .await;
         let models = peer.next().await;
         assert_eq!(models["method"], "model/list");
         cx.run_until_parked();
-        cx.background_executor.advance_clock(std::time::Duration::from_secs(60));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(60));
         let page = peer.next().await;
         assert_eq!(page["method"], "thread/turns/list");
-        peer.send(json!({"id":page["id"],"result":{"data":[]}})).await;
+        peer.send(json!({"id":page["id"],"result":{"data":[]}}))
+            .await;
         let thread = load.await.expect("history after timeout");
-        peer.send(json!({"id":models["id"],"result":{"data":[{"model":"a","displayName":"A"}]}})).await;
+        peer.send(json!({"id":models["id"],"result":{"data":[{"model":"a","displayName":"A"}]}}))
+            .await;
         cx.run_until_parked();
-        assert!(!connection.sessions.borrow()[&acp::SessionId::new("stored")].attached);
+        assert!(!connection.sessions.borrow()[&acp_v2::SessionId::new("stored")].attached);
         thread.read_with(cx, |thread, _| assert_eq!(thread.notices().len(), 1));
         assert!(peer.next().now_or_never().is_none());
     }
@@ -1049,7 +1080,7 @@ mod tests {
             .await;
         peer.send(json!({"method":"turn/completed","params":{"threadId":"stored","turn":{"id":"new-turn","status":"completed"}}})).await;
         send.await.expect("online retry");
-        assert!(connection.sessions.borrow()[&acp::SessionId::new("stored")].attached);
+        assert!(connection.sessions.borrow()[&acp_v2::SessionId::new("stored")].attached);
         thread.read_with(cx, |thread, _| assert!(thread.notices().is_empty()));
         assert!(peer.next().now_or_never().is_none());
     }
@@ -1083,7 +1114,7 @@ mod tests {
         );
         assert!(peer.next().now_or_never().is_none());
         assert!(
-            connection.sessions.borrow()[&acp::SessionId::new("stored")]
+            connection.sessions.borrow()[&acp_v2::SessionId::new("stored")]
                 .active
                 .is_none()
         );
@@ -1166,7 +1197,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (connection, peer, source) = session(cx).await;
-        let id = acp::SessionId::new("session");
+        let id = acp_v2::SessionId::new("session");
         let project = source.read_with(cx, |thread, _| thread.project().clone());
         connection
             .sessions
@@ -1302,7 +1333,7 @@ mod tests {
     #[gpui::test]
     async fn fork_guard_blocks_writes_and_is_released_on_drop(cx: &mut TestAppContext) {
         let (connection, _peer, _thread) = session(cx).await;
-        let id = acp::SessionId::new("session");
+        let id = acp_v2::SessionId::new("session");
         let guard = forks::SessionGuard::acquire(connection.sessions.clone(), id.clone()).unwrap();
         assert!(forks::SessionGuard::acquire(connection.sessions.clone(), id.clone()).is_err());
         let prompt = cx.update(|cx| {
@@ -1333,7 +1364,7 @@ mod tests {
         });
         let request = peer.next().await;
         assert_eq!(request["method"], "turn/start");
-        cx.update(|cx| connection.cancel(&acp::SessionId::new("session"), cx));
+        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx));
         peer.send(
             json!({"method":"turn/started","params":{"threadId":"session","turn":{"id":"turn"}}}),
         )
@@ -1350,7 +1381,7 @@ mod tests {
             acp::StopReason::Cancelled
         );
         assert!(
-            connection.sessions.borrow()[&acp::SessionId::new("session")]
+            connection.sessions.borrow()[&acp_v2::SessionId::new("session")]
                 .active
                 .is_none()
         );
@@ -1446,7 +1477,7 @@ mod tests {
                 .contains("connection failed")
         );
         let sessions = connection.sessions.borrow();
-        let session = &sessions[&acp::SessionId::new("session")];
+        let session = &sessions[&acp_v2::SessionId::new("session")];
         assert!(session.active.is_none());
         assert!(!session.uncertain);
     }
@@ -1470,7 +1501,7 @@ mod tests {
                 .to_string()
                 .contains("load the saved reply")
         );
-        assert!(connection.sessions.borrow()[&acp::SessionId::new("session")].uncertain);
+        assert!(connection.sessions.borrow()[&acp_v2::SessionId::new("session")].uncertain);
         let retry = cx.update(|cx| {
             connection.prompt(
                 acp_v2::PromptRequest::new("session", vec!["retry".into()]),
@@ -1512,7 +1543,7 @@ mod tests {
             acp::StopReason::Cancelled
         );
         assert!(
-            connection.sessions.borrow()[&acp::SessionId::new("session")]
+            connection.sessions.borrow()[&acp_v2::SessionId::new("session")]
                 .active
                 .is_none()
         );
@@ -1524,7 +1555,7 @@ mod tests {
         {
             let mut sessions = connection.sessions.borrow_mut();
             let active = sessions
-                .get_mut(&acp::SessionId::new("session"))
+                .get_mut(&acp_v2::SessionId::new("session"))
                 .expect("session")
                 .active
                 .as_mut()
@@ -1592,7 +1623,7 @@ mod tests {
     #[gpui::test]
     async fn recovery_manual_stop_does_not_wait_forever_for_completion(cx: &mut TestAppContext) {
         let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
-        cx.update(|cx| connection.cancel(&acp::SessionId::new("session"), cx));
+        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx));
         let interrupt = peer.next().await;
         peer.send(json!({"id":interrupt["id"],"result":{}})).await;
         quiet_minutes(cx, 1);
@@ -1606,7 +1637,7 @@ mod tests {
                 .to_string()
                 .contains("not confirmed cancellation")
         );
-        assert!(connection.sessions.borrow()[&acp::SessionId::new("session")].uncertain);
+        assert!(connection.sessions.borrow()[&acp_v2::SessionId::new("session")].uncertain);
     }
 
     #[gpui::test]
@@ -1630,7 +1661,7 @@ mod tests {
                 .contains("outcome is unknown")
         );
         let sessions = connection.sessions.borrow();
-        let session = &sessions[&acp::SessionId::new("session")];
+        let session = &sessions[&acp_v2::SessionId::new("session")];
         assert!(session.active.is_none());
         assert!(session.uncertain);
     }
@@ -1679,10 +1710,10 @@ mod tests {
         assert_eq!(connection.approvals.borrow().len(), 1);
         thread.update(cx, |thread, cx| {
             thread.authorize_tool_call(
-                acp::ToolCallId::new("tool"),
+                acp_v2::ToolCallId::new("tool"),
                 acp_thread::SelectedPermissionOutcome::new(
-                    acp::PermissionOptionId::new("2"),
-                    acp::PermissionOptionKind::RejectOnce,
+                    acp_v2::PermissionOptionId::new("2"),
+                    acp_v2::PermissionOptionKind::RejectOnce,
                 ),
                 cx,
             )
@@ -1719,7 +1750,7 @@ mod tests {
         assert_eq!(old_reply["id"], "old-approval");
         let new_id = thread.read_with(cx, |thread, _| {
             thread
-                .tool_call(&acp::ToolCallId::new("tool"))
+                .tool_call(&acp_v2::ToolCallId::new("tool"))
                 .expect("tool")
                 .1
                 .authorization_id()
@@ -1730,7 +1761,7 @@ mod tests {
         thread.read_with(cx, |thread, _| {
             assert_eq!(
                 thread
-                    .tool_call(&acp::ToolCallId::new("tool"))
+                    .tool_call(&acp_v2::ToolCallId::new("tool"))
                     .expect("tool")
                     .1
                     .authorization_id(),
@@ -1739,10 +1770,10 @@ mod tests {
         });
         thread.update(cx, |thread, cx| {
             thread.authorize_tool_call(
-                acp::ToolCallId::new("tool"),
+                acp_v2::ToolCallId::new("tool"),
                 acp_thread::SelectedPermissionOutcome::new(
-                    acp::PermissionOptionId::new("2"),
-                    acp::PermissionOptionKind::RejectOnce,
+                    acp_v2::PermissionOptionId::new("2"),
+                    acp_v2::PermissionOptionKind::RejectOnce,
                 ),
                 cx,
             );
@@ -1831,7 +1862,7 @@ mod tests {
             connection
                 .sessions
                 .borrow()
-                .contains_key(&acp::SessionId::new("session"))
+                .contains_key(&acp_v2::SessionId::new("session"))
         );
     }
 
@@ -1841,7 +1872,7 @@ mod tests {
         let project = thread.read_with(cx, |thread, _| thread.project().clone());
         let pending = cx.update(|cx| {
             connection.clone().fork_session(
-                acp::SessionId::new("session"),
+                acp_v2::SessionId::new("session"),
                 project,
                 PathList::default(),
                 None,
@@ -1868,7 +1899,7 @@ mod tests {
         peer.send(json!({"id":archive["id"],"result":{}})).await;
         cx.run_until_parked();
         assert!(connection.fork_preferences.borrow().is_empty());
-        assert!(!connection.sessions.borrow()[&acp::SessionId::new("session")].forking);
+        assert!(!connection.sessions.borrow()[&acp_v2::SessionId::new("session")].forking);
     }
 
     #[gpui::test]
@@ -1923,12 +1954,12 @@ impl AgentConnection for NativeCodexConnection {
     }
     fn fork_session(
         self: Rc<Self>,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         project: Entity<Project>,
         work_dirs: PathList,
         point: Option<acp_thread::SessionForkPoint>,
         cx: &mut App,
-    ) -> Task<Result<acp::SessionId>> {
+    ) -> Task<Result<acp_v2::SessionId>> {
         let cleanup = self.clone();
         let operation = cx.spawn(async move |cx| {
             ensure!(
@@ -1993,7 +2024,7 @@ impl AgentConnection for NativeCodexConnection {
     }
     fn load_session(
         self: Rc<Self>,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         project: Entity<Project>,
         dirs: PathList,
         title: Option<SharedString>,
@@ -2007,7 +2038,7 @@ impl AgentConnection for NativeCodexConnection {
     }
     fn history_page(
         &self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         cursor: Option<String>,
         cx: &mut App,
     ) -> Task<Result<HistoryPage>> {
@@ -2036,6 +2067,7 @@ impl AgentConnection for NativeCodexConnection {
         params: acp_v2::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
+        let session_id = params.session_id.clone();
         let params = match acp_thread::content::prompt_to_v1(params) {
             Ok(params) => params,
             Err(error) => return Task::ready(Err(error)),
@@ -2046,7 +2078,7 @@ impl AgentConnection for NativeCodexConnection {
         };
         let (completion, receiver) = oneshot::channel();
         let mut sessions = self.sessions.borrow_mut();
-        let Some(session) = sessions.get_mut(&params.session_id) else {
+        let Some(session) = sessions.get_mut(&session_id) else {
             return Task::ready(Err(anyhow::anyhow!("Native Codex session not open")));
         };
         if session.active.is_some() || session.forking {
@@ -2078,11 +2110,11 @@ impl AgentConnection for NativeCodexConnection {
         cx.spawn(async move |cx| {
             let preparation: Result<Value> = async {
                 if !attached {
-                    let mut preferences = runtime.restore(&params.session_id, &work_dirs, cx).await?;
+                    let mut preferences = runtime.restore(&session_id, &work_dirs, cx).await?;
                     if let Some(inherited) = inherited { preferences = inherited; }
                     let (notice, sender) = {
                         let mut sessions = sessions.borrow_mut();
-                        let session = sessions.get_mut(&params.session_id).context("Codex session closed during connection")?;
+                        let session = sessions.get_mut(&session_id).context("Codex session closed during connection")?;
                         session.preferences = preferences;
                         session.attached = true;
                         (session.history_notice.take(), session.settings_sender.clone())
@@ -2093,16 +2125,16 @@ impl AgentConnection for NativeCodexConnection {
                     }
                 }
                 let sessions = sessions.borrow();
-                let session = sessions.get(&params.session_id).context("Codex session closed before sending")?;
+                let session = sessions.get(&session_id).context("Codex session closed before sending")?;
                 ensure!(!session.active.as_ref().is_none_or(|active| active.cancel_requested), "Codex send cancelled before starting a turn; nothing was sent");
-                Ok(session.preferences.turn_params(&params.session_id, input))
+                Ok(session.preferences.turn_params(&session_id, input))
             }.await;
             let turn_params = match preparation {
                 Ok(params) => params,
                 Err(error) => {
                     let (notice, cancelled) = {
                         let mut sessions = sessions.borrow_mut();
-                        sessions.get_mut(&params.session_id).map(|session| {
+                        sessions.get_mut(&session_id).map(|session| {
                             let cancelled = session.active.take().is_some_and(|active| active.cancel_requested);
                             (session.history_notice.take(), cancelled)
                         }).unwrap_or_default()
@@ -2116,7 +2148,7 @@ impl AgentConnection for NativeCodexConnection {
                         };
                         thread.push_notice(acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, title).description(message), cx);
                         let id = thread.notices().last().map(|(id, _)| *id);
-                        if let Some(session) = sessions.borrow_mut().get_mut(&params.session_id) { session.history_notice = id; }
+                        if let Some(session) = sessions.borrow_mut().get_mut(&session_id) { session.history_notice = id; }
                     }).log_err();
                     return Err(error);
                 }
@@ -2128,7 +2160,7 @@ impl AgentConnection for NativeCodexConnection {
             });
             if let Some(active) = sessions
                 .borrow_mut()
-                .get_mut(&params.session_id)
+                .get_mut(&session_id)
                 .and_then(|session| session.active.as_mut())
             {
                 active.optimistic_message = optimistic_message;
@@ -2136,7 +2168,7 @@ impl AgentConnection for NativeCodexConnection {
             let response = match rpc.request("turn/start", turn_params).await {
                 Ok(response) => response,
                 Err(error) => {
-                    if let Some(session) = sessions.borrow_mut().get_mut(&params.session_id) {
+                    if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
                         session.active.take();
                         session.uncertain = true;
                     }
@@ -2148,7 +2180,7 @@ impl AgentConnection for NativeCodexConnection {
             let cancel = {
                 let mut sessions = sessions.borrow_mut();
                 if let Some(active) = sessions
-                    .get_mut(&params.session_id)
+                    .get_mut(&session_id)
                     .and_then(|session| session.active.as_mut())
                 {
                     let interrupt = active.id.is_none() && active.cancel_requested;
@@ -2161,7 +2193,7 @@ impl AgentConnection for NativeCodexConnection {
             if cancel {
                 rpc.request(
                     "turn/interrupt",
-                    json!({"threadId":params.session_id,"turnId":turn_id}),
+                    json!({"threadId":session_id,"turnId":turn_id}),
                 )
                 .await?;
             }
@@ -2170,7 +2202,7 @@ impl AgentConnection for NativeCodexConnection {
                 Box::pin(recovery::watch(
                     rpc,
                     sessions,
-                    params.session_id,
+                    session_id,
                     turn_id,
                     cx,
                 )),
@@ -2184,7 +2216,7 @@ impl AgentConnection for NativeCodexConnection {
             }
         })
     }
-    fn cancel(&self, id: &acp::SessionId, cx: &mut App) {
+    fn cancel(&self, id: &acp_v2::SessionId, cx: &mut App) {
         let turn = self
             .sessions
             .borrow_mut()
@@ -2208,7 +2240,7 @@ impl AgentConnection for NativeCodexConnection {
     fn supports_close_session(&self) -> bool {
         true
     }
-    fn close_session(self: Rc<Self>, id: &acp::SessionId, cx: &mut App) -> Task<Result<()>> {
+    fn close_session(self: Rc<Self>, id: &acp_v2::SessionId, cx: &mut App) -> Task<Result<()>> {
         let id = id.clone();
         cx.spawn(async move |_| {
             ensure!(
@@ -2233,7 +2265,7 @@ impl AgentConnection for NativeCodexConnection {
             Ok(())
         })
     }
-    fn set_title(&self, id: &acp::SessionId, _: &App) -> Option<Rc<dyn AgentSessionSetTitle>> {
+    fn set_title(&self, id: &acp_v2::SessionId, _: &App) -> Option<Rc<dyn AgentSessionSetTitle>> {
         Some(Rc::new(Title {
             rpc: self.rpc.clone(),
             id: id.clone(),
@@ -2241,7 +2273,7 @@ impl AgentConnection for NativeCodexConnection {
     }
     fn session_config_options(
         &self,
-        id: &acp::SessionId,
+        id: &acp_v2::SessionId,
         cx: &App,
     ) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
         let sessions = self.sessions.borrow();
@@ -2269,8 +2301,8 @@ impl AgentConnection for NativeCodexConnection {
 
 struct ConfigOptions {
     runtime: SessionRuntime,
-    sessions: std::rc::Weak<RefCell<HashMap<acp::SessionId, Session>>>,
-    id: acp::SessionId,
+    sessions: std::rc::Weak<RefCell<HashMap<acp_v2::SessionId, Session>>>,
+    id: acp_v2::SessionId,
     quota: Rc<settings::Quota>,
     sender: Rc<RefCell<watch::Sender<()>>>,
     receiver: watch::Receiver<()>,
@@ -2410,7 +2442,7 @@ impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
 
 struct Title {
     rpc: Rpc,
-    id: acp::SessionId,
+    id: acp_v2::SessionId,
 }
 impl AgentSessionSetTitle for Title {
     fn run(&self, title: SharedString, cx: &mut App) -> Task<Result<()>> {
@@ -2453,7 +2485,7 @@ impl AgentSessionList for SessionList {
     fn supports_delete(&self) -> bool {
         true
     }
-    fn delete_session(&self, id: &acp::SessionId, cx: &mut App) -> Task<Result<()>> {
+    fn delete_session(&self, id: &acp_v2::SessionId, cx: &mut App) -> Task<Result<()>> {
         let rpc = self.0.clone();
         let id = id.clone();
         cx.spawn(async move |_| {

@@ -1,5 +1,5 @@
 use super::{Session, events, transport::Rpc};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use anyhow::{Result, bail};
 use gpui::AsyncApp;
 use serde_json::{Value, json};
@@ -58,8 +58,8 @@ impl Progress {
 }
 
 fn snapshot(
-    sessions: &RefCell<HashMap<acp::SessionId, Session>>,
-    id: &acp::SessionId,
+    sessions: &RefCell<HashMap<acp_v2::SessionId, Session>>,
+    id: &acp_v2::SessionId,
     turn_id: &str,
 ) -> Option<(u64, bool, bool)> {
     let sessions = sessions.borrow();
@@ -86,8 +86,8 @@ fn waiting_on_backend_user(status: &Value) -> bool {
 }
 
 fn release(
-    sessions: &RefCell<HashMap<acp::SessionId, Session>>,
-    id: &acp::SessionId,
+    sessions: &RefCell<HashMap<acp_v2::SessionId, Session>>,
+    id: &acp_v2::SessionId,
     turn_id: &str,
     uncertain: bool,
 ) {
@@ -105,8 +105,8 @@ fn release(
 
 pub(super) async fn watch(
     rpc: Rpc,
-    sessions: Rc<RefCell<HashMap<acp::SessionId, Session>>>,
-    id: acp::SessionId,
+    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, Session>>>,
+    id: acp_v2::SessionId,
     turn_id: String,
     cx: &mut AsyncApp,
 ) -> Result<acp::PromptResponse> {
