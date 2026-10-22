@@ -4193,6 +4193,26 @@ impl AgentPanel {
         false
     }
 
+    pub fn reconnect_thread(
+        &self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let conversation = self
+            .active_conversation_view()
+            .into_iter()
+            .chain(self.retained_threads.values())
+            .chain(self.draft_thread.iter())
+            .find(|view| view.read(cx).thread_id == thread_id)
+            .cloned();
+        if let Some(conversation) = conversation {
+            conversation.update(cx, |view, cx| view.request_reconnect(window, cx));
+            return true;
+        }
+        false
+    }
+
     fn update_thread_work_dirs(&self, cx: &mut Context<Self>) {
         let new_work_dirs = self.project.read(cx).default_path_list(cx);
         let new_worktree_paths = self.project.read(cx).worktree_paths(cx);
@@ -6134,7 +6154,7 @@ impl AgentPanel {
                                 let conversation_view = conversation_view.clone();
                                 move |window, cx| {
                                     conversation_view.update(cx, |conversation_view, cx| {
-                                        conversation_view.retry_connection(window, cx);
+                                        conversation_view.request_reconnect(window, cx);
                                     });
                                 }
                             });

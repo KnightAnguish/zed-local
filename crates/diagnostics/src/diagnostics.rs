@@ -3,6 +3,9 @@ mod toolbar_controls;
 
 mod buffer_diagnostics;
 mod diagnostic_renderer;
+mod spelling_review;
+mod proofreader;
+pub use spelling_review::ReviewSpelling;
 
 #[cfg(test)]
 mod diagnostics_tests;
@@ -70,6 +73,7 @@ pub fn init(cx: &mut App) {
     editor::set_diagnostic_renderer(diagnostic_renderer::DiagnosticRenderer {}, cx);
     cx.observe_new(ProjectDiagnosticsEditor::register).detach();
     cx.observe_new(BufferDiagnosticsEditor::register).detach();
+    cx.observe_new(spelling_review::SpellingReview::register).detach();
 }
 
 pub(crate) struct ProjectDiagnosticsEditor {

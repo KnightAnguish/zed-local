@@ -779,6 +779,12 @@ pub enum AcpServerViewEvent {
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
 
+#[derive(Default)]
+struct ReconnectInput {
+    draft: Vec<acp_v2::ContentBlock>,
+    queue: Vec<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>, bool)>,
+}
+
 pub struct ConversationView {
     agent: Rc<dyn AgentServer>,
     connection_store: Entity<AgentConnectionStore>,
@@ -791,6 +797,7 @@ pub struct ConversationView {
     pub(crate) root_session_id: Option<acp_v1::SessionId>,
     server_state: ServerState,
     pending_selections: Vec<AgentContextSelection>,
+    reconnect_input: Option<ReconnectInput>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
@@ -1078,6 +1085,7 @@ impl ConversationView {
                 cx,
             ),
             pending_selections: Vec::new(),
+            reconnect_input: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
@@ -1167,10 +1175,91 @@ impl ConversationView {
     /// Drops the cached connection for this agent (so the next request spawns a
     /// fresh server process) and rebuilds the thread state from scratch.
     pub(crate) fn retry_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.root_thread_view() {
+            let view = view.read(cx);
+            self.reconnect_input = Some(ReconnectInput {
+                draft: view
+                    .message_editor
+                    .read(cx)
+                    .draft_content_blocks_snapshot(cx),
+                queue: view
+                    .message_queue
+                    .iter()
+                    .map(|entry| {
+                        let content = if entry
+                            .content
+                            .iter()
+                            .all(acp_thread::content::can_convert_to_v1)
+                        {
+                            entry.editor.read(cx).draft_content_blocks_snapshot(cx)
+                        } else {
+                            entry.content.clone()
+                        };
+                        (content, entry.tracked_buffers.clone(), entry.steer)
+                    })
+                    .collect(),
+            });
+        }
+        if let Some(connected) = self.as_connected() {
+            for view in connected.threads.values() {
+                view.update(cx, |view, cx| {
+                    view.message_queue.pause();
+                    view.cancel_generation(cx);
+                });
+            }
+        }
         self.connection_store.update(cx, |store, cx| {
             store.restart_connection(self.connection_key.clone(), self.agent.clone(), cx);
         });
         self.reset(window, cx);
+    }
+
+    pub(crate) fn request_reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_loading() {
+            return;
+        }
+        if self
+            .root_thread(cx)
+            .is_some_and(|thread| !thread.read(cx).connection().supports_load_session())
+        {
+            drop(window.prompt(
+                gpui::PromptLevel::Warning,
+                "Агент не поддерживает восстановление чата",
+                Some("Переподключение создало бы другую сессию. Этот чат не изменён."),
+                &["OK"],
+                cx,
+            ));
+            return;
+        }
+        let working = self.as_connected().is_some_and(|connected| {
+            connected
+                .threads
+                .values()
+                .any(|view| view.read(cx).thread.read(cx).status() == ThreadStatus::Generating)
+        });
+        if !working {
+            self.retry_connection(window, cx);
+            return;
+        }
+        let session = self.root_session_id.clone();
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Переподключить агента?",
+            Some("Текущая работа этого чата будет остановлена. История и набранный текст сохранятся; очередь останется на паузе. Отправленные сообщения повторяться не будут. Другие чаты не перезапускаются."),
+            &["Отмена", "Переподключить"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await? == 1 {
+                this.update_in(cx, |this, window, cx| {
+                    if this.root_session_id == session && !this.is_loading() {
+                        this.retry_connection(window, cx);
+                    }
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1386,6 +1475,22 @@ impl ConversationView {
                             window,
                             cx,
                         );
+
+                        if let Some(input) = this.reconnect_input.take() {
+                            current.update(cx, |view, cx| {
+                                view.message_editor.update(cx, |editor, cx| {
+                                    editor.set_source_message(input.draft, window, cx);
+                                });
+                                for (content, buffers, steer) in input.queue {
+                                    view.add_to_queue(content, buffers, window, cx);
+                                    if steer && let Some(id) = view.message_queue.last_id() {
+                                        view.message_queue.toggle_steer(id);
+                                    }
+                                }
+                                view.message_queue.pause();
+                                view.sync_queue_flag_to_native_thread(cx);
+                            });
+                        }
 
                         if this.has_pending_selections() {
                             current.update(cx, |thread, cx| {
@@ -6380,6 +6485,188 @@ pub(crate) mod tests {
                 "the live AcpThread should hold the resumed session id"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_preserves_draft_and_pauses_queue_without_sending(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let original = conversation.read_with(cx, |view, cx| {
+            (
+                view.thread_id,
+                view.root_thread(cx).unwrap().read(cx).session_id().clone(),
+            )
+        });
+        message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Unsent draft", window, cx);
+        });
+        active_thread(&conversation, cx).update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["Queued follow-up".into()], vec![], window, cx);
+            let id = view.message_queue.last_id().unwrap();
+            view.message_queue.toggle_steer(id);
+        });
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        cx.run_until_parked();
+        conversation.read_with(cx, |view, cx| {
+            assert_eq!(view.thread_id, original.0);
+            assert_eq!(
+                view.root_thread(cx).unwrap().read(cx).session_id(),
+                &original.1
+            );
+            assert!(view.reconnect_input.is_none());
+        });
+        assert_eq!(
+            message_editor(&conversation, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "Unsent draft"
+        );
+        active_thread(&conversation, cx).read_with(cx, |view, cx| {
+            assert!(view.thread.read(cx).entries().is_empty());
+            assert_eq!(view.message_queue.len(), 1);
+            assert_eq!(
+                view.message_queue.first().unwrap().content,
+                vec![acp_v2::ContentBlock::from("Queued follow-up")]
+            );
+            assert!(view.message_queue.first().unwrap().steer);
+            assert!(view.message_queue.auto_send_candidate(false).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_keeps_input_across_failed_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (server, fail) =
+            FlakyAgentServer::new(StubAgentConnection::new().with_supports_load_session(true));
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (conversation, cx) = setup_conversation_view(server, cx).await;
+        message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Keep through outage", window, cx);
+        });
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        cx.run_until_parked();
+        conversation.read_with(cx, |view, _| {
+            assert!(matches!(view.server_state, ServerState::LoadError { .. }));
+            assert!(view.reconnect_input.is_some());
+        });
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor(&conversation, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "Keep through outage"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_refuses_to_replace_nonresumable_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let original =
+            conversation.read_with(cx, |view, cx| view.root_thread(cx).unwrap().entity_id());
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert_eq!(
+            conversation.read_with(cx, |view, cx| view.root_thread(cx).unwrap().entity_id()),
+            original
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_requires_confirmation_for_running_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let _response = connection.defer_next_prompt_response();
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Start", window, cx)
+        });
+        active_thread(&conversation, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let original = conversation.read_with(cx, |view, cx| view.root_thread(cx).unwrap());
+        assert_eq!(
+            original.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Отмена");
+        cx.run_until_parked();
+        assert_eq!(
+            conversation.read_with(cx, |view, cx| view.root_thread(cx).unwrap().entity_id()),
+            original.entity_id()
+        );
+        assert_eq!(
+            original.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        cx.simulate_prompt_answer("Переподключить");
+        cx.run_until_parked();
+        assert_ne!(
+            conversation.read_with(cx, |view, cx| view.root_thread(cx).unwrap().entity_id()),
+            original.entity_id()
+        );
+        assert_eq!(
+            original.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_does_not_reset_neighbor_on_shared_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let neighbor = conversation.update_in(cx, |view, window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    view.agent.clone(),
+                    view.connection_store.clone(),
+                    view.connection_key.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    view.workspace.clone(),
+                    view.project.clone(),
+                    view.thread_store.clone(),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let original = neighbor.read_with(cx, |view, cx| view.root_thread(cx).unwrap().entity_id());
+        let connection = neighbor.read_with(cx, |view, _| {
+            view.as_connected().unwrap().connection.clone()
+        });
+        message_editor(&neighbor, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Neighbor draft", window, cx)
+        });
+        conversation.update_in(cx, |view, window, cx| view.request_reconnect(window, cx));
+        cx.run_until_parked();
+        neighbor.read_with(cx, |view, cx| {
+            assert_eq!(view.root_thread(cx).unwrap().entity_id(), original);
+            assert!(Rc::ptr_eq(
+                &connection,
+                &view.as_connected().unwrap().connection
+            ));
+        });
+        assert_eq!(
+            message_editor(&neighbor, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "Neighbor draft"
+        );
     }
 
     #[gpui::test]

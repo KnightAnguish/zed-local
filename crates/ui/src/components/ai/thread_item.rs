@@ -46,6 +46,7 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
+    inline_timestamp: bool,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -81,6 +82,7 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
+            inline_timestamp: false,
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -104,6 +106,11 @@ impl ThreadItem {
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
         self.timestamp = timestamp.into();
+        self
+    }
+
+    pub fn inline_timestamp(mut self, inline: bool) -> Self {
+        self.inline_timestamp = inline;
         self
     }
 
@@ -349,13 +356,15 @@ impl RenderOnce for ThreadItem {
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
+        let inline_timestamp = self.inline_timestamp && !self.timestamp.is_empty();
+        let has_title_slot = self.title_slot.is_some();
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
         } else if self.title_generating {
             Label::new(title)
                 .color(Color::Muted)
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || inline_timestamp, |label| label.truncate())
                 .with_animation(
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
@@ -367,12 +376,12 @@ impl RenderOnce for ThreadItem {
         } else if highlight_positions.is_empty() {
             Label::new(title)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || inline_timestamp, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!opaque_window || inline_timestamp, |label| label.truncate())
                 .into_any_element()
         };
 
@@ -397,8 +406,38 @@ impl RenderOnce for ThreadItem {
 
         let has_project_name = self.project_name.is_some();
         let has_project_paths = project_paths.is_some();
-        let has_timestamp = !self.timestamp.is_empty();
+        let has_timestamp = !self.timestamp.is_empty() && !inline_timestamp;
         let timestamp = self.timestamp;
+        let title_label = if inline_timestamp {
+            h_flex()
+                .min_w_0()
+                .flex_1()
+                .min_h_6()
+                .flex_wrap()
+                .gap_x_1p5()
+                .child(
+                    div()
+                        .debug_selector(|| "THREAD_INLINE_TITLE".to_owned())
+                        .min_w_0()
+                        .max_w_full()
+                        .flex_shrink_0()
+                        .when(has_title_slot, |title| title.w_full())
+                        .child(title_label),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "THREAD_INLINE_TIME".to_owned())
+                        .flex_none()
+                        .child(
+                            Label::new(timestamp.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            title_label
+        };
 
         let show_tooltip = matches!(
             self.status,
@@ -443,7 +482,8 @@ impl RenderOnce for ThreadItem {
                 h_flex()
                     .min_w_0()
                     .w_full()
-                    .h_6()
+                    .when(inline_timestamp, |row| row.min_h_6())
+                    .when(!inline_timestamp, |row| row.h_6())
                     .gap_2()
                     .justify_between()
                     .child(
@@ -452,18 +492,20 @@ impl RenderOnce for ThreadItem {
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
-                            .child(icon)
+                            .when(inline_timestamp, |content| content.items_start())
+                            .child(h_flex().h_6().flex_none().child(icon))
                             .child(title_label),
                     )
-                    .when(self.is_truncated && opaque_window, |this| {
-                        this.child(gradient_overlay)
-                    })
+                    .when(
+                        self.is_truncated && opaque_window && !inline_timestamp,
+                        |this| this.child(gradient_overlay),
+                    )
                     .when(self.hovered, |this| {
                         this.when_some(self.action_slot, |this, slot| {
                             this.child(
                                 h_flex()
                                     .relative()
-                                    .when(opaque_window, |this| {
+                                    .when(opaque_window && !inline_timestamp, |this| {
                                         this.child(
                                             GradientFade::new(base_bg, hover_bg, active_bg)
                                                 .width(px(120.0))
@@ -990,6 +1032,112 @@ impl Component for ThreadItem {
 mod tests {
     use super::*;
     use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
+
+    struct InlineTimestampTestView {
+        width: f32,
+        title: SharedString,
+        hovered: bool,
+        rename: bool,
+    }
+
+    impl Render for InlineTimestampTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).child(
+                ThreadItem::new("layout-thread", self.title.clone())
+                    .timestamp("22m")
+                    .inline_timestamp(true)
+                    .hovered(self.hovered)
+                    .when(self.hovered, |item| {
+                        item.action_slot(IconButton::new("archive", IconName::Archive))
+                    })
+                    .when(self.rename, |item| {
+                        item.title_slot(div().h_6().w_full().child("Rename"))
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn inline_timestamp_wraps_only_when_title_and_time_do_not_fit(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (view, cx) = cx.add_window_view(|_, _| InlineTimestampTestView {
+            width: 320.,
+            title: "Плагинатор".into(),
+            hovered: false,
+            rename: false,
+        });
+        let bounds = |cx: &mut VisualTestContext| {
+            (
+                cx.debug_bounds("THREAD_INLINE_TITLE")
+                    .expect("title bounds"),
+                cx.debug_bounds("THREAD_INLINE_TIME")
+                    .expect("timestamp bounds"),
+            )
+        };
+        for (width, wraps) in [(320., false), (100., true), (260., false), (110., true)] {
+            view.update(cx, |view, cx| {
+                view.width = width;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let (title, time) = bounds(cx);
+            assert_eq!(
+                time.origin.y >= title.bottom(),
+                wraps,
+                "width={width}: title={title:?}, time={time:?}"
+            );
+            if !wraps {
+                assert!(time.left() >= title.right());
+            }
+            assert!(title.right() <= px(width));
+            assert!(time.right() <= px(width));
+        }
+        view.update(cx, |view, cx| {
+            view.width = 260.;
+            view.title = "Очень длинное название чата с описанием проекта и текущей задачи".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (title, time) = bounds(cx);
+        assert!(time.origin.y >= title.bottom());
+        assert!(title.right() <= px(260.));
+        assert!(time.right() <= px(260.));
+        view.update(cx, |view, cx| {
+            view.width = 800.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (title, time) = bounds(cx);
+        assert!(
+            time.origin.y < title.bottom(),
+            "resizing wide restores one row"
+        );
+        view.update(cx, |view, cx| {
+            view.hovered = true;
+            view.title = "Визуалка".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (title, time) = bounds(cx);
+        assert!(
+            time.origin.y < title.bottom(),
+            "hover actions leave a fitting timestamp inline"
+        );
+        view.update(cx, |view, cx| {
+            view.rename = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (title, time) = bounds(cx);
+        assert!(
+            time.origin.y >= title.bottom(),
+            "rename editor keeps the full title width"
+        );
+    }
 
     #[gpui::test]
     fn test_thread_action_padding_preserves_row_background(cx: &mut TestAppContext) {

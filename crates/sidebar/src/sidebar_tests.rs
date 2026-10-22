@@ -4422,6 +4422,133 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
 }
 
 #[gpui::test]
+async fn test_reconnect_retained_thread_keeps_neighbor_and_metadata(cx: &mut TestAppContext) {
+    use acp_thread::AgentConnection;
+    use std::{any::Any, rc::Rc};
+
+    #[derive(Clone)]
+    struct RestoringConnection(StubAgentConnection);
+    impl AgentConnection for RestoringConnection {
+        fn agent_id(&self) -> AgentId {
+            self.0.agent_id()
+        }
+        fn telemetry_id(&self) -> SharedString {
+            "reconnect-history-test".into()
+        }
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
+            &[]
+        }
+        fn authenticate(&self, _: acp_v2::AuthMethodId, _: &mut App) -> Task<anyhow::Result<()>> {
+            Task::ready(Ok(()))
+        }
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<project::Project>,
+            dirs: PathList,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Entity<AcpThread>>> {
+            Rc::new(self.0.clone()).new_session(project, dirs, cx)
+        }
+        fn load_session(
+            self: Rc<Self>,
+            id: acp::SessionId,
+            project: Entity<project::Project>,
+            dirs: PathList,
+            title: Option<SharedString>,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Entity<AcpThread>>> {
+            let load = Rc::new(self.0.clone()).load_session(id, project, dirs, title, cx);
+            cx.spawn(async move |cx| {
+                let thread = load.await?;
+                thread.update(cx, |thread, cx| {
+                    thread.handle_session_update(
+                        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                            "Saved user message".into(),
+                        )),
+                        cx,
+                    )
+                })?;
+                Ok(thread)
+            })
+        }
+        fn prompt(
+            &self,
+            params: acp_v2::PromptRequest,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<acp::PromptResponse>> {
+            self.0.prompt(params, cx)
+        }
+        fn cancel(&self, id: &acp::SessionId, cx: &mut App) {
+            self.0.cancel(id, cx);
+        }
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done A".into()),
+    )]);
+    open_thread_with_custom_connection(&panel, RestoringConnection(connection.clone()), cx);
+    send_message(&panel, cx);
+    let session_a = active_session_id(&panel, cx);
+    let thread_a = active_thread_id(&panel, cx);
+    save_test_thread_metadata(&session_a, &project, cx).await;
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done B".into()),
+    )]);
+    open_thread_with_custom_connection(&panel, RestoringConnection(connection), cx);
+    send_message(&panel, cx);
+    let session_b = active_session_id(&panel, cx);
+    let thread_b = active_thread_id(&panel, cx);
+    save_test_thread_metadata(&session_b, &project, cx).await;
+    let neighbor = panel.read_with(cx, |panel, cx| {
+        panel.active_agent_thread(cx).unwrap().entity_id()
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(panel.reconnect_thread(thread_a, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(active_session_id(&panel, cx), session_b);
+    assert_eq!(active_thread_id(&panel, cx), thread_b);
+    panel.read_with(cx, |panel, cx| {
+        assert_eq!(panel.active_agent_thread(cx).unwrap().entity_id(), neighbor);
+        let restored = panel
+            .retained_threads()
+            .get(&thread_a)
+            .expect("retained target");
+        assert_eq!(
+            restored
+                .read(cx)
+                .root_thread_view()
+                .unwrap()
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id(),
+            &session_a
+        );
+        let store = ThreadMetadataStore::global(cx);
+        let metadata = store.read(cx).entry(thread_a).expect("metadata retained");
+        assert!(!metadata.archived);
+        assert_eq!(metadata.session_id.as_ref(), Some(&session_a));
+    });
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(sidebar.contents.entries.iter().filter(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_a)
+        }).count(), 1);
+    });
+}
+
+#[gpui::test]
 async fn test_parallel_threads_shown_with_live_status(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

@@ -102,6 +102,20 @@ pub(super) struct Preferences {
 }
 
 impl Preferences {
+    pub(super) fn history() -> Self {
+        Self {
+            models: Rc::new(Vec::new()),
+            model: String::new(),
+            effort: None,
+            tier: None,
+            mode: None,
+        }
+    }
+
+    pub(super) fn has_model(&self) -> bool {
+        !self.model.is_empty()
+    }
+
     pub(super) fn apply_editor_defaults(&mut self, cx: &App) -> Result<()> {
         let Some(store) = cx.try_global::<::settings::SettingsStore>() else {
             return Ok(());

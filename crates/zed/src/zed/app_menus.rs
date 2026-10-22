@@ -55,6 +55,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         MenuItem::action("Git Panel", git_panel::ToggleFocus),
         MenuItem::separator(),
         MenuItem::action("Diagnostics", diagnostics::Deploy),
+        MenuItem::action("Проверка текста", diagnostics::ReviewSpelling),
         MenuItem::separator(),
     ]);
 

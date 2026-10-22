@@ -6322,6 +6322,7 @@ impl Sidebar {
             })
             .worktrees(worktrees)
             .timestamp(timestamp)
+            .inline_timestamp(true)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
@@ -6544,6 +6545,37 @@ impl Sidebar {
                             });
                         }
 
+                        if !is_zed_thread && let Some(workspace) = thread_workspace.as_ref() {
+                            menu = menu.entry("Переподключить агента", None, {
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+                                    {
+                                        panel.update(cx, |panel, cx| {
+                                            if !panel.reconnect_thread(thread_id, window, cx)
+                                                && let Some(metadata) =
+                                                    ThreadMetadataStore::global(cx)
+                                                        .read(cx)
+                                                        .entry(thread_id)
+                                                        .cloned()
+                                            {
+                                                panel.load_agent_thread(
+                                                    Agent::from(metadata.agent_id.clone()),
+                                                    thread_id,
+                                                    Some(metadata.folder_paths().clone()),
+                                                    metadata.title(),
+                                                    true,
+                                                    AgentThreadSource::Sidebar,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                        }
+
                         if can_open_as_markdown {
                             menu = menu.entry("Open Thread as Markdown", None, {
                                 let session_id = session_id.clone();
@@ -6639,6 +6671,7 @@ impl Sidebar {
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)
+            .inline_timestamp(true)
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
             .selected(is_active)

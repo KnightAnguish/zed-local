@@ -26,10 +26,11 @@ use std::{
 };
 use std::{ops::Range, sync::Arc, time::Duration};
 use std::{path::PathBuf, rc::Rc};
+use text::ToPointUtf16 as _;
 use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
-use util::TryFutureExt;
+use util::{ResultExt, TryFutureExt};
 use workspace::{OpenOptions, OpenVisible, Workspace};
 
 pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
@@ -66,7 +67,12 @@ pub fn hover_at(
             editor.hover_state.info_task = None;
         } else {
             let settings = EditorSettings::get_global(cx);
-            if !settings.hover_popover_sticky {
+            let spelling_hover = editor
+                .hover_state
+                .diagnostic_popover
+                .as_ref()
+                .is_some_and(|popover| popover.spelling.is_some());
+            if !settings.hover_popover_sticky && !spelling_hover {
                 hide_hover(editor, cx);
                 return;
             }
@@ -428,14 +434,18 @@ fn show_hover(
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor,
                     last_bounds: Rc::new(Cell::new(None)),
+                    spelling: None,
+                    _spelling_task: None,
                     _subscription: subscription,
                 })
             } else {
                 None
             };
 
-            this.update(cx, |this, _| {
+            this.update_in(cx, |this, window, cx| {
                 this.hover_state.diagnostic_popover = diagnostic_popover;
+                this.request_hover_spelling_suggestions(&buffer, buffer_position, window, cx);
+                cx.notify();
             })?;
 
             let invisible_char = if let Some(invisible) = snapshot
@@ -1357,8 +1367,191 @@ pub struct DiagnosticPopover {
     pub keyboard_grace: Rc<RefCell<bool>>,
     pub anchor: Anchor,
     pub last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    spelling: Option<HoverSpellingSuggestions>,
+    _spelling_task: Option<Task<()>>,
     _subscription: Subscription,
     pub scroll_handle: ScrollHandle,
+}
+
+struct HoverSpellingSuggestions {
+    buffer: Entity<language::Buffer>,
+    version: clock::Global,
+    original: String,
+    replacements: Vec<String>,
+    loading: bool,
+}
+
+fn spelling_replacement(
+    action: &project::CodeAction,
+    uri: &lsp::Uri,
+    range: lsp::Range,
+) -> Option<String> {
+    let project::LspAction::Action(action) = &action.lsp_action else {
+        return None;
+    };
+    if action.command.is_some()
+        || action.disabled.is_some()
+        || action.kind.as_ref() != Some(&lsp::CodeActionKind::QUICKFIX)
+    {
+        return None;
+    }
+    let edit = action.edit.as_ref()?;
+    if edit.document_changes.is_some() {
+        return None;
+    }
+    let changes = edit.changes.as_ref()?;
+    if changes.len() != 1 {
+        return None;
+    }
+    let edits = changes.get(uri)?;
+    let [edit] = edits.as_slice() else {
+        return None;
+    };
+    if edit.range != range
+        || edit.new_text.is_empty()
+        || edit.new_text.chars().count() > 64
+        || edit.new_text.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(edit.new_text.clone())
+}
+
+impl Editor {
+    fn request_hover_spelling_suggestions(
+        &mut self,
+        buffer: &Entity<language::Buffer>,
+        position: text::Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(popover) = self.hover_state.diagnostic_popover.as_ref() else {
+            return;
+        };
+        if self.read_only(cx)
+            || !popover
+                .local_diagnostic
+                .diagnostic
+                .source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case("cspell"))
+        {
+            return;
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let range = popover.local_diagnostic.range.clone();
+        let Some((start, _)) = snapshot.anchor_to_buffer_anchor(range.start) else {
+            return;
+        };
+        let Some((end, _)) = snapshot.anchor_to_buffer_anchor(range.end) else {
+            return;
+        };
+        if start.buffer_id != buffer.read(cx).remote_id() || start.buffer_id != end.buffer_id {
+            return;
+        }
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let Some(file) = buffer_snapshot.file().and_then(|file| file.as_local()) else {
+            return;
+        };
+        let Ok(uri) = lsp::Uri::from_file_path(file.abs_path(cx)) else {
+            return;
+        };
+        let lsp_range = lsp::Range::new(
+            language::point_to_lsp(start.to_point_utf16(&buffer_snapshot)),
+            language::point_to_lsp(end.to_point_utf16(&buffer_snapshot)),
+        );
+        let original: String = snapshot.text_for_range(range.clone()).collect();
+        if original.is_empty() || original.chars().count() > 64 {
+            return;
+        }
+        let version = buffer.read(cx).version();
+        let hover_anchor = popover.anchor;
+        let requests = self
+            .code_action_providers
+            .iter()
+            .map(|provider| provider.code_actions(buffer, position..position, window, cx))
+            .collect::<Vec<_>>();
+        let buffer = buffer.clone();
+        if let Some(popover) = self.hover_state.diagnostic_popover.as_mut() {
+            popover.spelling = Some(HoverSpellingSuggestions {
+                buffer: buffer.clone(),
+                version: version.clone(),
+                original,
+                replacements: Vec::new(),
+                loading: true,
+            });
+        }
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let mut replacements = Vec::new();
+            for response in futures::future::join_all(requests).await {
+                if let Some(actions) = response.log_err() {
+                    for action in actions {
+                        if let Some(replacement) = spelling_replacement(&action, &uri, lsp_range)
+                            && !replacements.contains(&replacement)
+                            && replacements.len() < 8
+                        {
+                            replacements.push(replacement);
+                        }
+                    }
+                }
+            }
+            this.update(cx, |editor, cx| {
+                if buffer.read(cx).version() != version {
+                    return;
+                }
+                if let Some(popover) = editor.hover_state.diagnostic_popover.as_mut()
+                    && popover.anchor == hover_anchor
+                    && let Some(spelling) = popover.spelling.as_mut()
+                {
+                    spelling.replacements = replacements;
+                    spelling.loading = false;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        });
+        if let Some(popover) = self.hover_state.diagnostic_popover.as_mut() {
+            popover._spelling_task = Some(task);
+        }
+    }
+
+    fn apply_hover_spelling_suggestion(
+        &mut self,
+        replacement: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.read_only(cx) {
+            return false;
+        }
+        let Some(popover) = self.hover_state.diagnostic_popover.as_ref() else {
+            return false;
+        };
+        let Some(spelling) = popover.spelling.as_ref() else {
+            return false;
+        };
+        let range = popover.local_diagnostic.range.clone();
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let current: String = snapshot.text_for_range(range.clone()).collect();
+        // Suggestions describe one buffer version, not whichever text is now under the mouse.
+        if spelling.buffer.read(cx).version() != spelling.version
+            || current != spelling.original
+            || !spelling
+                .replacements
+                .iter()
+                .any(|candidate| candidate == replacement)
+        {
+            hide_hover(self, cx);
+            return false;
+        }
+        let replacement = replacement.to_owned();
+        hide_hover(self, cx);
+        self.transact(window, cx, |editor, _, cx| {
+            editor.edit([(range, replacement)], cx)
+        });
+        cx.notify();
+        true
+    }
 }
 
 impl DiagnosticPopover {
@@ -1450,7 +1643,37 @@ impl DiagnosticPopover {
                                         }
                                     },
                                 ),
-                            ),
+                            )
+                            .when_some(self.spelling.as_ref(), |container, spelling| {
+                                container.child(
+                                    v_flex()
+                                        .gap_1()
+                                        .mt_1()
+                                        .children(spelling.replacements.iter().enumerate().map(
+                                            |(index, replacement)| {
+                                                let replacement = replacement.clone();
+                                                Button::new(
+                                                    ("spelling-suggestion", index),
+                                                    replacement.clone(),
+                                                )
+                                                .style(ButtonStyle::Subtle)
+                                                .full_width()
+                                                .on_click(cx.listener(
+                                                    move |editor, _, window, cx| {
+                                                        editor.apply_hover_spelling_suggestion(
+                                                            &replacement,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                            },
+                                        ))
+                                        .when(spelling.loading, |list| {
+                                            list.child(Label::new("Подбираю исправления…"))
+                                        }),
+                                )
+                            }),
                     )
                     .child(div().absolute().top_1().right_1().child({
                         let message = self
@@ -1496,6 +1719,266 @@ mod tests {
 
     fn get_hover_popover_delay(cx: &gpui::TestAppContext) -> u64 {
         cx.read(|cx: &App| -> u64 { EditorSettings::get_global(cx).hover_popover_delay.0 })
+    }
+
+    fn spelling_test_action(uri: lsp::Uri, range: lsp::Range) -> project::CodeAction {
+        project::CodeAction {
+            server_id: language::LanguageServerId(1),
+            range: text::Anchor::min_max_range_for_buffer(language::BufferId::new(1).unwrap()),
+            lsp_action: project::LspAction::Action(Box::new(lsp::CodeAction {
+                title: "ошибка".into(),
+                kind: Some(lsp::CodeActionKind::QUICKFIX),
+                edit: Some(lsp::WorkspaceEdit::new(
+                    [(uri, vec![lsp::TextEdit::new(range, "ошибка".into())])]
+                        .into_iter()
+                        .collect(),
+                )),
+                ..Default::default()
+            })),
+            resolved: true,
+        }
+    }
+
+    #[test]
+    fn test_spelling_replacement_accepts_only_one_exact_word_edit() {
+        // URI parsing avoids depending on the host's drive letter in this pure test.
+        let uri: lsp::Uri = "file:///spelling.md".parse().unwrap();
+        let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 7));
+        let action = spelling_test_action(uri.clone(), range);
+        assert_eq!(
+            spelling_replacement(&action, &uri, range).as_deref(),
+            Some("ошибка")
+        );
+        let other_uri: lsp::Uri = "file:///other.md".parse().unwrap();
+        assert!(spelling_replacement(&action, &other_uri, range).is_none());
+        assert!(spelling_replacement(&action, &uri, lsp::Range::default()).is_none());
+        for replacement in ["", "два слова", "строка\n", "\t", &"а".repeat(65)] {
+            let mut action = action.clone();
+            if let project::LspAction::Action(raw) = &mut action.lsp_action {
+                raw.edit
+                    .as_mut()
+                    .unwrap()
+                    .changes
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&uri)
+                    .unwrap()[0]
+                    .new_text = replacement.into();
+            }
+            assert!(spelling_replacement(&action, &uri, range).is_none());
+        }
+    }
+
+    #[test]
+    fn test_spelling_replacement_rejects_commands_and_wider_workspace_edits() {
+        let uri: lsp::Uri = "file:///spelling.md".parse().unwrap();
+        let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 7));
+        for variant in 0..5 {
+            let mut action = spelling_test_action(uri.clone(), range);
+            if let project::LspAction::Action(raw) = &mut action.lsp_action {
+                match variant {
+                    0 => {
+                        raw.command = Some(lsp::Command {
+                            command: "AddToUserWordsConfig".into(),
+                            ..Default::default()
+                        })
+                    }
+                    1 => {
+                        raw.disabled = Some(lsp::CodeActionDisabled {
+                            reason: "disabled".into(),
+                        })
+                    }
+                    2 => raw.kind = Some(lsp::CodeActionKind::REFACTOR),
+                    3 => {
+                        raw.edit.as_mut().unwrap().document_changes =
+                            Some(lsp::DocumentChanges::Edits(Vec::new()))
+                    }
+                    _ => raw
+                        .edit
+                        .as_mut()
+                        .unwrap()
+                        .changes
+                        .as_mut()
+                        .unwrap()
+                        .get_mut(&uri)
+                        .unwrap()
+                        .push(lsp::TextEdit::new(range, "ещё".into())),
+                }
+            }
+            assert!(spelling_replacement(&action, &uri, range).is_none());
+        }
+    }
+
+    struct SpellingTestRenderer;
+
+    impl crate::DiagnosticRenderer for SpellingTestRenderer {
+        fn render_group(
+            &self,
+            _: Vec<language::DiagnosticEntryRef<'_, crate::Point>>,
+            _: language::BufferId,
+            _: EditorSnapshot,
+            _: gpui::WeakEntity<Editor>,
+            _: Option<Arc<LanguageRegistry>>,
+            _: &mut App,
+        ) -> Vec<crate::BlockProperties<Anchor>> {
+            Vec::new()
+        }
+
+        fn render_hover(
+            &self,
+            _: Vec<language::DiagnosticEntryRef<'_, crate::Point>>,
+            _: Range<crate::Point>,
+            _: language::BufferId,
+            _: Option<Arc<LanguageRegistry>>,
+            cx: &mut App,
+        ) -> Option<Entity<Markdown>> {
+            Some(cx.new(|cx| Markdown::new("Unknown word".into(), None, None, cx)))
+        }
+
+        fn open_link(
+            &self,
+            _: &mut Editor,
+            _: SharedString,
+            _: &mut Window,
+            _: &mut Context<Editor>,
+        ) {
+        }
+    }
+
+    async fn spelling_hover_context(
+        cx: &mut gpui::TestAppContext,
+        source: &str,
+    ) -> EditorLspTestContext {
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                code_action_provider: Some(lsp::CodeActionProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.update(|_, cx| {
+            crate::set_diagnostic_renderer(SpellingTestRenderer, cx);
+            cx.update_global::<SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.hover_popover_sticky = Some(false);
+                    settings.editor.hover_popover_hiding_delay = Some(DelayMs(500));
+                });
+            });
+        });
+        cx.set_state("ошибкка\nˇ");
+        let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 7));
+        cx.lsp
+            .set_request_handler::<lsp::request::CodeActionRequest, _, _>(
+                move |params, _| async move {
+                    if params.range.start.line != 0 {
+                        return Ok(None);
+                    }
+                    assert!(
+                        params
+                            .context
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.source.as_deref() == Some("cSpell"))
+                    );
+                    let action = spelling_test_action(params.text_document.uri, range);
+                    let project::LspAction::Action(action) = action.lsp_action else {
+                        unreachable!()
+                    };
+                    Ok(Some(vec![lsp::CodeActionOrCommand::CodeAction(*action)]))
+                },
+            );
+        cx.lsp
+            .notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: cx.buffer_lsp_url.clone(),
+                diagnostics: vec![lsp::Diagnostic {
+                    range,
+                    source: Some(source.into()),
+                    message: "Unknown word".into(),
+                    severity: Some(lsp::DiagnosticSeverity::INFORMATION),
+                    ..Default::default()
+                }],
+                version: None,
+            });
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            let anchor = snapshot.anchor_before(MultiBufferOffset(4));
+            hover_at(editor, Some(anchor), None, window, cx);
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx
+    }
+
+    #[gpui::test]
+    async fn test_spelling_hover_loads_without_click_and_click_is_undoable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = spelling_hover_context(cx, "cSpell").await;
+        assert_eq!(cx.buffer_text(), "ошибкка\n");
+        cx.update_editor(|editor, window, cx| {
+            let spelling = editor
+                .hover_state
+                .diagnostic_popover
+                .as_ref()
+                .unwrap()
+                .spelling
+                .as_ref()
+                .unwrap();
+            assert_eq!(spelling.replacements, ["ошибка"]);
+            assert!(!spelling.loading);
+            assert!(editor.apply_hover_spelling_suggestion("ошибка", window, cx));
+        });
+        assert_eq!(cx.buffer_text(), "ошибка\n");
+        cx.dispatch_action(crate::actions::Undo);
+        assert_eq!(cx.buffer_text(), "ошибкка\n");
+    }
+
+    #[gpui::test]
+    async fn test_spelling_hover_rejects_stale_replacement(cx: &mut gpui::TestAppContext) {
+        let mut cx = spelling_hover_context(cx, "cSpell").await;
+        cx.update_editor(|editor, window, cx| {
+            editor.edit(
+                [(
+                    MultiBufferOffset(0)..MultiBufferOffset("ошибкка".len()),
+                    "новое",
+                )],
+                cx,
+            );
+            assert!(!editor.apply_hover_spelling_suggestion("ошибка", window, cx));
+        });
+        assert_eq!(cx.buffer_text(), "новое\n");
+    }
+
+    #[gpui::test]
+    async fn test_spelling_hover_ignores_non_spelling_diagnostics(cx: &mut gpui::TestAppContext) {
+        let mut cx = spelling_hover_context(cx, "rustc").await;
+        cx.update_editor(|editor, _, _| {
+            let popover = editor.hover_state.diagnostic_popover.as_ref().unwrap();
+            assert!(popover.spelling.is_none());
+        });
+        assert_eq!(cx.buffer_text(), "ошибкка\n");
+    }
+
+    #[gpui::test]
+    async fn test_spelling_hover_allows_mouse_to_cross_the_popover_gap(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = spelling_hover_context(cx, "cSpell").await;
+        cx.update_editor(|editor, window, cx| {
+            hover_at(editor, None, None, window, cx);
+            assert!(editor.hover_state.diagnostic_popover.is_some());
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| assert!(editor.hover_state.visible()));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| assert!(!editor.hover_state.visible()));
     }
 
     #[gpui::test]
