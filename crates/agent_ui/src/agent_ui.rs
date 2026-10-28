@@ -23,6 +23,7 @@ mod mention_set;
 mod message_editor;
 mod user_path_links;
 mod mode_selector;
+mod model_search;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;

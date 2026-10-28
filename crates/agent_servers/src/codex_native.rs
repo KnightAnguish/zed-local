@@ -1100,7 +1100,8 @@ mod tests {
         });
         let account = peer.next().await;
         assert_eq!(account["method"], "account/read");
-        cx.update(|cx| connection.cancel(&"stored".into(), cx));
+        cx.update(|cx| connection.cancel(&"stored".into(), cx))
+            .expect("cancellation request accepted");
         peer.send(json!({"id":account["id"],"result":{"requiresOpenaiAuth":false}}))
             .await;
         let resume = peer.next().await;
@@ -1364,7 +1365,8 @@ mod tests {
         });
         let request = peer.next().await;
         assert_eq!(request["method"], "turn/start");
-        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx));
+        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx))
+            .expect("cancellation request accepted");
         peer.send(
             json!({"method":"turn/started","params":{"threadId":"session","turn":{"id":"turn"}}}),
         )
@@ -1623,7 +1625,8 @@ mod tests {
     #[gpui::test]
     async fn recovery_manual_stop_does_not_wait_forever_for_completion(cx: &mut TestAppContext) {
         let (connection, peer, _thread, prompt) = quiet_prompt(cx).await;
-        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx));
+        cx.update(|cx| connection.cancel(&acp_v2::SessionId::new("session"), cx))
+            .expect("cancellation request accepted");
         let interrupt = peer.next().await;
         peer.send(json!({"id":interrupt["id"],"result":{}})).await;
         quiet_minutes(cx, 1);
@@ -2216,7 +2219,7 @@ impl AgentConnection for NativeCodexConnection {
             }
         })
     }
-    fn cancel(&self, id: &acp_v2::SessionId, cx: &mut App) {
+    fn cancel(&self, id: &acp_v2::SessionId, cx: &mut App) -> Result<()> {
         let turn = self
             .sessions
             .borrow_mut()
@@ -2236,6 +2239,9 @@ impl AgentConnection for NativeCodexConnection {
             })
             .detach_and_log_err(cx);
         }
+        // This acknowledges the local cancellation request, not completion of
+        // the asynchronous interrupt. Turn completion remains event-driven.
+        Ok(())
     }
     fn supports_close_session(&self) -> bool {
         true
