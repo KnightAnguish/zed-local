@@ -242,6 +242,11 @@ impl Preferences {
                     acp::SessionConfigSelectOption::new("native-read-only", "Read only"),
                     acp::SessionConfigSelectOption::new("read-only", "Ask for approval"),
                     acp::SessionConfigSelectOption::new("agent", "Approve for me"),
+                    acp::SessionConfigSelectOption::new(
+                        "agent-full-access-confirm",
+                        "Full access + confirm risky",
+                    )
+                    .description("Unrestricted files and network. Ask when Codex execution policy requires approval, not for every command. Forbidden actions remain blocked."),
                     acp::SessionConfigSelectOption::new("agent-full-access", "Full access"),
                 ],
             )
@@ -318,7 +323,12 @@ impl Preferences {
                 ensure!(
                     matches!(
                         selected,
-                        "server" | "native-read-only" | "read-only" | "agent" | "agent-full-access"
+                        "server"
+                            | "native-read-only"
+                            | "read-only"
+                            | "agent"
+                            | "agent-full-access-confirm"
+                            | "agent-full-access"
                     ),
                     "Unknown permission mode"
                 );
@@ -337,6 +347,11 @@ impl Preferences {
         // Explicit null clears a previously persisted service tier (omission would inherit it).
         params["serviceTier"] = json!(self.tier);
         match self.mode.as_deref() {
+            Some("agent-full-access-confirm") => {
+                params["sandboxPolicy"] = json!({"type":"dangerFullAccess"});
+                params["approvalPolicy"] = json!("on-request");
+                params["approvalsReviewer"] = json!("user");
+            }
             Some("agent-full-access") => {
                 params["sandboxPolicy"] = json!({"type":"dangerFullAccess"});
                 params["approvalPolicy"] = json!("never");
@@ -500,6 +515,51 @@ mod tests {
         let params = preferences.turn_params(&id, vec![]);
         assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(params["approvalPolicy"], "on-request");
+    }
+    #[test]
+    fn full_access_confirmation_is_explicit_local_and_non_broadening() {
+        let original = preferences();
+        let mut changed = original.clone();
+        let id = acp::SessionId::new("t");
+        changed
+            .change("mode", &"agent-full-access-confirm".into())
+            .unwrap();
+        let params = changed.turn_params(&id, vec![]);
+        assert_eq!(params["sandboxPolicy"], json!({"type":"dangerFullAccess"}));
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["approvalsReviewer"], "user");
+        assert!(
+            original
+                .turn_params(&id, vec![])
+                .get("approvalPolicy")
+                .is_none()
+        );
+
+        let options = serde_json::to_value(changed.options()).unwrap();
+        let permissions = options
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["configId"] == "mode")
+            .expect("permissions selector must be advertised");
+        assert_eq!(permissions["currentValue"], "agent-full-access-confirm");
+        assert_eq!(
+            permissions["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|option| option["value"] == "agent-full-access-confirm")
+                .count(),
+            1
+        );
+
+        changed.change("mode", &"agent-full-access".into()).unwrap();
+        assert_eq!(changed.turn_params(&id, vec![])["approvalPolicy"], "never");
+        changed.change("mode", &"server".into()).unwrap();
+        let inherited = changed.turn_params(&id, vec![]);
+        assert!(inherited.get("sandboxPolicy").is_none());
+        assert!(inherited.get("approvalPolicy").is_none());
+        assert!(inherited.get("approvalsReviewer").is_none());
     }
     #[test]
     fn ui_options_are_valid_and_fast_off_is_explicit_null() {

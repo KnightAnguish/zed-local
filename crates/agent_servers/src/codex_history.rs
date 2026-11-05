@@ -1,7 +1,8 @@
+use crate::codex_framing;
 use acp_thread::{HistoryMessage, HistoryPage};
 use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use anyhow::{Context as _, Result, bail, ensure};
-use futures::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, io::BufReader};
+use futures::{AsyncWriteExt as _, io::BufReader};
 use project::agent_server_store::AgentServerCommand;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -9,7 +10,21 @@ use std::{path::PathBuf, process::Stdio};
 use util::process::Child;
 
 const PAGE_SIZE: usize = 20;
-const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) async fn request_turn_page<F, Fut>(
+    session_id: &acp_v2::SessionId,
+    cursor: Option<&str>,
+    mut request: F,
+) -> Result<Value>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    request(json!({
+        "threadId":session_id.to_string(),"cursor":cursor,"limit":PAGE_SIZE,
+        "sortDirection":"desc","itemsView":"summary"
+    }))
+    .await
+}
 
 struct ReaderProcess(Child);
 
@@ -58,17 +73,11 @@ impl CodexHistory {
         session_id: acp_v2::SessionId,
         cursor: Option<String>,
     ) -> Result<HistoryPage> {
-        decode_page(
-            self.read(
-                "thread/turns/list",
-                json!({
-                    "threadId":session_id.to_string(),"cursor":cursor,"limit":PAGE_SIZE,
-                    "sortDirection":"desc","itemsView":"summary"
-                }),
-            )
-            .await?,
-            cursor.as_deref(),
-        )
+        let response = request_turn_page(&session_id, cursor.as_deref(), |params| {
+            self.read("thread/turns/list", params)
+        })
+        .await?;
+        decode_page(response, cursor.as_deref())
     }
 
     pub(crate) async fn rate_limits(&self) -> Result<Value> {
@@ -155,21 +164,7 @@ async fn read_response(
     id: u64,
 ) -> Result<Value> {
     for _ in 0..128 {
-        let mut line = Vec::new();
-        (&mut *reader)
-            .take(MAX_LINE_BYTES + 1)
-            .read_until(b'\n', &mut line)
-            .await?;
-        ensure!(
-            !line.is_empty(),
-            "Codex history reader closed before replying"
-        );
-        ensure!(
-            line.len() as u64 <= MAX_LINE_BYTES,
-            "Codex history page exceeds 16 MiB"
-        );
-        let value: Value =
-            serde_json::from_slice(&line).context("Invalid Codex history response")?;
+        let mut value = codex_framing::read(reader).await?;
         if value.get("id").and_then(Value::as_u64) != Some(id) {
             ensure!(
                 value.get("id").is_none(),
@@ -187,8 +182,8 @@ async fn read_response(
             );
         }
         return value
-            .get("result")
-            .cloned()
+            .get_mut("result")
+            .map(Value::take)
             .context("Missing Codex history result");
     }
     bail!("Too many notifications from Codex history reader")
@@ -389,6 +384,61 @@ fn history_image_link(path: &str) -> Option<acp::ContentBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_pages_preserve_the_requested_cursor_and_pagination() {
+        futures::executor::block_on(async {
+            let mut limits = Vec::new();
+            let page = request_turn_page(
+                &acp_v2::SessionId::new("thread"),
+                Some("same-cursor"),
+                |params| {
+                    assert_eq!(params["cursor"], "same-cursor");
+                    assert_eq!(params["itemsView"], "summary");
+                    limits.push(params["limit"].as_u64().unwrap());
+                    futures::future::ready(Ok(json!({"data":[],"nextCursor":"older-turns"})))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(limits, [20]);
+            assert_eq!(page["nextCursor"], "older-turns");
+        });
+    }
+
+    #[test]
+    fn history_errors_are_not_retried() {
+        futures::executor::block_on(async {
+            let mut calls = 0;
+            request_turn_page(&acp_v2::SessionId::new("thread"), None, |_| {
+                calls += 1;
+                futures::future::ready(Err(anyhow::anyhow!("permission denied")))
+            })
+            .await
+            .expect_err("ordinary errors must propagate");
+            assert_eq!(calls, 1);
+        });
+    }
+
+    #[test]
+    fn single_large_history_turn_is_loaded_without_truncation() {
+        futures::executor::block_on(async {
+            let length = 17 * 1024 * 1024;
+            let frame = format!(
+                "{{\"id\":2,\"result\":{{\"data\":[{{\"items\":[{{\"type\":\"agentMessage\",\"id\":\"large\",\"text\":\"{}\"}}]}}],\"nextCursor\":\"older\"}}}}\n",
+                "x".repeat(length)
+            );
+            let mut reader = futures::io::Cursor::new(frame);
+            let response = read_response(&mut reader, 2).await.unwrap();
+            let page = decode_page(response, None).unwrap();
+            assert_eq!(page.messages.len(), 1);
+            let acp::ContentBlock::Text(text) = &page.messages[0].content[0] else {
+                panic!("history text");
+            };
+            assert_eq!(text.text.len(), length);
+            assert_eq!(page.next_cursor.as_deref(), Some("older"));
+        });
+    }
 
     #[test]
     fn restores_embedded_history_images_to_permanent_files() {

@@ -608,13 +608,9 @@ impl NativeCodexConnection {
                 }
             };
             let tail = if session_id.is_some() {
-                let response = self
-                .rpc
-                .request(
-                    "thread/turns/list",
-                    json!({"threadId":id,"limit":20,"sortDirection":"desc","itemsView":"summary"}),
-                )
-                .await?;
+                let response = crate::codex_history::request_turn_page(&id, None, |params| {
+                    self.rpc.request("thread/turns/list", params)
+                }).await?;
                 Some(
                     cx.background_spawn(async move {
                         crate::codex_history::decode_page(response, None)
@@ -1706,6 +1702,73 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn full_access_confirmation_waits_only_for_server_requested_approval(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, peer, thread) = session(cx).await;
+        let session_id = acp_v2::SessionId::new("session");
+        let options = cx
+            .update(|cx| connection.session_config_options(&session_id, cx))
+            .unwrap();
+        let quota = peer.next().await;
+        assert_eq!(quota["method"], "account/rateLimits/read");
+        peer.send(json!({"id":quota["id"],"result":{}})).await;
+        cx.update(|cx| {
+            options.set_config_option(
+                acp_v2::SessionConfigId::new("mode"),
+                "agent-full-access-confirm".into(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let prompt = cx.update(|cx| {
+            connection.prompt(
+                acp_v2::PromptRequest::new("session", vec!["test commands".into()]),
+                cx,
+            )
+        });
+        let request = peer.next().await;
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(
+            request["params"]["sandboxPolicy"]["type"],
+            "dangerFullAccess"
+        );
+        assert_eq!(request["params"]["approvalPolicy"], "on-request");
+        assert_eq!(request["params"]["approvalsReviewer"], "user");
+        peer.send(json!({"id":request["id"],"result":{"turn":{"id":"turn"}}}))
+            .await;
+
+        peer.send(json!({"method":"item/started","params":{"threadId":"session","turnId":"turn","item":{"type":"commandExecution","id":"routine","command":"echo routine","status":"inProgress"}}})).await;
+        peer.send(json!({"method":"item/completed","params":{"threadId":"session","turnId":"turn","item":{"type":"commandExecution","id":"routine","command":"echo routine","status":"completed","exitCode":0,"aggregatedOutput":"routine"}}})).await;
+        cx.run_until_parked();
+        assert!(connection.approvals.borrow().is_empty());
+
+        peer.send(json!({"id":"risky-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"session","turnId":"turn","itemId":"risky","command":"server-classified risky fixture","reason":"Fixture requires explicit confirmation"}})).await;
+        cx.run_until_parked();
+        assert_eq!(connection.approvals.borrow().len(), 1);
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                acp_v2::ToolCallId::new("risky"),
+                acp_thread::SelectedPermissionOutcome::new(
+                    acp_v2::PermissionOptionId::new("0"),
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            )
+        });
+        let response = peer.next().await;
+        assert_eq!(response["id"], "risky-approval");
+        assert_eq!(response["result"], json!({"decision":"accept"}));
+        cx.run_until_parked();
+        assert!(connection.approvals.borrow().is_empty());
+
+        peer.send(json!({"method":"turn/completed","params":{"threadId":"session","turn":{"id":"turn","status":"completed"}}})).await;
+        assert_eq!(prompt.await.unwrap().stop_reason, acp::StopReason::EndTurn);
+    }
+
+    #[gpui::test]
     async fn approval_is_not_sent_before_user_decision(cx: &mut TestAppContext) {
         let (connection, peer, thread) = session(cx).await;
         peer.send(json!({"id":"approval","method":"item/commandExecution/requestApproval","params":{"threadId":"session","turnId":"turn","itemId":"tool","command":"echo hello"}})).await;
@@ -2047,10 +2110,15 @@ impl AgentConnection for NativeCodexConnection {
     ) -> Task<Result<HistoryPage>> {
         let rpc = self.rpc.clone();
         cx.spawn(async move |cx| {
-            let response = rpc.request("thread/turns/list", json!({"threadId":id,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"})).await?;
+            let response =
+                crate::codex_history::request_turn_page(&id, cursor.as_deref(), |params| {
+                    rpc.request("thread/turns/list", params)
+                })
+                .await?;
             cx.background_spawn(async move {
                 crate::codex_history::decode_page(response, cursor.as_deref())
-            }).await
+            })
+            .await
         })
     }
     fn auth_methods(&self) -> &[acp_v2::AuthMethod] {

@@ -1,8 +1,7 @@
 //! Persistent Codex app-server JSONL transport. No Node process, shell, or auth-file reads.
+use crate::codex_framing;
 use anyhow::{Context as _, Result, bail, ensure};
-use futures::{
-    AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, channel::oneshot, io::BufReader,
-};
+use futures::{AsyncWriteExt as _, channel::oneshot, io::BufReader};
 use gpui::{BackgroundExecutor, Task};
 use serde_json::{Value, json};
 use std::{
@@ -14,7 +13,6 @@ use std::{
 };
 use util::process::Child;
 
-const MAX_FRAME: u64 = 16 * 1024 * 1024;
 const MAX_PENDING: usize = 128;
 const QUEUE_SIZE: usize = 8;
 
@@ -62,20 +60,21 @@ impl Routing {
         }
     }
 
-    fn route(&mut self, frame: Value) -> Result<Option<Event>> {
+    fn route(&mut self, mut frame: Value) -> Result<Option<Event>> {
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
-            let params = frame.get("params").cloned().unwrap_or(Value::Null);
-            return Ok(Some(match frame.get("id") {
+            let method = method.to_owned();
+            let params = frame
+                .get_mut("params")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            return Ok(Some(match frame.get_mut("id") {
                 Some(id) if id.is_string() || id.is_number() => Event::Request {
-                    id: id.clone(),
-                    method: method.to_owned(),
+                    id: id.take(),
+                    method,
                     params,
                 },
                 Some(_) => bail!("Invalid Codex server request ID"),
-                None => Event::Notification {
-                    method: method.to_owned(),
-                    params,
-                },
+                None => Event::Notification { method, params },
             }));
         }
         let id = frame
@@ -83,7 +82,10 @@ impl Routing {
             .and_then(Value::as_u64)
             .context("Invalid Codex response ID")?;
         let result = match (frame.get("result"), frame.get("error")) {
-            (Some(result), None) => Ok(result.clone()),
+            (Some(_), None) => Ok(frame
+                .get_mut("result")
+                .context("Missing Codex response result")?
+                .take()),
             (None, Some(error)) => Err(anyhow::anyhow!(
                 "Codex RPC error {}: {}",
                 error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
@@ -211,11 +213,13 @@ impl Rpc {
                 );
                 let read = async {
                     loop {
-                        let frame = read_frame(&mut output).await?;
-                        let event = task_routing
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("Codex routing lock poisoned"))?
-                            .route(frame)?;
+                        let frame = codex_framing::read(&mut output).await?;
+                        let event = {
+                            let mut routing = task_routing
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("Codex routing lock poisoned"))?;
+                            routing.route(frame)?
+                        };
                         if let Some(event) = event {
                             events
                                 .send(event)
@@ -321,10 +325,9 @@ impl Rpc {
 
     fn send(&self, frame: Value) -> Result<()> {
         let mut bytes = serde_json::to_vec(&frame)?;
-        ensure!(
-            (bytes.len() as u64) < MAX_FRAME,
-            "Codex request exceeds 16 MiB"
-        );
+        bytes
+            .try_reserve(1)
+            .context("Not enough memory to send Codex frame")?;
         bytes.push(b'\n');
         self.0
             .outgoing
@@ -357,19 +360,9 @@ impl FakePeer {
     }
 }
 
+#[cfg(test)]
 async fn read_frame(reader: &mut (impl futures::AsyncBufRead + Unpin)) -> Result<Value> {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_FRAME + 1)
-        .read_until(b'\n', &mut bytes)
-        .await?;
-    ensure!(!bytes.is_empty(), "Codex closed stdout");
-    ensure!(
-        bytes.len() as u64 <= MAX_FRAME,
-        "Codex frame exceeds 16 MiB"
-    );
-    ensure!(bytes.last() == Some(&b'\n'), "Truncated Codex frame");
-    serde_json::from_slice(&bytes).context("Invalid Codex JSONL frame")
+    codex_framing::read(reader).await
 }
 
 #[cfg(test)]
@@ -468,20 +461,39 @@ mod tests {
             }
         });
         let operation = cx.background_executor.spawn(async move {
-        let initialized = rpc.initialize().await.expect("initialize installed runtime");
-        assert!(initialized["codexHome"].is_string());
-        let (history, models, usage) = futures::join!(
-            rpc.request("thread/turns/list", json!({"threadId":thread,"limit":20,"sortDirection":"desc","itemsView":"summary"})),
-            rpc.request("model/list", json!({"limit":100})),
-            rpc.request("account/rateLimits/read", json!({}))
-        );
-        assert!(!crate::codex_history::decode_page(history.unwrap(), None).unwrap().messages.is_empty());
-        let models = models.unwrap();
-        let catalog: Vec<crate::codex_native::settings::Model> = serde_json::from_value(models["data"].clone()).expect("installed model catalog schema");
-        assert!(!catalog.is_empty());
-        let usage = usage.unwrap();
-        assert!(usage.get("rateLimits").is_some() || usage.get("rateLimitsByLimitId").is_some());
-        drop(drain);
+            let initialized = rpc
+                .initialize()
+                .await
+                .expect("initialize installed runtime");
+            assert!(initialized["codexHome"].is_string());
+            let thread = agent_client_protocol::schema::v2::SessionId::new(thread);
+            let (history, models, usage) = futures::join!(
+                crate::codex_history::request_turn_page(&thread, None, |params| rpc
+                    .request("thread/turns/list", params)),
+                rpc.request("model/list", json!({"limit":100})),
+                rpc.request("account/rateLimits/read", json!({}))
+            );
+            let history = history.unwrap();
+            eprintln!(
+                "Read-only history returned {} turns",
+                history["data"].as_array().unwrap().len()
+            );
+            assert!(
+                !crate::codex_history::decode_page(history, None)
+                    .unwrap()
+                    .messages
+                    .is_empty()
+            );
+            let models = models.unwrap();
+            let catalog: Vec<crate::codex_native::settings::Model> =
+                serde_json::from_value(models["data"].clone())
+                    .expect("installed model catalog schema");
+            assert!(!catalog.is_empty());
+            let usage = usage.unwrap();
+            assert!(
+                usage.get("rateLimits").is_some() || usage.get("rateLimitsByLimitId").is_some()
+            );
+            drop(drain);
         });
         futures::pin_mut!(operation);
         // Real child IO must not auto-advance the simulated GPUI clock to the RPC deadline.
@@ -511,6 +523,30 @@ mod tests {
             assert!(routing.pending.is_empty());
         });
     }
+    #[test]
+    fn large_response_is_delivered_without_disconnect_or_replaying_writes() {
+        futures::executor::block_on(async {
+            let mut routing = Routing::default();
+            let (large, received) = routing.register().unwrap();
+            let (other, response) = routing.register().unwrap();
+            let payload = "x".repeat(17 * 1024 * 1024);
+            let original_pointer = payload.as_ptr();
+            let mut frame = json!({"id":large,"result":null});
+            frame["result"] = Value::String(payload);
+            routing.route(frame).unwrap();
+            let result = received.await.unwrap().unwrap();
+            assert_eq!(result.as_str().unwrap().as_ptr(), original_pointer);
+            assert_eq!(result.as_str().unwrap().len(), 17 * 1024 * 1024);
+            assert!(routing.closed.is_none());
+            routing
+                .route(json!({"id":other,"result":"still connected"}))
+                .unwrap();
+            assert_eq!(response.await.unwrap().unwrap(), "still connected");
+            assert!(routing.pending.is_empty());
+            assert_eq!(routing.next_id, other);
+        });
+    }
+
     #[test]
     fn disconnect_fails_every_pending_request_and_rejects_new_requests() {
         futures::executor::block_on(async {
@@ -572,12 +608,23 @@ mod tests {
                     .unwrap()["id"],
                 1
             );
-            let huge = vec![b'x'; MAX_FRAME as usize + 1];
-            assert!(
-                read_frame(&mut futures::io::Cursor::new(huge))
-                    .await
-                    .is_err()
+        });
+    }
+
+    #[gpui::test]
+    fn sends_requests_larger_than_the_old_frame_limit(cx: &mut gpui::TestAppContext) {
+        futures::executor::block_on(async {
+            let (rpc, peer, _events) = Rpc::fake(cx.background_executor.clone());
+            rpc.send(json!({"id":1,"method":"turn/start","params":{
+                "input":[{"type":"text","text":"x".repeat(17 * 1024 * 1024)}]
+            }}))
+            .unwrap();
+            let frame = peer.next().await;
+            assert_eq!(
+                frame["params"]["input"][0]["text"].as_str().unwrap().len(),
+                17 * 1024 * 1024
             );
+            assert!(peer.requests.is_empty());
         });
     }
 }
