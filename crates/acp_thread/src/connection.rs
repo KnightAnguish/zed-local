@@ -186,6 +186,12 @@ pub trait AgentConnection {
         false
     }
 
+    /// Whether subagents follow the ACP subagents RFD on this connection: they are discovered
+    /// only through their parent's announcements, and must never be loaded or resumed.
+    fn announces_subagents(&self) -> bool {
+        false
+    }
+
     /// Whether conversation teardown should invoke `close_session`.
     /// The default preserves existing UI cleanup; backend-owned release hooks are separate.
     /// Autonomous backends can opt out without disabling explicit close support.
@@ -436,6 +442,11 @@ pub trait AgentSessionModes {
 pub trait AgentSessionConfigOptions {
     /// Get all current config options with their state
     fn config_options(&self) -> Vec<acp_v2::SessionConfigOption>;
+
+    /// Agent-owned sessions may report configuration without allowing the client to change it.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 
     /// Set a config option value
     /// Returns the full updated list of config options
@@ -961,7 +972,7 @@ mod test_support {
     use action_log::ActionLog;
     use collections::{HashMap, VecDeque};
     use futures::{channel::oneshot, future::try_join_all};
-    use gpui::{AppContext as _, WeakEntity};
+    use gpui::{AppContext as _, Entity, WeakEntity};
     use parking_lot::Mutex;
 
     use crate::AuthorizationKind;
@@ -1038,9 +1049,11 @@ mod test_support {
         fork_requests: Arc<Mutex<Vec<Option<SessionForkPoint>>>>,
         fork_succeeds: Arc<Mutex<bool>>,
         supports_close_session: bool,
+        announces_subagents: bool,
         close_sessions_on_release: bool,
         supports_session_additional_directories: bool,
         supports_set_title: bool,
+        supports_truncate: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
@@ -1091,9 +1104,11 @@ mod test_support {
                 fork_requests: Default::default(),
                 fork_succeeds: Default::default(),
                 supports_close_session: false,
+                announces_subagents: false,
                 close_sessions_on_release: true,
                 supports_session_additional_directories: false,
                 supports_set_title: true,
+                supports_truncate: true,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
                 prompt_capabilities_rx: watch::Receiver::constant(
@@ -1189,6 +1204,18 @@ mod test_support {
             sender
         }
 
+        /// Makes a session this connection did not create, such as an ACP subagent, known to
+        /// it, as a real connection knows the subagents it announced.
+        pub fn track_session(&self, thread: &Entity<AcpThread>, cx: &App) {
+            self.sessions.lock().insert(
+                thread.read(cx).session_id().clone(),
+                Session {
+                    thread: thread.downgrade(),
+                    response_tx: None,
+                },
+            );
+        }
+
         pub fn take_cancel_calls(&self) -> Vec<acp_v2::SessionId> {
             std::mem::take(&mut *self.cancel_calls.lock())
         }
@@ -1218,6 +1245,11 @@ mod test_support {
 
         pub fn with_supports_close_session(mut self, supports_close_session: bool) -> Self {
             self.supports_close_session = supports_close_session;
+            self
+        }
+
+        pub fn with_announced_subagents(mut self, announces_subagents: bool) -> Self {
+            self.announces_subagents = announces_subagents;
             self
         }
 
@@ -1254,6 +1286,11 @@ mod test_support {
 
         pub fn with_supports_set_title(mut self, supports_set_title: bool) -> Self {
             self.supports_set_title = supports_set_title;
+            self
+        }
+
+        pub fn with_supports_truncate(mut self, supports_truncate: bool) -> Self {
+            self.supports_truncate = supports_truncate;
             self
         }
 
@@ -1432,6 +1469,10 @@ mod test_support {
 
         fn supports_close_session(&self) -> bool {
             self.supports_close_session
+        }
+
+        fn announces_subagents(&self) -> bool {
+            self.announces_subagents
         }
 
         fn should_close_sessions_on_release(&self) -> bool {
@@ -1633,9 +1674,11 @@ mod test_support {
             _cx: &App,
         ) -> Option<Rc<dyn AgentSessionTruncate>> {
             // Capability checks also call this; only run may consume the gate.
-            Some(Rc::new(StubAgentSessionEditor {
-                next_truncate: self.next_truncate.clone(),
-            }))
+            self.supports_truncate.then(|| {
+                Rc::new(StubAgentSessionEditor {
+                    next_truncate: self.next_truncate.clone(),
+                }) as Rc<dyn AgentSessionTruncate>
+            })
         }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
