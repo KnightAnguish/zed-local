@@ -73,6 +73,7 @@ async fn close_session_and_drain(
 pub struct AcpConnection {
     native_history: Option<crate::codex_history::CodexHistory>,
     native_usage: Option<crate::codex_usage::NativeUsage>,
+    opencode_usage: Option<crate::opencode_usage::OpenCodeUsage>,
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
@@ -564,6 +565,23 @@ impl AcpConnection {
         } else {
             None
         };
+        let opencode_usage = if (agent_id.as_ref() == "opencode"
+            || agent_id.as_ref() == "opencode-v2")
+            && project.read_with(cx, |project, _| project.is_local())
+        {
+            let root_dir = project.read_with(cx, |project, cx| {
+                project
+                    .default_path_list(cx)
+                    .ordered_paths()
+                    .next()
+                    .cloned()
+            });
+            cx.update(|cx| {
+                crate::opencode_usage::OpenCodeUsage::from_command(&original_command, root_dir, cx)
+            })
+        } else {
+            None
+        };
         let transport::StdioProcess {
             child,
             incoming,
@@ -741,6 +759,7 @@ impl AcpConnection {
             native_usage: native_history
                 .clone()
                 .map(|reader| cx.update(|cx| crate::codex_usage::NativeUsage::new(reader, cx))),
+            opencode_usage,
             native_history,
             auth_methods,
             agent_server_store,
@@ -791,6 +810,7 @@ impl AcpConnection {
             id: agent_id,
             native_history: None,
             native_usage: None,
+            opencode_usage: None,
             telemetry_id: "test".into(),
             agent_version: None,
             connection,
@@ -1885,10 +1905,15 @@ impl AgentConnection for AcpConnection {
         if let Some(usage) = &self.native_usage {
             usage.refresh(cx, false);
         }
+        if let Some(usage) = &self.opencode_usage {
+            usage.refresh(cx, false);
+        }
 
         Some(Rc::new(AcpSessionConfigOptions {
             native_usage: self.native_usage.clone(),
+            opencode_usage: self.opencode_usage.clone(),
             native_watch_task: RefCell::new(None),
+            opencode_watch_task: RefCell::new(None),
             session_id: session_id.clone(),
             connection: self.connection.clone(),
             config_options: config_opts.clone(),
@@ -7083,7 +7108,9 @@ mod tests {
         ])));
         let options = AcpSessionConfigOptions {
             native_usage: None,
+            opencode_usage: None,
             native_watch_task: RefCell::new(None),
+            opencode_watch_task: RefCell::new(None),
             session_id: acp_v2::SessionId::new("session"),
             connection: connection.connection.clone(),
             config_options: config,
@@ -10177,7 +10204,9 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
 
 struct AcpSessionConfigOptions {
     native_usage: Option<crate::codex_usage::NativeUsage>,
+    opencode_usage: Option<crate::opencode_usage::OpenCodeUsage>,
     native_watch_task: RefCell<Option<Task<()>>>,
+    opencode_watch_task: RefCell<Option<Task<()>>>,
     session_id: acp_v2::SessionId,
     connection: ConnectionTo<Agent>,
     config_options: ConfigOptions,
@@ -10185,10 +10214,14 @@ struct AcpSessionConfigOptions {
 
 impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
     fn config_options(&self) -> Vec<acp_v2::SessionConfigOption> {
-        let options = self.config_options.config_options.borrow().clone();
-        self.native_usage
-            .as_ref()
-            .map_or_else(|| options.clone(), |usage| usage.options(options.clone()))
+        let mut options = self.config_options.config_options.borrow().clone();
+        if let Some(usage) = &self.native_usage {
+            options = usage.options(options);
+        }
+        if let Some(usage) = &self.opencode_usage {
+            options = usage.options(options);
+        }
+        options
     }
 
     fn set_config_option(
@@ -10203,18 +10236,29 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
             usage.refresh(cx, true);
             return Task::ready(Ok(self.config_options()));
         }
+        if let Some(usage) = &self.opencode_usage
+            && crate::opencode_usage::OpenCodeUsage::owns(&config_id)
+        {
+            usage.refresh(cx, true);
+            return Task::ready(Ok(self.config_options()));
+        }
         let connection = self.connection.clone();
         let session_id = self.session_id.clone();
         let config_options = self.config_options.clone();
         let native_usage = self.native_usage.clone();
+        let opencode_usage = self.opencode_usage.clone();
 
         cx.foreground_executor().spawn(async move {
-            let options = config_options
+            let mut options = config_options
                 .set_config_option(&connection, session_id, config_id, value)
                 .await?;
-            Ok(native_usage
-                .as_ref()
-                .map_or_else(|| options.clone(), |usage| usage.options(options.clone())))
+            if let Some(usage) = native_usage.as_ref() {
+                options = usage.options(options);
+            }
+            if let Some(usage) = opencode_usage.as_ref() {
+                options = usage.options(options);
+            }
+            Ok(options)
         })
     }
 
@@ -10223,6 +10267,16 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
             let mut receiver = usage.receiver.clone();
             let sender = self.config_options.tx.clone();
             *self.native_watch_task.borrow_mut() =
+                Some(cx.foreground_executor().spawn(async move {
+                    while receiver.recv().await.is_ok() {
+                        sender.borrow_mut().send(()).log_err();
+                    }
+                }));
+        }
+        if let Some(usage) = &self.opencode_usage {
+            let mut receiver = usage.receiver.clone();
+            let sender = self.config_options.tx.clone();
+            *self.opencode_watch_task.borrow_mut() =
                 Some(cx.foreground_executor().spawn(async move {
                     while receiver.recv().await.is_ok() {
                         sender.borrow_mut().send(()).log_err();

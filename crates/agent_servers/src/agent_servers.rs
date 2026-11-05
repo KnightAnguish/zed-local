@@ -5,6 +5,7 @@ mod codex_history;
 mod codex_native;
 mod codex_usage;
 mod custom;
+mod opencode_usage;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
