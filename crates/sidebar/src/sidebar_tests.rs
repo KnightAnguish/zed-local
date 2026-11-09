@@ -4582,8 +4582,8 @@ async fn test_reconnect_retained_thread_keeps_neighbor_and_metadata(cx: &mut Tes
         ) -> Task<anyhow::Result<acp_v1::PromptResponse>> {
             self.0.prompt(params, cx)
         }
-        fn cancel(&self, id: &acp::SessionId, cx: &mut App) {
-            self.0.cancel(id, cx);
+        fn cancel(&self, id: &acp::SessionId, cx: &mut App) -> anyhow::Result<()> {
+            self.0.cancel(id, cx)
         }
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
@@ -4765,6 +4765,58 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     });
 
     assert_eq!(parent_status, AgentThreadStatus::WaitingForConfirmation);
+}
+
+#[gpui::test]
+async fn test_pending_question_marks_thread_waiting(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/project-question", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+
+    let session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&session_id, &project, cx).await;
+
+    let thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+    let _response_task = thread.update(cx, |thread, cx| {
+        thread
+            .request_elicitation(
+                acp_v2::CreateElicitationRequest::new(
+                    acp_v2::ElicitationFormMode::new(
+                        acp_v2::ElicitationSessionScope::new(acp_v2::SessionId::new(
+                            session_id.0.clone(),
+                        )),
+                        acp_v2::ElicitationSchema::new().string("answer", true),
+                    ),
+                    "A blocking question",
+                ),
+                cx,
+            )
+            .unwrap()
+    });
+    cx.run_until_parked();
+
+    let status = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&session_id) =>
+                {
+                    Some(thread.status)
+                }
+                _ => None,
+            })
+            .expect("Expected active thread entry in sidebar")
+    });
+
+    assert_eq!(status, AgentThreadStatus::WaitingForConfirmation);
 }
 
 #[gpui::test]
