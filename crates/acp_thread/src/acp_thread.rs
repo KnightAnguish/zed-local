@@ -3989,7 +3989,9 @@ impl AcpThread {
                 | AcpThreadEvent::ToolAuthorizationReceived(_)
                 | AcpThreadEvent::ElicitationRequested(_)
                 | AcpThreadEvent::ElicitationResponded(_) => {
-                    if !this.uses_reported_activity() {
+                    // ACP agents that never send state updates (OpenCode, codex-acp)
+                    // still need local action state for permission and question waits.
+                    if !this.uses_reported_activity() || !this.has_received_session_state() {
                         this.sync_local_action_state(cx);
                     }
                     this.update_idle_sleep_prevention(cx);
