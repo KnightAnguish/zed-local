@@ -15361,16 +15361,16 @@ mod tests {
     #[test]
     fn test_system_link_windows_absolute_paths() {
         for link in [
-            "C:/Users/DecayScope/Documents/GitHub/Terrarium/Water air study.cmd",
-            r"C:\Users\DecayScope\Documents\GitHub\Terrarium\Water air study.cmd",
-            "file:///C:/Users/DecayScope/Documents/GitHub/Terrarium/Water%20air%20study.cmd#L2",
+            "C:/Users/Example/Documents/GitHub/Terrarium/Water air study.cmd",
+            r"C:\Users\Example\Documents\GitHub\Terrarium\Water air study.cmd",
+            "file:///C:/Users/Example/Documents/GitHub/Terrarium/Water%20air%20study.cmd#L2",
         ] {
             assert_eq!(
                 system_link_candidates(link, PathStyle::Windows)
                     .unwrap()
                     .first(),
                 Some(&PathBuf::from(
-                    r"C:\Users\DecayScope\Documents\GitHub\Terrarium\Water air study.cmd"
+                    r"C:\Users\Example\Documents\GitHub\Terrarium\Water air study.cmd"
                 ))
             );
         }

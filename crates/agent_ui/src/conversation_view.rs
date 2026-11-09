@@ -12575,9 +12575,9 @@ pub(crate) mod tests {
     async fn test_message_context_menu_uses_clicked_content(cx: &mut TestAppContext) {
         init_test(cx);
         let local_path = if cfg!(windows) {
-            r"C:\Users\DecayScope\Documents\GitHub\Рабочка\README.md"
+            r"C:\Users\Example\Documents\GitHub\Workspace\README.md"
         } else {
-            "/tmp/Рабочка/README.md"
+            "/tmp/workspace/README.md"
         };
         let local_url = url::Url::from_file_path(local_path).expect("local file URL");
         let acp_v1::ContentBlock::Image(image) = png_image() else {
