@@ -897,6 +897,21 @@ impl ConversationView {
         })
     }
 
+    /// Whether the root thread is stopped on a blocking question or permission request.
+    /// Elicitations are not tool calls, so `root_thread_has_pending_tool_call` alone
+    /// leaves a question waiting while the thread is still shown as generating.
+    pub fn root_thread_is_waiting_for_confirmation(&self, cx: &App) -> bool {
+        let Some(root_thread) = self.root_thread_view() else {
+            return false;
+        };
+        root_thread
+            .read(cx)
+            .thread
+            .read(cx)
+            .is_waiting_for_confirmation()
+            || self.root_thread_has_pending_tool_call(cx)
+    }
+
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
