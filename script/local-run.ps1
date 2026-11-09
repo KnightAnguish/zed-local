@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][string]$UserDataDirectory,
     [ValidateSet('debug', 'release')][string]$Profile = 'debug',
-    [string]$BuildRoot = 'D:\Build\zed-local'
+    [string]$BuildRoot = (Join-Path $env:LOCALAPPDATA 'ZedLocalBuild')
 )
 $ErrorActionPreference = 'Stop'
 $profileDirectory = [IO.Path]::GetFullPath($UserDataDirectory).TrimEnd('\', '/')

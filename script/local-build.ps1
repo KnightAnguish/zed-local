@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('dev', 'release')][string]$Profile = 'dev',
-    [string]$BuildRoot = 'D:\Build\zed-local',
+    [string]$BuildRoot = (Join-Path $env:LOCALAPPDATA 'ZedLocalBuild'),
     [ValidateRange(1, 32)][int]$Jobs = 12
 )
 $ErrorActionPreference = 'Stop'

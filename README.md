@@ -15,7 +15,8 @@ Branch `decay/local` starts at official tag `v1.21.0` (33c95853ed2b6956f339733c6
 There is no automatic merge, installation, or background Windows service.
 
 Build with `script/local-build.ps1`; generated artifacts and the Cargo cache stay in
-`D:/Build/zed-local`. Run only with `script/local-run.ps1`, which requires an explicit
+`%LOCALAPPDATA%/ZedLocalBuild` by default, or in the path passed as `-BuildRoot`.
+Run only with `script/local-run.ps1`, which requires an explicit
 isolated user-data directory and refuses the official Zed profile. The official installation
 and its settings/databases must not be overwritten. Do not copy live databases as ordinary
 files: migrate using a consistent backup only after the user agrees to switch.
