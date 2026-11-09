@@ -1,0 +1,262 @@
+diff --git a/src/CodexElicitationHandler.ts b/src/CodexElicitationHandler.ts
+index 6e7236b..3f67ac4 100644
+--- a/src/CodexElicitationHandler.ts
++++ b/src/CodexElicitationHandler.ts
+@@ -274,7 +274,10 @@ export class CodexElicitationHandler implements ElicitationHandler {
+         params: ToolRequestUserInputParams
+     ): Promise<acp.CreateElicitationResponse | null> {
+         const request = this.buildUserInputRequest(params);
+-        if (params.autoResolutionMs === null) {
++        // `autoResolutionMs` is deprecated in favor of `isBlocking`. A blocking
++        // question must wait for the user even if old app-server versions sent
++        // a timeout alongside it; otherwise the turn silently continues.
++        if (params.isBlocking || params.autoResolutionMs === null) {
+             return await this.connection.request(
+                 acp.methods.client.elicitation.create,
+                 request,
+@@ -399,8 +402,8 @@ export class CodexElicitationHandler implements ElicitationHandler {
+             const hasOptions = options.length > 0;
+             const hasOtherAnswer = question.isOther && hasOptions;
+             const base = {
+-                title: question.question || question.header || question.id,
+-                ...(question.header ? { description: question.header } : {}),
++                title: question.header || question.question || question.id,
++                ...(question.question ? { description: question.question } : {}),
+                 _meta: {
+                     codex: {
+                         isOther: question.isOther,
+@@ -459,6 +462,10 @@ export class CodexElicitationHandler implements ElicitationHandler {
+                 codex: {
+                     autoResolutionMs: params.autoResolutionMs,
+                 },
++                // Zed keeps answered Codex questions visible and respects blocking state.
++                "zed.dev/codexQuestion": {
++                    isBlocking: params.isBlocking,
++                },
+             },
+         };
+     }
+diff --git a/src/__tests__/CodexACPAgent/data/elicitation-user-input-existing-other.json b/src/__tests__/CodexACPAgent/data/elicitation-user-input-existing-other.json
+index ecbbcd2..fe11033 100644
+--- a/src/__tests__/CodexACPAgent/data/elicitation-user-input-existing-other.json
++++ b/src/__tests__/CodexACPAgent/data/elicitation-user-input-existing-other.json
+@@ -10,8 +10,8 @@
+         "type": "object",
+         "properties": {
+           "next_step": {
+-            "title": "What should I do next?",
+-            "description": "Next step",
++            "title": "Next step",
++            "description": "What should I do next?",
+             "_meta": {
+               "codex": {
+                 "isOther": true,
+@@ -51,6 +51,9 @@
+       "_meta": {
+         "codex": {
+           "autoResolutionMs": null
++        },
++        "zed.dev/codexQuestion": {
++          "isBlocking": true
+         }
+       }
+     }
+diff --git a/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-after.json b/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-after.json
+index 9ad0ed8..d56f3aa 100644
+--- a/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-after.json
++++ b/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-after.json
+@@ -10,8 +10,8 @@
+         "type": "object",
+         "properties": {
+           "choice": {
+-            "title": "What should I do next?",
+-            "description": "Next step",
++            "title": "Next step",
++            "description": "What should I do next?",
+             "_meta": {
+               "codex": {
+                 "isOther": true,
+@@ -49,8 +49,8 @@
+             }
+           },
+           "choice_note": {
+-            "title": "Which constraints should I follow?",
+-            "description": "Constraints",
++            "title": "Constraints",
++            "description": "Which constraints should I follow?",
+             "_meta": {
+               "codex": {
+                 "isOther": false,
+@@ -60,8 +60,8 @@
+             "type": "string"
+           },
+           "choice_note1": {
+-            "title": "What private context should I consider?",
+-            "description": "Private",
++            "title": "Private",
++            "description": "What private context should I consider?",
+             "_meta": {
+               "codex": {
+                 "isOther": false,
+@@ -80,6 +80,9 @@
+       "_meta": {
+         "codex": {
+           "autoResolutionMs": null
++        },
++        "zed.dev/codexQuestion": {
++          "isBlocking": true
+         }
+       }
+     }
+diff --git a/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-before.json b/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-before.json
+index ae234c3..9f69b96 100644
+--- a/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-before.json
++++ b/src/__tests__/CodexACPAgent/data/elicitation-user-input-note-collision-before.json
+@@ -10,8 +10,8 @@
+         "type": "object",
+         "properties": {
+           "choice_note": {
+-            "title": "Which constraints should I follow?",
+-            "description": "Constraints",
++            "title": "Constraints",
++            "description": "Which constraints should I follow?",
+             "_meta": {
+               "codex": {
+                 "isOther": false,
+@@ -21,8 +21,8 @@
+             "type": "string"
+           },
+           "choice_note1": {
+-            "title": "What private context should I consider?",
+-            "description": "Private",
++            "title": "Private",
++            "description": "What private context should I consider?",
+             "_meta": {
+               "codex": {
+                 "isOther": false,
+@@ -32,8 +32,8 @@
+             "type": "string"
+           },
+           "choice": {
+-            "title": "What should I do next?",
+-            "description": "Next step",
++            "title": "Next step",
++            "description": "What should I do next?",
+             "_meta": {
+               "codex": {
+                 "isOther": true,
+@@ -80,6 +80,9 @@
+       "_meta": {
+         "codex": {
+           "autoResolutionMs": null
++        },
++        "zed.dev/codexQuestion": {
++          "isBlocking": true
+         }
+       }
+     }
+diff --git a/src/__tests__/CodexACPAgent/elicitation-events.test.ts b/src/__tests__/CodexACPAgent/elicitation-events.test.ts
+index b688266..a322c61 100644
+--- a/src/__tests__/CodexACPAgent/elicitation-events.test.ts
++++ b/src/__tests__/CodexACPAgent/elicitation-events.test.ts
+@@ -912,8 +912,8 @@ describe('Elicitation Events', () => {
+                         properties: {
+                             next_step: {
+                                 type: 'string',
+-                                title: 'What should I do next?',
+-                                description: 'Next step',
++                                title: 'Next step',
++                                description: 'What should I do next?',
+                                 oneOf: [
+                                     { const: 'Run tests', title: 'Run tests', description: 'Run the focused test suite.' },
+                                     { const: 'Stop', title: 'Stop', description: 'Stop and report current status.' },
+@@ -936,8 +936,8 @@ describe('Elicitation Events', () => {
+                             },
+                             notes: {
+                                 type: 'string',
+-                                title: 'Any extra instructions?',
+-                                description: 'Notes',
++                                title: 'Notes',
++                                description: 'Any extra instructions?',
+                                 _meta: {
+                                     codex: { isOther: false, isSecret: false },
+                                 },
+@@ -947,6 +947,7 @@ describe('Elicitation Events', () => {
+                     },
+                     _meta: {
+                         codex: { autoResolutionMs: 60000 },
++                        'zed.dev/codexQuestion': { isBlocking: true },
+                     },
+                 }],
+             }]);
+@@ -1122,7 +1123,7 @@ describe('Elicitation Events', () => {
+                 turnId: 'turn-1',
+                 itemId: 'request-user-input-1',
+                 autoResolutionMs: 1,
+-                isBlocking: true,
++                isBlocking: false,
+                 questions: [{
+                     id: 'next_step',
+                     header: 'Next step',
+@@ -1150,6 +1151,61 @@ describe('Elicitation Events', () => {
+             await promptPromise;
+         });
+ 
++        it('should wait for the user when a blocking question carries a legacy timeout', async () => {
++            const { promptPromise, completeTurn } = await setupSessionWithPendingPromptAndCapabilities({
++                elicitation: { form: {} },
++            });
++            let resolveResponse!: (response: acp.CreateElicitationResponse) => void;
++            fixture.setElicitationResponse(new Promise((resolve) => {
++                resolveResponse = resolve;
++            }));
++
++            const params: ToolRequestUserInputParams = {
++                threadId: sessionId,
++                turnId: 'turn-1',
++                itemId: 'request-user-input-1',
++                autoResolutionMs: 1,
++                isBlocking: true,
++                questions: [{
++                    id: 'next_step',
++                    header: 'Next step',
++                    question: 'What should I do next?',
++                    isOther: false,
++                    isSecret: false,
++                    options: null,
++                }],
++            };
++
++            const request = fixture.sendServerRequest('item/tool/requestUserInput', params);
++            let settled = false;
++            void request.then(() => {
++                settled = true;
++            });
++            await new Promise((resolve) => setTimeout(resolve, 20));
++            expect(settled).toBe(false);
++
++            resolveResponse({
++                action: 'accept',
++                content: { next_step: 'Wait for me' },
++            });
++            expect(await request).toEqual({
++                answers: { next_step: { answers: ['Wait for me'] } },
++            });
++
++            const [elicitationEvent] = fixture.getAcpConnectionEvents([]);
++            expect(elicitationEvent).toMatchObject({
++                method: 'createElicitation',
++                args: [{
++                    _meta: {
++                        'zed.dev/codexQuestion': { isBlocking: true },
++                    },
++                }],
++            });
++
++            completeTurn();
++            await promptPromise;
++        });
++
+         it('should not call ACP elicitation for request_user_input without form support', async () => {
+             const { promptPromise, completeTurn } = setupSessionWithPendingPrompt();
+ 
