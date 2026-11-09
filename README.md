@@ -14,6 +14,10 @@ Branch `decay/local` starts at official tag `v1.21.0` (33c95853ed2b6956f339733c6
 `upstream/main` is tracked for inspection, but stable releases are the default merge candidates.
 There is no automatic merge, installation, or background Windows service.
 
+Prebuilt Windows x64 packages are published at
+<https://github.com/KnightAnguish/zed-local/releases>. See [local/README.md](local/README.md)
+for the fork layout and the codex-acp patch.
+
 Build with `script/local-build.ps1`; generated artifacts and the Cargo cache stay in
 `%LOCALAPPDATA%/ZedLocalBuild` by default, or in the path passed as `-BuildRoot`.
 Run only with `script/local-run.ps1`, which requires an explicit
