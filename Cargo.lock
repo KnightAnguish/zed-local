@@ -1412,6 +1412,7 @@ dependencies = [
  "util",
  "which",
  "workspace",
+ "zed_local_installer",
  "zlog",
 ]
 
@@ -22724,6 +22725,20 @@ name = "zed_html"
 version = "0.3.2"
 dependencies = [
  "zed_extension_api 0.7.0",
+]
+
+[[package]]
+name = "zed_local_installer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "windows 0.62.2",
+ "zip",
 ]
 
 [[package]]

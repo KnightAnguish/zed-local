@@ -1,0 +1,34 @@
+[package]
+name = "zed_local_installer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "zed_local_launcher"
+path = "src/bin/launcher.rs"
+
+[[bin]]
+name = "zed_local_setup"
+path = "src/bin/setup.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+zip = "0.6.6"
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
