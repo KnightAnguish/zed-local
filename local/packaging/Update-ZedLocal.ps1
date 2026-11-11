@@ -66,7 +66,8 @@ try {
     if (-not $manifest.release -or -not $manifest.asset_url -or -not $manifest.sha256) {
         throw 'Release manifest is missing release, asset_url or sha256.'
     }
-    if ($manifest.asset_url -notmatch '^https://github\.com/KnightAnguish/zed-local/releases/download/') {
+    $isLocalManifest = $ManifestUrl -match '^https?://(127\.0\.0\.1|localhost)(:\d+)?/'
+    if (-not $isLocalManifest -and $manifest.asset_url -notmatch '^https://github\.com/KnightAnguish/zed-local/releases/download/') {
         throw "Unexpected update asset URL: $($manifest.asset_url)"
     }
     if ($manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
