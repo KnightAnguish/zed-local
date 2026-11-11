@@ -49,10 +49,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
-fn powershell_quote(path: impl AsRef<Path>) -> String {
-    path.as_ref().to_string_lossy().replace('\'', "''")
-}
-
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
     let os_release = match std::fs::read_to_string("/etc/os-release") {
@@ -963,23 +959,15 @@ impl AutoUpdater {
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
-            .context("ZedLocal update requires an installed build")?;
+            .context("ZedLocal update requires an installed build")?
+            .to_path_buf();
         anyhow::ensure!(
             install_root.join("install.json").is_file(),
             "ZedLocal update requires install.json in {}",
             install_root.display()
         );
-        let user_data = paths::data_dir();
-        let package_dir = installer_dir.path().join("package");
-        let install_script = package_dir.join("Install.ps1");
-        let command_line = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force; & '{}' -InstallRoot '{}' -UserData '{}' -Quiet",
-            powershell_quote(&target_path),
-            powershell_quote(&package_dir),
-            powershell_quote(&install_script),
-            powershell_quote(install_root),
-            powershell_quote(user_data),
-        );
+        let user_data = paths::data_dir().to_path_buf();
+        let package_path = target_path.clone();
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Installing {
@@ -988,20 +976,21 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let mut command = new_command("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            command_line.as_str(),
-        ]);
-        let output = command.output().await?;
-        anyhow::ensure!(
-            output.status.success(),
-            "ZedLocal installer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        cx.background_executor()
+            .spawn(async move {
+                zed_local_installer::install_from_zip(
+                    &package_path,
+                    zed_local_installer::InstallOptions {
+                        install_root,
+                        user_data,
+                        keep_builds: zed_local_installer::DEFAULT_KEEP_BUILDS,
+                        shortcuts: true,
+                        quiet: true,
+                    },
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("ZedLocal installer failed: {error:#}"))?;
         Ok(())
     }
 
