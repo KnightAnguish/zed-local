@@ -115,7 +115,7 @@ mod tests {
     fn messages(count: usize) -> Vec<HistoryMessage> {
         (0..count)
             .map(|index| HistoryMessage {
-                id: agent_client_protocol::schema::v1::MessageId::new(index.to_string()),
+                id: agent_client_protocol::v1::schema::MessageId::new(index.to_string()),
                 is_user: true,
                 content: vec![],
             })

@@ -1,5 +1,5 @@
 //! Translation at the UI boundary only; ACP is not used as a transport.
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v1::schema as acp;
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};

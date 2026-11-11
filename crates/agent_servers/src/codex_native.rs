@@ -15,7 +15,8 @@ use acp_thread::{
     PermissionOptions, RequestPermissionOutcome,
 };
 use action_log::ActionLog;
-use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
+use agent_client_protocol::v1::schema as acp;
+use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::{Context as _, Result, ensure};
 use events::{TurnEvents, text};
 use futures::channel::oneshot;

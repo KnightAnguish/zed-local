@@ -1,8 +1,8 @@
 use super::{Session, events::text, transport::Rpc};
 use acp_thread::SessionForkPoint;
 #[cfg(test)]
-use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::schema::v2 as acp_v2;
+use agent_client_protocol::v1::schema as acp;
+use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{

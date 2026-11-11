@@ -347,7 +347,6 @@ fn main() {
     let installation_id = app
         .background_executor()
         .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
-    let session_id = Uuid::new_v4().to_string();
     let background_executor = app.background_executor();
 
     let (open_listener, mut open_rx) = OpenListener::new();
@@ -380,6 +379,7 @@ fn main() {
 
     // Only the primary instance publishes its session ID. A rejected second
     // instance must not replace the restore point with a session that has no windows.
+    let session_id = Uuid::new_v4().to_string();
     let session = app.background_executor().spawn(Session::new(
         session_id.clone(),
         KeyValueStore::from_app_db(&app_db),
@@ -1457,7 +1457,12 @@ pub(crate) async fn restore_or_create_workspace(
                             connection_options,
                             paths,
                             app_state.clone(),
-                            workspace::OpenOptions::default(),
+                            workspace::OpenOptions {
+                                // Each saved window must retain its own project roots,
+                                // even when some roots also appear in another window.
+                                workspace_matching: workspace::WorkspaceMatching::None,
+                                ..Default::default()
+                            },
                             cx,
                         )
                         .await?;

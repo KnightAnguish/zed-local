@@ -21,7 +21,6 @@ mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
 mod message_editor;
-mod user_path_links;
 mod mode_selector;
 mod model_search;
 mod model_selector;
@@ -35,6 +34,7 @@ pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
+mod user_path_links;
 
 pub mod threads_archive_view;
 mod ui;
@@ -44,7 +44,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ::ui::IconName;
-use agent_client_protocol::schema::v2 as acp_v2;
+use agent_client_protocol::v2::schema as acp_v2;
 use agent_settings::{AgentProfileId, AgentSettings};
 use anyhow::Context as _;
 use command_palette_hooks::CommandPaletteFilter;

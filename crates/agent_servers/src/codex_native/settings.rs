@@ -1,5 +1,5 @@
 use super::transport::Rpc;
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{App, Task};
 use serde::Deserialize;

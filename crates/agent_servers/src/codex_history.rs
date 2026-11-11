@@ -1,6 +1,7 @@
 use crate::codex_framing;
 use acp_thread::{HistoryMessage, HistoryPage};
-use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
+use agent_client_protocol::v1::schema as acp;
+use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::{Context as _, Result, bail, ensure};
 use futures::{AsyncWriteExt as _, io::BufReader};
 use project::agent_server_store::AgentServerCommand;

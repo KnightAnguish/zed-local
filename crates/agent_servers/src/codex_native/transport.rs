@@ -388,7 +388,7 @@ mod tests {
             rpc.initialize().await.unwrap();
             let session = rpc.request("thread/start", json!({"cwd":directory,"ephemeral":true,"sandbox":"read-only","approvalPolicy":"on-request","baseInstructions":"This is a transport test. Follow the user instruction without using tools."})).await.unwrap();
             let id = session["thread"]["id"].as_str().unwrap().to_owned();
-            let blocks: Vec<agent_client_protocol::schema::v1::ContentBlock> = serde_json::from_value(json!([
+            let blocks: Vec<agent_client_protocol::v1::schema::ContentBlock> = serde_json::from_value(json!([
                 {"type":"text","text":"Reply with the attached marker only. Do not use tools or access files."},
                 {"type":"resource","resource":{"uri":"diagnostic://marker","text":"NATIVE_SMOKE_OK"}}
             ])).unwrap();
@@ -466,7 +466,7 @@ mod tests {
                 .await
                 .expect("initialize installed runtime");
             assert!(initialized["codexHome"].is_string());
-            let thread = agent_client_protocol::schema::v2::SessionId::new(thread);
+            let thread = agent_client_protocol::v2::schema::SessionId::new(thread);
             let (history, models, usage) = futures::join!(
                 crate::codex_history::request_turn_page(&thread, None, |params| rpc
                     .request("thread/turns/list", params)),

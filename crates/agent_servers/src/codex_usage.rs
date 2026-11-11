@@ -1,5 +1,5 @@
 use crate::codex_history::CodexHistory;
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use gpui::{App, AppContext as _, Task};
 use serde_json::Value;
 use std::{
