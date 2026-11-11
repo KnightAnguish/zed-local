@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$installRoot = Split-Path -Parent $PSScriptRoot
+$installRoot = $PSScriptRoot
 $installFile = Join-Path $installRoot 'install.json'
 $executable = $null
 $userData = $null
