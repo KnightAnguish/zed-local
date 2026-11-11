@@ -66,9 +66,7 @@ Copy-Item -LiteralPath (Join-Path $source 'LICENSE-GPL') -Destination (Join-Path
 Copy-Item -LiteralPath (Join-Path $source 'LICENSE-APACHE') -Destination (Join-Path $buildDir 'LICENSE-APACHE') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall.ps1') -Destination (Join-Path $installRoot 'Uninstall.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall.cmd') -Destination (Join-Path $installRoot 'Uninstall.cmd') -Force
-foreach ($file in @('Launch-ZedLocal.ps1', 'Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update.cmd')) {
-    Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installRoot $file) -Force
-}
+Copy-Item -LiteralPath (Join-Path $source 'ZedLocalLauncher.exe') -Destination (Join-Path $installRoot 'ZedLocalLauncher.exe') -Force
 
 function Remove-OldBuilds {
     $buildsRoot = Join-Path $installRoot 'builds'
@@ -121,7 +119,7 @@ $installInfo = [pscustomobject]@{
 $installInfo | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $installRoot 'install.json')
 Remove-OldBuilds
 
-$launcher = Join-Path $installRoot 'ZedLocalLauncher.vbs'
+$launcher = Join-Path $installRoot 'ZedLocalLauncher.exe'
 
 function Set-ZedShortcut([string]$Path) {
     $parent = Split-Path -Parent $Path
@@ -129,13 +127,14 @@ function Set-ZedShortcut([string]$Path) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($Path)
     if (Test-Path -LiteralPath $launcher) {
-        $shortcut.TargetPath = Join-Path $env:WINDIR 'System32\wscript.exe'
-        $shortcut.Arguments = '"' + $launcher + '"'
+        $shortcut.TargetPath = $launcher
+        $shortcut.Arguments = ''
+        $shortcut.WorkingDirectory = $installRoot
     } else {
         $shortcut.TargetPath = $exe
         $shortcut.Arguments = '--user-data-dir "' + $userData + '"'
+        $shortcut.WorkingDirectory = $buildDir
     }
-    $shortcut.WorkingDirectory = $buildDir
     $shortcut.IconLocation = $exe + ',0'
     $shortcut.Description = 'Zed Local ' + $manifest.version
     $shortcut.Save()
