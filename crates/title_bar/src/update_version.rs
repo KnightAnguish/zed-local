@@ -133,11 +133,26 @@ impl Render for UpdateVersion {
         }
         match &self.status {
             AutoUpdateStatus::Available { version } => {
+                let is_fork = AutoUpdater::is_local_fork();
                 let url = format!("https://zed.dev/releases/stable/{version}");
-                UpdateButton::new(IconName::Download, format!("Zed {version} available"))
-                    .tooltip("Official stable release available. Review and merge into Zed Local; this build will not be overwritten.")
+                let button = if is_fork {
+                    UpdateButton::new(
+                        IconName::Download,
+                        format!("ZedLocal {version} available"),
+                    )
+                    .tooltip("Download and install this ZedLocal release; it applies after a restart.")
+                    .on_click(move |_, _, cx| {
+                        if let Some(auto_updater) = AutoUpdater::get(cx) {
+                            auto_updater.update(cx, |updater, cx| updater.download_fork_update(cx));
+                        }
+                    })
+                } else {
+                    UpdateButton::new(IconName::Download, format!("Zed {version} available"))
+                        .tooltip("Official stable release available. Review and merge into Zed Local; this build will not be overwritten.")
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                };
+                button
                     .with_dismiss()
-                    .on_click(move |_, _, cx| cx.open_url(&url))
                     .on_dismiss(cx.listener(|this, _, _window, cx| this.dismiss(cx)))
                     .into_any_element()
             }
