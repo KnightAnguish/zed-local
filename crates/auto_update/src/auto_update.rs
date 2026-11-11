@@ -12,6 +12,7 @@ use release_channel::{AppCommitSha, ReleaseChannel};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings, SettingsStore};
+use sha2::{Digest, Sha256};
 use smol::fs::File;
 use smol::{
     fs,
@@ -47,6 +48,10 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+
+fn powershell_quote(path: impl AsRef<Path>) -> String {
+    path.as_ref().to_string_lossy().replace('\'', "''")
+}
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -195,12 +200,23 @@ pub struct AutoUpdater {
     update_check_type: UpdateCheckType,
     _wake_subscription: gpui::Subscription,
     dismissed_status: Option<AutoUpdateStatus>,
+    fork_release: Option<ForkRelease>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ForkRelease {
+    release: String,
+    version: String,
+    asset_url: String,
+    sha256: String,
+    #[serde(default)]
+    published_at: Option<String>,
 }
 
 struct MacOsUnmounter<'a> {
@@ -443,6 +459,10 @@ impl AutoUpdater {
         cx.default_global::<GlobalAutoUpdate>().0.clone()
     }
 
+    pub fn is_local_fork() -> bool {
+        paths::IS_LOCAL_FORK
+    }
+
     fn new(current_version: Version, client: Arc<Client>, cx: &mut Context<Self>) -> Self {
         // On windows, executable files cannot be overwritten while they are
         // running, so we must wait to overwrite the application until quitting
@@ -482,6 +502,7 @@ impl AutoUpdater {
             update_check_type: UpdateCheckType::Automatic,
             _wake_subscription: wake_subscription,
             dismissed_status: None,
+            fork_release: None,
         }
     }
 
@@ -759,7 +780,235 @@ impl AutoUpdater {
         })
     }
 
+    fn installed_release() -> Option<(Option<String>, Option<String>)> {
+        let current_exe = std::env::current_exe().ok()?;
+        let install_root = current_exe.parent()?.parent()?.parent()?;
+        let text = std::fs::read_to_string(install_root.join("install.json")).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some((
+            value
+                .get("release")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            value
+                .get("published_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ))
+    }
+
+    async fn get_fork_release(this: &Entity<Self>, cx: &mut AsyncApp) -> Result<ForkRelease> {
+        let client = this.read_with(cx, |this, _| this.client.clone());
+        let url = "https://github.com/KnightAnguish/zed-local/releases/latest/download/latest.json";
+        let mut response = client
+            .http_client()
+            .get(url, Default::default(), true)
+            .await?;
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "failed to fetch ZedLocal release: {:?}",
+            String::from_utf8_lossy(&body),
+        );
+        let release: ForkRelease = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "error deserializing ZedLocal release {:?}",
+                String::from_utf8_lossy(&body),
+            )
+        })?;
+        anyhow::ensure!(
+            release
+                .asset_url
+                .starts_with("https://github.com/KnightAnguish/zed-local/releases/download/"),
+            "unexpected ZedLocal update URL: {}",
+            release.asset_url
+        );
+        Ok(release)
+    }
+
+    async fn update_fork(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        let (current_version, previous_status, check_type) = this.read_with(cx, |this, _| {
+            (
+                this.current_version.clone(),
+                this.status.clone(),
+                this.update_check_type,
+            )
+        });
+        if matches!(previous_status, AutoUpdateStatus::Updated { .. }) {
+            return Ok(());
+        }
+
+        this.update(cx, |this, cx| {
+            this.status = AutoUpdateStatus::Checking;
+            cx.notify();
+        });
+
+        let release = Self::get_fork_release(&this, cx).await?;
+        let version: Version = release.version.parse()?;
+        let installed_release = Self::installed_release();
+        let same_release = installed_release
+            .as_ref()
+            .and_then(|(release, _)| release.as_deref())
+            .is_some_and(|installed| installed == release.release);
+        let not_newer = installed_release
+            .as_ref()
+            .and_then(|(_, published_at)| published_at.as_deref())
+            .zip(release.published_at.as_deref())
+            .is_some_and(|(installed, latest)| latest <= installed);
+        if same_release || not_newer || version == current_version {
+            this.update(cx, |this, cx| {
+                this.fork_release = None;
+                this.status = AutoUpdateStatus::Idle;
+                if check_type.is_manual() {
+                    cx.emit(AutoUpdateEvent::UpToDate);
+                }
+                cx.notify();
+            });
+            return Ok(());
+        }
+
+        log::info!(
+            "ZedLocal update available: {} (current {})",
+            release.release,
+            current_version
+        );
+        this.update(cx, |this, cx| {
+            this.fork_release = Some(release);
+            this.status = AutoUpdateStatus::Available { version };
+            cx.notify();
+        });
+        Ok(())
+    }
+
+    pub fn download_fork_update(&mut self, cx: &mut Context<Self>) {
+        let Some(release) = self.fork_release.clone() else {
+            return;
+        };
+        let AutoUpdateStatus::Available { version } = self.status.clone() else {
+            return;
+        };
+        self.status = AutoUpdateStatus::Downloading {
+            version: version.clone(),
+            progress: None,
+        };
+        cx.notify();
+
+        let updater = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = Self::install_fork_release(updater.clone(), release, cx).await;
+            updater.update(cx, |this, cx| {
+                this.status = match result {
+                    Ok(()) => AutoUpdateStatus::Updated { version },
+                    Err(error) => AutoUpdateStatus::Errored {
+                        error: Arc::new(error),
+                    },
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    async fn install_fork_release(
+        this: Entity<Self>,
+        release: ForkRelease,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let version: Version = release.version.parse()?;
+        let client = this.read_with(cx, |this, _| this.client.http_client());
+        let installer_dir = InstallerDir::new()
+            .await
+            .context("Failed to create ZedLocal installer directory")?;
+        let target_path = installer_dir.path().join("ZedLocal.zip");
+
+        let progress_entity = this.clone();
+        let mut progress_cx = cx.clone();
+        download_release(
+            &target_path,
+            ReleaseAsset {
+                version: version.to_string(),
+                url: release.asset_url.clone(),
+            },
+            client,
+            move |progress| {
+                progress_entity.update(&mut progress_cx, |this, cx| {
+                    if let AutoUpdateStatus::Downloading {
+                        progress: current_progress,
+                        ..
+                    } = &mut this.status
+                    {
+                        *current_progress = progress;
+                        cx.notify();
+                    }
+                });
+            },
+        )
+        .await
+        .context("Failed to download ZedLocal update")?;
+
+        let bytes = fs::read(&target_path).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_hash = format!("{:x}", hasher.finalize());
+        anyhow::ensure!(
+            actual_hash.eq_ignore_ascii_case(&release.sha256),
+            "ZedLocal update SHA256 mismatch: expected {}, got {}",
+            release.sha256,
+            actual_hash
+        );
+
+        let current_exe = std::env::current_exe()?;
+        let install_root = current_exe
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("ZedLocal update requires an installed build")?;
+        anyhow::ensure!(
+            install_root.join("install.json").is_file(),
+            "ZedLocal update requires install.json in {}",
+            install_root.display()
+        );
+        let user_data = paths::data_dir();
+        let package_dir = installer_dir.path().join("package");
+        let install_script = package_dir.join("Install.ps1");
+        let command_line = format!(
+            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force; & '{}' -InstallRoot '{}' -UserData '{}' -Quiet",
+            powershell_quote(&target_path),
+            powershell_quote(&package_dir),
+            powershell_quote(&install_script),
+            powershell_quote(install_root),
+            powershell_quote(user_data),
+        );
+
+        this.update(cx, |this, cx| {
+            this.status = AutoUpdateStatus::Installing {
+                version: version.clone(),
+            };
+            cx.notify();
+        });
+
+        let mut command = new_command("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command_line.as_str(),
+        ]);
+        let output = command.output().await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "ZedLocal installer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        if paths::IS_LOCAL_FORK {
+            return Self::update_fork(this, cx).await;
+        }
         let (client, installed_version, previous_status, release_channel, notification_only) = this
             .read_with(cx, |this, cx| {
                 (
@@ -1427,7 +1676,7 @@ mod tests {
     impl Global for InstallOverride {}
 
     #[gpui::test]
-    async fn test_local_fork_checks_stable_without_downloading(cx: &mut TestAppContext) {
+    async fn test_local_fork_checks_fork_release_without_downloading(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let updater = cx.update(|cx| {
@@ -1439,11 +1688,13 @@ mod tests {
                 requests.fetch_add(1, atomic::Ordering::SeqCst);
                 async move {
                     anyhow::ensure!(
-                        request.uri().path() == "/releases/stable/latest/asset",
-                        "Notification-only updater attempted a download"
+                        request.uri().path()
+                            == "/KnightAnguish/zed-local/releases/latest/download/latest.json",
+                        "Unexpected fork release request: {}",
+                        request.uri()
                     );
                     Ok(Response::builder().status(200).body(
-                        r#"{"version":"1.21.1","url":"https://test.example/must-not-download"}"#
+                        r#"{"release":"v1.21.1","version":"1.21.1","asset_url":"https://github.com/KnightAnguish/zed-local/releases/download/v1.21.1/test.zip","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#
                             .into(),
                     )?)
                 }
@@ -1468,7 +1719,7 @@ mod tests {
         );
         assert!(
             !status.is_updated(),
-            "An available upstream release is not installed"
+            "An available fork release is not installed"
         );
     }
 
