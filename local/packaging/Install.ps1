@@ -2,7 +2,8 @@ param(
     [switch]$Quiet,
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\ZedLocal'),
     [string]$UserData = (Join-Path $env:LOCALAPPDATA 'ZedLocal\UserData'),
-    [switch]$NoShortcuts
+    [switch]$NoShortcuts,
+    [ValidateRange(1, 20)][int]$KeepBuilds = 2
 )
 $ErrorActionPreference = 'Stop'
 
@@ -19,6 +20,18 @@ $installRoot = [IO.Path]::GetFullPath($InstallRoot)
 $userData = [IO.Path]::GetFullPath($UserData)
 $buildDir = Join-Path $installRoot ('builds\' + $manifest.build)
 $exe = Join-Path $buildDir 'zedlocal.exe'
+$previousBuildDir = $null
+$priorInstallFile = Join-Path $installRoot 'install.json'
+if (Test-Path -LiteralPath $priorInstallFile) {
+    try {
+        $priorInstall = Get-Content -Raw -Encoding UTF8 -LiteralPath $priorInstallFile | ConvertFrom-Json
+        if ($priorInstall.install_dir) {
+            $previousBuildDir = [IO.Path]::GetFullPath($priorInstall.install_dir)
+        }
+    } catch {
+        Write-Warning "Could not read the previous install state: $($_.Exception.Message)"
+    }
+}
 
 foreach ($file in $manifest.files) {
     $path = Join-Path $source $file.path
@@ -57,6 +70,43 @@ foreach ($file in @('Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installRoot $file) -Force
 }
 
+function Remove-OldBuilds {
+    $buildsRoot = Join-Path $installRoot 'builds'
+    if (-not (Test-Path -LiteralPath $buildsRoot)) { return }
+    $keep = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    [void]$keep.Add([IO.Path]::GetFullPath($buildDir))
+    if ($previousBuildDir) { [void]$keep.Add([IO.Path]::GetFullPath($previousBuildDir)) }
+    Get-Process zedlocal -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $dir = Split-Path -Parent ([IO.Path]::GetFullPath($_.Path))
+            if ($dir) { [void]$keep.Add($dir) }
+        } catch {}
+    }
+    $logRoot = Join-Path $env:LOCALAPPDATA 'ZedLocal\updates'
+    New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+    $log = Join-Path $logRoot 'cleanup.log'
+    $kept = 0
+    $candidates = Get-ChildItem -LiteralPath $buildsRoot -Directory | Sort-Object LastWriteTime -Descending
+    foreach ($candidate in $candidates) {
+        $full = [IO.Path]::GetFullPath($candidate.FullName)
+        if ($keep.Contains($full)) {
+            $kept++
+            continue
+        }
+        if ($kept -lt $KeepBuilds) {
+            [void]$keep.Add($full)
+            $kept++
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+            Add-Content -LiteralPath $log -Value ('{0} removed {1}' -f (Get-Date).ToUniversalTime().ToString('o'), $full) -Encoding UTF8
+        } catch {
+            Add-Content -LiteralPath $log -Value ('{0} kept {1}: {2}' -f (Get-Date).ToUniversalTime().ToString('o'), $full, $_.Exception.Message) -Encoding UTF8
+        }
+    }
+}
+
 $installInfo = [pscustomobject]@{
     product = 'Zed Local'
     version = $manifest.version
@@ -69,6 +119,7 @@ $installInfo = [pscustomobject]@{
     user_data = $userData
 } | ConvertTo-Json -Depth 4
 $installInfo | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $installRoot 'install.json')
+Remove-OldBuilds
 
 $launcher = Join-Path $installRoot 'ZedLocalLauncher.vbs'
 
