@@ -66,7 +66,7 @@ Copy-Item -LiteralPath (Join-Path $source 'LICENSE-GPL') -Destination (Join-Path
 Copy-Item -LiteralPath (Join-Path $source 'LICENSE-APACHE') -Destination (Join-Path $buildDir 'LICENSE-APACHE') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall.ps1') -Destination (Join-Path $installRoot 'Uninstall.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall.cmd') -Destination (Join-Path $installRoot 'Uninstall.cmd') -Force
-foreach ($file in @('Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update.cmd')) {
+foreach ($file in @('Launch-ZedLocal.ps1', 'Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update.cmd')) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installRoot $file) -Force
 }
 

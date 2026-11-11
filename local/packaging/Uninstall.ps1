@@ -47,7 +47,7 @@ if (Test-Path -LiteralPath $installRoot) {
         }
     }
     try {
-        foreach ($name in @('install.json', 'Uninstall.ps1', 'Uninstall.cmd', 'Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update.cmd')) {
+        foreach ($name in @('install.json', 'Uninstall.ps1', 'Uninstall.cmd', 'Launch-ZedLocal.ps1', 'Update-ZedLocal.ps1', 'ZedLocalLauncher.vbs', 'Check-Update.cmd')) {
             Remove-Item -LiteralPath (Join-Path $installRoot $name) -Force -ErrorAction SilentlyContinue
         }
         if (-not (Get-ChildItem -LiteralPath $installRoot -Force)) {
