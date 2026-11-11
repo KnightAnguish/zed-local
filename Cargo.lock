@@ -22736,6 +22736,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo 0.39.6",
  "tempfile",
  "windows 0.62.2",
  "zip",

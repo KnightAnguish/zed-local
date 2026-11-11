@@ -418,11 +418,12 @@ fn prune_builds(
             keep_paths.push(previous.to_path_buf());
         }
     }
+    keep_paths.extend(running_build_dirs());
 
     let mut kept = 0;
     let mut removed = Vec::new();
     for candidate in candidates {
-        if keep_paths.iter().any(|path| path == &candidate) {
+        if keep_paths.iter().any(|path| same_path(path, &candidate)) {
             kept += 1;
             continue;
         }
@@ -465,6 +466,34 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn running_build_dirs() -> Vec<PathBuf> {
+    let system = sysinfo::System::new_all();
+    system
+        .processes()
+        .values()
+        .filter(|process| {
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(ZED_EXE)
+        })
+        .filter_map(|process| {
+            process
+                .exe()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -735,6 +764,59 @@ mod tests {
         assert!(builds.join("build-three").is_dir());
         assert!(builds.join("build-two").is_dir());
         assert!(!builds.join("build-one").exists());
+    }
+
+    #[test]
+    fn installs_from_a_zip() {
+        let temp = TempDir::new().unwrap();
+        let package_dir = temp.path().join("package");
+        fs::create_dir_all(&package_dir).unwrap();
+        let manifest = package(&package_dir, "zip-build");
+        let zip_path = temp.path().join("package.zip");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::default();
+            add_zip(&mut writer, &package_dir, &package_dir, options).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let report = install_from_zip(
+            &zip_path,
+            InstallOptions {
+                install_root: temp.path().join("install"),
+                user_data: temp.path().join("user"),
+                keep_builds: 2,
+                shortcuts: false,
+                quiet: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.build, manifest.build);
+        assert!(report.build_dir.join(ZED_EXE).is_file());
+        assert!(!temp.path().join("install").join("updates").join("staging").exists());
+    }
+
+    fn add_zip(
+        writer: &mut zip::ZipWriter<File>,
+        root: &Path,
+        current: &Path,
+        options: zip::write::FileOptions,
+    ) -> Result<()> {
+        for entry in fs::read_dir(current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                add_zip(writer, root, &path, options)?;
+            } else {
+                let relative = path
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                writer.start_file(relative, options)?;
+                writer.write_all(&fs::read(&path)?)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
