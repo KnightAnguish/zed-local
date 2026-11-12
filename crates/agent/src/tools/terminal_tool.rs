@@ -2,7 +2,7 @@ use acp_thread::ProcessOutput;
 use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::Result;
 use futures::FutureExt as _;
-use gpui::{App, AsyncApp, Entity, SharedString, Task};
+use gpui::{App, AsyncApp, Entity, SharedString, Task, WeakEntity};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,14 +13,16 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use uuid::Uuid;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::SandboxFallbackDecision;
+use crate::harness::{ShellJob, ShellJobId, ShellJobStatus};
 use crate::sandboxing::{
     NetworkRequest, sandbox_git_dirs, sandbox_worktree_writable_paths,
     sandboxing_enabled_for_project,
 };
-use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 
@@ -36,9 +38,9 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// For commands that run indefinitely — servers (like `npm run start`, `npm run dev`, `python -m http.server`), watchers, or long builds — set `background: true`. The tool returns immediately with a `shell_id`; continue other work and call `terminal` with that `shell_id` when you need the output. Do not poll repeatedly.
 ///
-/// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
+/// For potentially long-running commands that should still block, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
 /// Remember that each invocation of this tool will spawn a new shell process, so you can't rely on any state from previous invocations.
 ///
@@ -53,8 +55,10 @@ pub struct TerminalToolInput {
     /// The one-liner command to execute. Do not include shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`; resolve those values first or ask the user for the literal value to use.
     ///
     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+    #[serde(default)]
     pub command: String,
     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
+    #[serde(default)]
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
     pub timeout_ms: Option<u64>,
@@ -64,6 +68,15 @@ pub struct TerminalToolInput {
     /// Return only the last N lines of terminal output to the model after the command finishes. Do not pipe output to `tail`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    /// Run the command in the background and return immediately with a `shell_id`. Use this for dev servers, watchers, and long builds. Continue other work instead of polling; call `terminal` with `shell_id` when you need the output.
+    #[serde(default)]
+    pub background: bool,
+    /// Existing background job id. When set, `command` and `cd` are ignored and the tool returns the job's current output and status.
+    #[serde(default)]
+    pub shell_id: Option<String>,
+    /// Kill the background job identified by `shell_id`.
+    #[serde(default)]
+    pub kill: bool,
 }
 
 /// Executes a shell one-liner and returns the combined output.
@@ -78,9 +91,9 @@ pub struct TerminalToolInput {
 ///
 /// Do not pipe output to `head`, `tail`, or similar output-filtering commands just to reduce what you receive. Instead, use `head_lines` and/or `tail_lines`; this keeps the terminal output visible to the user in real time while limiting only the final output sent back to you. When both are specified, the first `head_lines` lines are returned, then a blank line, then the last `tail_lines` lines. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
 ///
-/// Do not use this tool for commands that run indefinitely, such as servers (like `npm run start`, `npm run dev`, `python -m http.server`, etc) or file watchers that don't terminate on their own.
+/// For commands that run indefinitely — servers (like `npm run start`, `npm run dev`, `python -m http.server`), watchers, or long builds — set `background: true`. The tool returns immediately with a `shell_id`; continue other work and call `terminal` with that `shell_id` when you need the output. Do not poll repeatedly.
 ///
-/// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
+/// For potentially long-running commands that should still block, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
 /// Remember that each invocation of this tool will spawn a new shell process, so you can't rely on any state from previous invocations.
 ///
@@ -106,6 +119,15 @@ pub struct SandboxedTerminalToolInput {
     /// Return only the last N lines of terminal output to the model after the command finishes. Do not pipe output to `tail`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
     pub tail_lines: Option<usize>,
+    /// Run the command in the background and return immediately with a `shell_id`. Use this for dev servers, watchers, and long builds. Continue other work instead of polling; call `terminal` with `shell_id` when you need the output.
+    #[serde(default)]
+    pub background: bool,
+    /// Existing background job id. When set, `command` and `cd` are ignored and the tool returns the job's current output and status.
+    #[serde(default)]
+    pub shell_id: Option<String>,
+    /// Kill the background job identified by `shell_id`.
+    #[serde(default)]
+    pub kill: bool,
     /// Hosts the command needs outbound network access to.
     ///
     /// Sandboxed commands cannot reach the network by default. List the hosts
@@ -224,6 +246,9 @@ struct TerminalToolRequest {
     timeout_ms: Option<u64>,
     selection: TerminalOutputSelection,
     sandbox: Option<TerminalSandboxInput>,
+    background: bool,
+    shell_id: Option<String>,
+    kill: bool,
 }
 
 impl From<TerminalToolInput> for TerminalToolRequest {
@@ -237,6 +262,9 @@ impl From<TerminalToolInput> for TerminalToolRequest {
                 tail_lines: input.tail_lines,
             },
             sandbox: None,
+            background: input.background,
+            shell_id: input.shell_id,
+            kill: input.kill,
         }
     }
 }
@@ -259,6 +287,9 @@ impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
                 unsandboxed: input.unsandboxed,
                 reason: input.reason,
             }),
+            background: input.background,
+            shell_id: input.shell_id,
+            kill: input.kill,
         }
     }
 }
@@ -266,6 +297,7 @@ impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
 pub struct TerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    thread: Option<WeakEntity<Thread>>,
 }
 
 impl TerminalTool {
@@ -273,13 +305,20 @@ impl TerminalTool {
         Self {
             project,
             environment,
+            thread: None,
         }
+    }
+
+    pub fn with_thread(mut self, thread: WeakEntity<Thread>) -> Self {
+        self.thread = Some(thread);
+        self
     }
 }
 
 pub struct SandboxedTerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    thread: Option<WeakEntity<Thread>>,
 }
 
 impl SandboxedTerminalTool {
@@ -287,7 +326,13 @@ impl SandboxedTerminalTool {
         Self {
             project,
             environment,
+            thread: None,
         }
+    }
+
+    pub fn with_thread(mut self, thread: WeakEntity<Thread>) -> Self {
+        self.thread = Some(thread);
+        self
     }
 }
 
@@ -324,6 +369,7 @@ impl AgentTool for TerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.thread.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -366,6 +412,7 @@ impl AgentTool for SandboxedTerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.thread.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -414,15 +461,82 @@ fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
     None
 }
 
+fn shell_job_status(
+    thread: Option<&WeakEntity<Thread>>,
+    shell_id: &str,
+    kill: bool,
+    selection: TerminalOutputSelection,
+    cx: &mut AsyncApp,
+) -> Result<String, String> {
+    let thread = thread
+        .ok_or_else(|| "Background shell jobs are unavailable in this context.".to_string())?;
+    let job_id = ShellJobId::new(shell_id);
+    let job = thread
+        .read_with(cx, |thread, _| {
+            thread.harness().shell_jobs().get(&job_id).cloned()
+        })
+        .map_err(|_| "The thread that owns this shell job is no longer available.".to_string())?
+        .ok_or_else(|| format!("Unknown background shell job: {shell_id}"))?;
+
+    if kill {
+        let handle = job.handle.as_ref().ok_or_else(|| {
+            format!("Background shell job {shell_id} has no live process handle.")
+        })?;
+        handle.kill(cx).map_err(|error| error.to_string())?;
+        thread
+            .update(cx, |thread, _| {
+                thread
+                    .harness_mut()
+                    .shell_jobs_mut()
+                    .set_status(&job_id, ShellJobStatus::Cancelled);
+            })
+            .map_err(|_| {
+                "The thread that owns this shell job is no longer available.".to_string()
+            })?;
+        return Ok(format!("Background shell job {shell_id} cancelled."));
+    }
+
+    let handle = job
+        .handle
+        .as_ref()
+        .ok_or_else(|| format!("Background shell job {shell_id} has no live process handle."))?;
+    let output = handle
+        .current_output(cx)
+        .map_err(|error| error.to_string())?;
+    let user_stopped = handle.was_stopped_by_user(cx).unwrap_or(false);
+    let content = process_content(output, &job.command, false, user_stopped, selection);
+    let status = match job.status {
+        ShellJobStatus::Running => "running".to_string(),
+        ShellJobStatus::Completed { exit } => match exit {
+            Some(exit) => format!("completed with exit code {exit}"),
+            None => "completed".to_string(),
+        },
+        ShellJobStatus::Failed => "failed".to_string(),
+        ShellJobStatus::Cancelled => "cancelled".to_string(),
+        ShellJobStatus::Interrupted => "interrupted".to_string(),
+    };
+    Ok(format!(
+        "Background shell job {shell_id} is {status}.\n\n{content}"
+    ))
+}
+
 async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    thread: Option<WeakEntity<Thread>>,
     input: TerminalToolRequest,
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
+
+    if let Some(shell_id) = input.shell_id.as_deref() {
+        return shell_job_status(thread.as_ref(), shell_id, input.kill, selection, cx);
+    }
+    if input.background && thread.is_none() {
+        return Err("Background shell jobs are unavailable in this context.".to_string());
+    }
 
     let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
         cx.update(|cx| {
@@ -991,6 +1105,128 @@ async fn run_terminal_tool(
             None => update,
         }
     });
+
+    if input.background {
+        let thread = thread
+            .ok_or_else(|| "Background shell jobs are unavailable in this context.".to_string())?;
+        let (background_enabled, max_jobs, running_jobs) = thread
+            .read_with(cx, |thread, _| {
+                let settings = thread.harness().settings();
+                (
+                    settings.background_shell,
+                    settings.max_background_jobs,
+                    thread.harness().shell_jobs().running_count(),
+                )
+            })
+            .map_err(|_| {
+                "The thread that owns this shell job is no longer available.".to_string()
+            })?;
+        if !background_enabled {
+            return Err(
+                "Background shell jobs are disabled for this thread. Run the command in the foreground instead."
+                    .to_string(),
+            );
+        }
+        if running_jobs >= max_jobs {
+            return Err(format!(
+                "Too many background shell jobs are already running ({running_jobs}/{max_jobs}). Wait for one to finish or kill it before starting another."
+            ));
+        }
+
+        let thread_id = thread
+            .read_with(cx, |thread, _| thread.id().to_string())
+            .map_err(|_| {
+                "The thread that owns this shell job is no longer available.".to_string()
+            })?;
+        let job_id = ShellJobId::new(Uuid::new_v4().to_string());
+        let output_path = std::env::temp_dir()
+            .join("zed-agent-jobs")
+            .join(thread_id)
+            .join(format!("{job_id}.log"));
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+
+        thread
+            .update(cx, |thread, cx| {
+                let mut job = ShellJob::new(
+                    job_id.clone(),
+                    input.command.clone(),
+                    working_dir.clone(),
+                    output_path.clone(),
+                    input.timeout_ms.map(Duration::from_millis),
+                );
+                job.set_handle(terminal.clone());
+                thread.harness_mut().shell_jobs_mut().insert(job);
+                cx.notify();
+            })
+            .map_err(|_| {
+                "The thread that owns this shell job is no longer available.".to_string()
+            })?;
+
+        let wait = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
+        let handle = terminal.clone();
+        let thread_for_job = thread.clone();
+        let job_id_for_job = job_id.clone();
+        let output_path_for_job = output_path.clone();
+        let environment_for_job = environment.clone();
+        let command_for_job = input.command.clone();
+        cx.spawn(async move |cx| {
+            let exit = wait.await.exit_code.map(|code| code as i32);
+            let stopped = handle.was_stopped_by_user(cx).unwrap_or(false);
+            let output_text = match handle.current_output(cx) {
+                Ok(output) => {
+                    let _ = std::fs::write(&output_path_for_job, &output.output);
+                    output.output
+                }
+                Err(_) => String::new(),
+            };
+            let status = if stopped {
+                ShellJobStatus::Cancelled
+            } else {
+                match exit {
+                    Some(exit) => ShellJobStatus::Completed { exit: Some(exit) },
+                    None => ShellJobStatus::Failed,
+                }
+            };
+            let _ = thread_for_job.update(cx, |thread, _| {
+                thread
+                    .harness_mut()
+                    .shell_jobs_mut()
+                    .set_status(&job_id_for_job, status);
+            });
+            if !stopped {
+                // Wait for the current turn to finish before injecting the
+                // result. Starting a follow-up while the agent is still
+                // working would cancel its in-flight tool calls.
+                loop {
+                    match thread_for_job.read_with(cx, |thread, _| thread.is_turn_running()) {
+                        Ok(true) => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(500))
+                                .await;
+                        }
+                        _ => break,
+                    }
+                }
+                environment_for_job.notify_background_shell_completed(
+                    &job_id_for_job,
+                    &command_for_job,
+                    exit,
+                    &output_text,
+                    cx,
+                );
+            }
+        })
+        .detach();
+
+        return Ok(format!(
+            "Command moved to the background (shell_id: {job_id}).\n\
+             Output is streaming to: {}\n\
+             Continue with other work. To check progress or get the result, call `terminal` with shell_id \"{job_id}\". Do not poll repeatedly.",
+            output_path.display()
+        ));
+    }
 
     let timeout = input.timeout_ms.map(Duration::from_millis);
 
@@ -2473,6 +2709,7 @@ mod tests {
                     timeout_ms: None,
                     head_lines: Some(1),
                     tail_lines: Some(1),
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -3274,6 +3511,36 @@ mod tests {
             schema.contains("unsandboxed"),
             "schema should advertise unsandboxed: {schema}"
         );
+    }
+
+    #[test]
+    fn test_background_fields_deserialize_and_default() {
+        let input: TerminalToolInput = serde_json::from_value(serde_json::json!({
+            "command": "npm run dev",
+            "cd": ".",
+            "background": true,
+        }))
+        .expect("background input should deserialize");
+        assert!(input.background);
+        assert_eq!(input.shell_id, None);
+        assert!(!input.kill);
+
+        let query: TerminalToolInput = serde_json::from_value(serde_json::json!({
+            "shell_id": "job-1",
+        }))
+        .expect("shell_id-only query should deserialize");
+        assert_eq!(query.shell_id.as_deref(), Some("job-1"));
+        assert_eq!(query.command, "");
+        assert_eq!(query.cd, "");
+
+        let schema = serde_json::to_string(&schemars::schema_for!(TerminalToolInput))
+            .expect("input schema should serialize");
+        for field in ["background", "shell_id", "kill"] {
+            assert!(
+                schema.contains(field),
+                "schema should advertise {field}: {schema}"
+            );
+        }
     }
 
     #[test]

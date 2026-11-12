@@ -11,7 +11,7 @@ use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
-use crate::harness::Harness;
+use crate::harness::{Harness, ShellJobId};
 
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
@@ -801,6 +801,18 @@ pub trait ThreadEnvironment {
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
+
+    /// Called when a background shell job finishes. Implementations may wake
+    /// the agent with the result; the default does nothing.
+    fn notify_background_shell_completed(
+        &self,
+        _job_id: &ShellJobId,
+        _command: &str,
+        _exit: Option<i32>,
+        _output: &str,
+        _cx: &mut AsyncApp,
+    ) {
+    }
 
     fn create_subagent(
         &self,
@@ -2285,11 +2297,14 @@ impl Thread {
         ));
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
-        self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
-        self.add_tool(SandboxedTerminalTool::new(
-            self.project.clone(),
-            environment.clone(),
-        ));
+        self.add_tool(
+            TerminalTool::new(self.project.clone(), environment.clone())
+                .with_thread(cx.weak_entity()),
+        );
+        self.add_tool(
+            SandboxedTerminalTool::new(self.project.clone(), environment.clone())
+                .with_thread(cx.weak_entity()),
+        );
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
@@ -4528,6 +4543,10 @@ impl Thread {
         self.running_turn
             .as_ref()
             .is_some_and(|turn| turn.tools.contains_key(name))
+    }
+
+    pub(crate) fn is_turn_running(&self) -> bool {
+        self.running_turn.is_some()
     }
 
     #[cfg(any(test, feature = "test-support"))]

@@ -1,10 +1,14 @@
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::TerminalHandle;
 
 /// Stable identifier for one background shell job.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,9 +56,9 @@ impl ShellJobStatus {
 
 /// Bookkeeping for a background shell job.
 ///
-/// Phase 0 only stores metadata. The terminal handle and completion callback
-/// are added when the `terminal` tool gains background mode.
-#[derive(Clone, Debug)]
+/// The terminal handle is stored so the `terminal` tool can return current
+/// output or kill the job later in the same thread.
+#[derive(Clone)]
 pub struct ShellJob {
     pub id: ShellJobId,
     pub command: String,
@@ -63,6 +67,23 @@ pub struct ShellJob {
     pub status: ShellJobStatus,
     pub started_at: Instant,
     pub timeout: Option<Duration>,
+    pub handle: Option<Rc<dyn TerminalHandle>>,
+}
+
+impl fmt::Debug for ShellJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShellJob")
+            .field("id", &self.id)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("output_path", &self.output_path)
+            .field("status", &self.status)
+            .field("started_at", &self.started_at)
+            .field("timeout", &self.timeout)
+            .field("has_handle", &self.handle.is_some())
+            .finish()
+    }
 }
 
 impl ShellJob {
@@ -81,7 +102,12 @@ impl ShellJob {
             status: ShellJobStatus::Running,
             started_at: Instant::now(),
             timeout,
+            handle: None,
         }
+    }
+
+    pub fn set_handle(&mut self, handle: Rc<dyn TerminalHandle>) {
+        self.handle = Some(handle);
     }
 
     pub fn elapsed(&self) -> Duration {

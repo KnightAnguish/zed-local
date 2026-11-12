@@ -13,6 +13,7 @@ mod thread_store;
 mod tool_permissions;
 mod tools;
 
+use crate::harness::ShellJobId;
 use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
@@ -3772,6 +3773,17 @@ impl NativeThreadEnvironment {
     }
 }
 
+fn tail_for_notification(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[earlier output truncated]\n{}", &text[start..])
+}
+
 impl ThreadEnvironment for NativeThreadEnvironment {
     fn create_terminal(
         &self,
@@ -3875,6 +3887,43 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 
             Ok(Rc::new(handle) as _)
         })
+    }
+
+    fn notify_background_shell_completed(
+        &self,
+        job_id: &ShellJobId,
+        command: &str,
+        exit: Option<i32>,
+        output: &str,
+        cx: &mut AsyncApp,
+    ) {
+        let Some(acp_thread) = self.acp_thread.upgrade() else {
+            return;
+        };
+        let Some(agent) = self.agent.upgrade() else {
+            return;
+        };
+        let exit = exit
+            .map(|code| format!("exit code {code}"))
+            .unwrap_or_else(|| "no exit code".to_string());
+        let output = tail_for_notification(output, 16 * 1024);
+        let content = format!(
+            "<background-job id=\"{job_id}\" status=\"{exit}\">\n\
+             Command: {command}\n\
+             Output:\n{output}\n\
+             </background-job>\n\n\
+             The background command finished. Continue the task. Do not poll or re-run the command; this result is already available."
+        );
+        let task = cx.update(|cx| {
+            NativeAgentConnection(agent).send_and_wait_for_completion(
+                acp_thread,
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    content,
+                ))],
+                cx,
+            )
+        });
+        task.detach();
     }
 
     fn create_subagent(
