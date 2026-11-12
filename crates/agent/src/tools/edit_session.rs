@@ -509,6 +509,7 @@ impl EditPipeline {
                 if !chunk.is_empty() {
                     matcher.push(chunk, None);
                 }
+                let old_text_hint = matcher.query_lines().join("\n");
                 let ResolvedMatch {
                     search_match: SearchMatch { range, line_pairs },
                     is_exact,
@@ -516,6 +517,7 @@ impl EditPipeline {
                     matcher.finish(),
                     buffer,
                     edit_index,
+                    &old_text_hint,
                     self.file_changed_since_last_read,
                     cx,
                 )?;
@@ -962,6 +964,7 @@ fn extract_match(
     matches: SearchMatches,
     buffer: &Entity<Buffer>,
     edit_index: &usize,
+    old_text: &str,
     file_changed_since_last_read: bool,
     cx: &mut AsyncApp,
 ) -> Result<ResolvedMatch, String> {
@@ -976,12 +979,18 @@ fn extract_match(
     };
 
     match matches.as_slice() {
-        [] => Err(format!(
-            "Could not find matching text for edit at index {}. \
-                The old_text did not match any content in the file.{} \
-                Please read the file again to get the current content.",
-            edit_index, file_changed_since_last_read_message,
-        )),
+        [] => {
+            let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+            let hint = edit_miss_hint(&snapshot.text(), old_text)
+                .map(|hint| format!("\n\nThe closest lines in the file:\n{hint}"))
+                .unwrap_or_default();
+            Err(format!(
+                "Could not find matching text for edit at index {}. \
+                    The old_text did not match any content in the file.{}{} \
+                    Please read the file again to get the current content.",
+                edit_index, file_changed_since_last_read_message, hint,
+            ))
+        }
         [search_match] => Ok(ResolvedMatch {
             search_match: search_match.clone(),
             is_exact,
@@ -1003,6 +1012,104 @@ fn extract_match(
             ))
         }
     }
+}
+
+/// Builds a short locator for a failed edit: the lines in the file closest to
+/// `old_text`, numbered like `read_file` output. The heuristic is deliberately
+/// cheap and only runs on a miss: non-distinct lines are ignored, and lines
+/// vote for where the edit starts. It is not a fuzzy matcher; it only helps the
+/// model recover without re-reading the whole file.
+fn edit_miss_hint(file_text: &str, old_text: &str) -> Option<String> {
+    const HINT_LINES: usize = 12;
+    const HINT_LINE_LENGTH: usize = 200;
+
+    fn key(line: &str) -> String {
+        line.replace(['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'], "'")
+            .replace(['\u{201C}', '\u{201D}', '\u{201E}'], "\"")
+            .replace(
+                ['\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}'],
+                "-",
+            )
+            .replace(
+                [
+                    '\u{00A0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
+                    '\u{2007}', '\u{2008}', '\u{2009}', '\u{200A}', '\u{202F}', '\u{205F}',
+                    '\u{3000}',
+                ],
+                " ",
+            )
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn distinct(line: &str) -> bool {
+        line.chars().any(|character| character.is_alphanumeric())
+    }
+
+    let lines = file_text.split('\n').collect::<Vec<_>>();
+    let search = old_text.split('\n').collect::<Vec<_>>();
+    if lines.is_empty() || search.is_empty() {
+        return None;
+    }
+
+    let mut positions = std::collections::HashMap::<String, Vec<usize>>::new();
+    for (index, line) in lines.iter().enumerate() {
+        let key = key(line);
+        if distinct(&key) {
+            positions.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut votes = std::collections::HashMap::<usize, usize>::new();
+    let mut wanted = 0usize;
+    for (offset, line) in search.iter().enumerate() {
+        let key = key(line);
+        if !distinct(&key) {
+            continue;
+        }
+        wanted += 1;
+        for index in positions.get(&key).into_iter().flatten() {
+            if let Some(start) = index.checked_sub(offset) {
+                *votes.entry(start).or_default() += 1;
+            }
+        }
+    }
+    let (start, count) = votes
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .unwrap_or((0, 0));
+    if count == 0 || count * 2 < wanted {
+        return None;
+    }
+
+    let matched = search
+        .iter()
+        .enumerate()
+        .flat_map(|(offset, line)| {
+            let index = start + offset;
+            (index < lines.len() && key(line) == key(lines[index])).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let from = *matched.first()?;
+    let to = (matched.last().copied().unwrap_or(from) + 1).min(from + HINT_LINES);
+    let hint = lines[from..to]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let line = if line.chars().count() > HINT_LINE_LENGTH {
+                format!(
+                    "{}…",
+                    line.chars().take(HINT_LINE_LENGTH).collect::<String>()
+                )
+            } else {
+                (*line).to_string()
+            };
+            format!("{}: {line}", from + offset + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!hint.is_empty()).then_some(hint)
 }
 
 /// Edits a buffer and reports the edit to the action log in the same effect
@@ -1298,4 +1405,39 @@ pub(crate) async fn test_resolve_path(
     cx: &mut gpui::TestAppContext,
 ) -> Result<ProjectPath, String> {
     cx.update(|cx| resolve_path(*mode, &PathBuf::from(path), project, cx))
+}
+
+#[cfg(test)]
+mod edit_miss_hint_tests {
+    use super::edit_miss_hint;
+
+    #[test]
+    fn points_at_the_closest_lines() {
+        let file = "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n";
+        let hint = edit_miss_hint(file, "fn beta() {\n    let z = 3;\n}")
+            .expect("beta should be locatable");
+        assert!(hint.contains("5: fn beta() {"), "hint was: {hint}");
+        assert!(hint.contains("7: }"), "hint was: {hint}");
+    }
+
+    #[test]
+    fn ignores_lines_without_letters_or_digits() {
+        let file = "fn alpha() {\n}\n";
+        assert!(edit_miss_hint(file, "}\n").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_nothing_is_close() {
+        let file = "fn alpha() {\n    let x = 1;\n}\n";
+        assert!(edit_miss_hint(file, "totally different content").is_none());
+    }
+
+    #[test]
+    fn truncates_long_lines() {
+        let long_line = format!("    let value = \"{}\";", "x".repeat(300));
+        let file = format!("fn alpha() {{\n{long_line}\n}}\n");
+        let hint =
+            edit_miss_hint(&file, &long_line).expect("the variable line should be locatable");
+        assert!(hint.contains('…'), "hint was: {hint}");
+    }
 }
