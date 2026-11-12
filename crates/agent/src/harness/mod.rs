@@ -18,6 +18,10 @@ pub use settings::{CodeModeSettings, CompactionSettings, HarnessMode, HarnessSet
 pub use shell::{ShellJob, ShellJobId, ShellJobRegistry, ShellJobStatus};
 
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 /// A thread-local harness state holder.
 ///
@@ -29,6 +33,7 @@ pub struct Harness {
     settings: HarnessSettings,
     context: ContextLedger,
     shell_jobs: ShellJobRegistry,
+    loaded_rules: HashSet<PathBuf>,
 }
 
 impl Harness {
@@ -37,6 +42,7 @@ impl Harness {
             settings,
             context: ContextLedger::new(),
             shell_jobs: ShellJobRegistry::new(),
+            loaded_rules: HashSet::new(),
         }
     }
 
@@ -67,6 +73,16 @@ impl Harness {
     pub fn shell_jobs_mut(&mut self) -> &mut ShellJobRegistry {
         &mut self.shell_jobs
     }
+
+    /// Marks a rules file as already injected into this thread. Returns
+    /// `false` when the file had already been loaded.
+    pub fn mark_rule_loaded(&mut self, path: PathBuf) -> bool {
+        self.loaded_rules.insert(path)
+    }
+
+    pub fn has_loaded_rule(&self, path: &Path) -> bool {
+        self.loaded_rules.contains(path)
+    }
 }
 
 /// Events emitted by the harness for the UI and telemetry.
@@ -96,5 +112,14 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(harness.mode(), HarnessMode::V2);
+    }
+
+    #[test]
+    fn harness_remembers_loaded_rules() {
+        let mut harness = Harness::default();
+        let path = PathBuf::from("/project/src/AGENTS.md");
+        assert!(harness.mark_rule_loaded(path.clone()));
+        assert!(!harness.mark_rule_loaded(path.clone()));
+        assert!(harness.has_loaded_rule(&path));
     }
 }

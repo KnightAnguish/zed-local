@@ -2,7 +2,7 @@ use action_log::ActionLog;
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
-use gpui::{App, Entity, SharedString, Task};
+use gpui::{App, AsyncApp, Entity, SharedString, Task, WeakEntity};
 use indoc::formatdoc;
 use language::Point;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
@@ -193,7 +193,7 @@ use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
     resolve_global_skill_path, resolve_project_path,
 };
-use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
+use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, outline};
 
 /// Reads the content of the given file in the project.
 ///
@@ -239,6 +239,7 @@ pub struct ReadFileTool {
     project: Entity<Project>,
     action_log: Entity<ActionLog>,
     update_agent_location: bool,
+    thread: Option<WeakEntity<Thread>>,
 }
 
 impl ReadFileTool {
@@ -251,7 +252,13 @@ impl ReadFileTool {
             project,
             action_log,
             update_agent_location,
+            thread: None,
         }
+    }
+
+    pub fn with_thread(mut self, thread: WeakEntity<Thread>) -> Self {
+        self.thread = Some(thread);
+        self
     }
 }
 
@@ -300,6 +307,7 @@ impl AgentTool for ReadFileTool {
     ) -> Task<Result<LanguageModelToolResultContent, LanguageModelToolResultContent>> {
         let project = self.project.clone();
         let action_log = self.action_log.clone();
+        let thread = self.thread.clone();
         cx.spawn(async move |cx| {
             let input = input
                 .recv()
@@ -535,6 +543,13 @@ impl AgentTool for ReadFileTool {
                 }
             };
 
+            let result = match result {
+                Ok(content) => Ok(
+                    append_nested_rules(content, &project, &abs_path, thread.as_ref(), cx).await,
+                ),
+                Err(error) => Err(error),
+            };
+
             project.update(cx, |project, cx| {
                 if self.update_agent_location {
                     project.set_agent_location(
@@ -585,6 +600,113 @@ impl AgentTool for ReadFileTool {
     }
 }
 
+/// Returns rules-file paths in the directories between `abs_path` and the
+/// worktree root, nearest directory first. The root itself is excluded because
+/// its rules file is already in the system prompt.
+fn nested_rule_candidates(abs_path: &Path, root: &Path) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    let mut directory = abs_path.parent();
+    while let Some(dir) = directory {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        for name in prompt_store::RULES_FILE_NAMES {
+            candidates.push(dir.join(name));
+        }
+        directory = dir.parent();
+    }
+    candidates
+}
+
+async fn append_nested_rules(
+    content: LanguageModelToolResultContent,
+    project: &Entity<Project>,
+    abs_path: &Path,
+    thread: Option<&WeakEntity<Thread>>,
+    cx: &mut AsyncApp,
+) -> LanguageModelToolResultContent {
+    let Some(thread) = thread else {
+        return content;
+    };
+    let LanguageModelToolResultContent::Text(text) = content else {
+        return content;
+    };
+    let rules = load_nested_rules(project, abs_path, thread, cx).await;
+    if rules.is_empty() {
+        LanguageModelToolResultContent::Text(text)
+    } else {
+        format!("{text}{rules}").into()
+    }
+}
+
+/// Discovers rules files in the directories above `abs_path`, stopping below
+/// the owning worktree root. The root rules file is already part of the system
+/// prompt; nested files are injected once per thread as read results.
+async fn load_nested_rules(
+    project: &Entity<Project>,
+    abs_path: &Path,
+    thread: &WeakEntity<Thread>,
+    cx: &mut AsyncApp,
+) -> String {
+    let roots = project.read_with(cx, |project, cx| {
+        project
+            .worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect::<Vec<_>>()
+    });
+    let Some(root) = roots
+        .into_iter()
+        .filter(|root| abs_path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+    else {
+        return String::new();
+    };
+
+    let fs = project.read_with(cx, |project, _cx| project.fs().clone());
+    let mut loaded = Vec::new();
+
+    for path in nested_rule_candidates(abs_path, &root) {
+        if path.as_path() == abs_path {
+            continue;
+        }
+        let already_loaded = thread
+            .read_with(cx, |thread, _| thread.harness().has_loaded_rule(&path))
+            .unwrap_or(true);
+        if already_loaded {
+            continue;
+        }
+        let Ok(text) = fs.load(&path).await else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let marked = thread
+            .update(cx, |thread, _| {
+                thread.harness_mut().mark_rule_loaded(path.clone())
+            })
+            .unwrap_or(false);
+        if !marked {
+            continue;
+        }
+        let display = path.strip_prefix(&root).unwrap_or(&path);
+        loaded.push(format!(
+            "### `{}`\n\n{}",
+            display.display(),
+            text.trim_end()
+        ));
+    }
+
+    if loaded.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Project instructions discovered while reading\n\n{}",
+            loaded.join("\n\n")
+        )
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -596,6 +718,104 @@ mod test {
     use std::path::PathBuf;
     use std::sync::Arc;
     use util::path;
+
+    #[test]
+    fn nested_rule_candidates_stop_below_root() {
+        let candidates = nested_rule_candidates(
+            Path::new("/project/src/deep/file.rs"),
+            Path::new("/project"),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path == Path::new("/project/src/deep/AGENTS.md"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path == Path::new("/project/src/AGENTS.md"))
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|path| path == Path::new("/project/AGENTS.md"))
+        );
+        assert!(candidates[0].starts_with("/project/src/deep"));
+    }
+
+    #[gpui::test]
+    async fn test_read_file_appends_nested_agents_md(cx: &mut TestAppContext) {
+        let fake = crate::tests::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root/project"),
+            json!({
+                "AGENTS.md": "Root rules",
+                "src": {
+                    "AGENTS.md": "Nested rules: use tabs",
+                    "deep": {
+                        "file.rs": "fn main() {}\n"
+                    }
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root/project").as_ref()], cx).await;
+        let project_context = cx.new(|_| prompt_store::ProjectContext::default());
+        let context_server_store =
+            project.read_with(cx, |project, _cx| project.context_server_store());
+        let context_server_registry =
+            cx.new(|cx| crate::ContextServerRegistry::new(context_server_store, cx));
+        let model = fake.model("fake");
+        let thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                project_context,
+                context_server_registry,
+                crate::Templates::new(),
+                Some(model),
+                cx,
+            )
+        });
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool =
+            Arc::new(ReadFileTool::new(project, action_log, true).with_thread(thread.downgrade()));
+
+        let read = |cx: &mut TestAppContext| {
+            let tool = tool.clone();
+            let (event_stream, _) = ToolCallEventStream::test();
+            cx.update(move |cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "project/src/deep/file.rs".to_string(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+        };
+
+        let result = read(cx).await.expect("first read should succeed");
+        let LanguageModelToolResultContent::Text(text) = result else {
+            panic!("expected text read result");
+        };
+        assert!(text.contains("Nested rules: use tabs"), "text was: {text}");
+        assert!(
+            !text.contains("Root rules"),
+            "root rules should stay in the system prompt"
+        );
+
+        let result = read(cx).await.expect("second read should succeed");
+        let LanguageModelToolResultContent::Text(text) = result else {
+            panic!("expected text read result");
+        };
+        assert!(
+            !text.contains("Nested rules: use tabs"),
+            "nested rules should not be repeated: {text}"
+        );
+    }
 
     #[gpui::test]
     async fn test_read_directory_path(cx: &mut TestAppContext) {

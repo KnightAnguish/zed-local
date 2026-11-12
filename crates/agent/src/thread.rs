@@ -2290,11 +2290,14 @@ impl Thread {
         self.add_tool(GrepTool::new(self.project.clone()));
         self.add_tool(ListDirectoryTool::new(self.project.clone()));
         self.add_tool(MovePathTool::new(self.project.clone()));
-        self.add_tool(ReadFileTool::new(
-            self.project.clone(),
-            self.action_log.clone(),
-            update_agent_location,
-        ));
+        self.add_tool(
+            ReadFileTool::new(
+                self.project.clone(),
+                self.action_log.clone(),
+                update_agent_location,
+            )
+            .with_thread(cx.weak_entity()),
+        );
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
         self.add_tool(
