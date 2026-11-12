@@ -50,8 +50,10 @@ pub struct Edit {
     /// Be minimal with replacements:
     /// - For unique lines, include only those lines
     /// - For non-unique lines, include enough context to identify them
+    #[serde(alias = "oldString")]
     pub old_text: String,
     /// The text to replace it with
+    #[serde(alias = "newString")]
     pub new_text: String,
 }
 
@@ -1409,7 +1411,18 @@ pub(crate) async fn test_resolve_path(
 
 #[cfg(test)]
 mod edit_miss_hint_tests {
-    use super::edit_miss_hint;
+    use super::{Edit, edit_miss_hint};
+
+    #[test]
+    fn accepts_camel_case_edit_fields() {
+        let edit: Edit = serde_json::from_value(serde_json::json!({
+            "oldString": "before",
+            "newString": "after",
+        }))
+        .expect("camelCase aliases should deserialize");
+        assert_eq!(edit.old_text, "before");
+        assert_eq!(edit.new_text, "after");
+    }
 
     #[test]
     fn points_at_the_closest_lines() {
