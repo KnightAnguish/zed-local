@@ -126,6 +126,11 @@ pub enum SandboxStatusRefresh {
 /// the user instead.
 pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 
+/// A turn gets at most one compaction-and-retry cycle after the provider
+/// rejects a prompt as too large. Retrying more would resend a prompt that the
+/// provider has already refused.
+const MAX_OVERFLOW_RECOVERIES: u8 = 1;
+
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
@@ -3062,6 +3067,10 @@ impl Thread {
         let mut intent = CompletionIntent::UserPrompt;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
+        // A provider that rejects an oversized prompt gets one compaction
+        // attempt before the turn fails, even if the estimate was below the
+        // auto-compaction threshold.
+        let mut overflow_recoveries = 0;
         loop {
             if *cancellation_rx.borrow() {
                 return Ok(());
@@ -3167,6 +3176,9 @@ impl Thread {
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, provider, request))
             })??;
+            // A mid-stream overflow after visible output is not safe to retry:
+            // the model may already have committed to part of an answer.
+            let mut request_had_output = false;
 
             telemetry::event!(
                 "Agent Thread Completion",
@@ -3240,6 +3252,14 @@ impl Thread {
                 while let Some(event) = events.next().now_or_never().flatten() {
                     batch.push(event);
                 }
+                let batch_had_output = batch.iter().any(|event| {
+                    matches!(
+                        event,
+                        Ok(LanguageModelCompletionEvent::Text(_))
+                            | Ok(LanguageModelCompletionEvent::Thinking { .. })
+                            | Ok(LanguageModelCompletionEvent::ToolUse(_))
+                    )
+                });
 
                 // Process the batch in a single update
                 let batch_result = this.update(cx, |this, cx| {
@@ -3275,6 +3295,7 @@ impl Thread {
                     (batch_tool_results, batch_error)
                 })?;
 
+                request_had_output |= batch_had_output;
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
                     let is_refusal = err
@@ -3408,6 +3429,45 @@ impl Thread {
             }
 
             if let Some(error) = error {
+                let prompt_too_large_tokens = if request_had_output {
+                    None
+                } else {
+                    Self::prompt_too_large_tokens(&error)
+                };
+                if overflow_recoveries < MAX_OVERFLOW_RECOVERIES
+                    && prompt_too_large_tokens.is_some()
+                {
+                    overflow_recoveries += 1;
+                    this.update(cx, |this, cx| {
+                        this.mark_token_limit_exceeded(prompt_too_large_tokens.flatten(), cx);
+                    })?;
+                    log::info!(
+                        "Provider rejected an oversized prompt; compacting and retrying the turn"
+                    );
+                    match Self::recover_from_overflow(
+                        this,
+                        event_stream,
+                        cancellation_rx.clone(),
+                        cx,
+                    )
+                    .await
+                    {
+                        Ok(Some(ControlFlow::Continue(()))) => continue,
+                        Ok(Some(ControlFlow::Break(()))) => return Ok(()),
+                        Ok(None) => {}
+                        Err(compaction_error) => {
+                            log::warn!(
+                                "Overflow compaction failed; surfacing the original error: {compaction_error:#}"
+                            );
+                            this.update(cx, |this, _| {
+                                this.emit_compaction_telemetry_outcome(
+                                    "failed",
+                                    Some(compaction_error.to_string()),
+                                );
+                            })?;
+                        }
+                    }
+                }
                 attempt += 1;
                 match Self::retry_completion_error(
                     this,
@@ -3476,6 +3536,63 @@ impl Thread {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Returns the provider-reported token count for a prompt-too-large
+    /// rejection, or `None` for any other error.
+    fn prompt_too_large_tokens(error: &LanguageModelCompletionError) -> Option<Option<u64>> {
+        match error {
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::PromptTooLarge { tokens },
+                ..
+            } => Some(*tokens),
+            _ => None,
+        }
+    }
+
+    /// Compacts the conversation after the provider rejected a prompt as too
+    /// large, then lets the caller retry the turn.
+    ///
+    /// Returns `Ok(None)` when there is nothing safe to compact, so the caller
+    /// can surface the original provider error.
+    async fn recover_from_overflow(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        cancellation_rx: watch::Receiver<bool>,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<ControlFlow<()>>> {
+        let Some((model, request, native_request, insertion_ix)) =
+            this.update(cx, |this, cx| {
+                if !this.harness.settings().compaction.enabled {
+                    return None;
+                }
+                let insertion_ix = this.overflow_compaction_target_ix()?;
+                let model = this.compaction_model(cx)?;
+                let request = this.build_compaction_request(insertion_ix, &model, cx);
+                let native_request = this.native_compaction_request(&model, &request);
+                this.current_request_token_usage = TokenUsage::default();
+                if this.pending_compaction_telemetry.is_none() {
+                    this.pending_compaction_telemetry =
+                        this.build_compaction_telemetry("overflow", &model, cx);
+                }
+                Some((model, request, native_request, insertion_ix))
+            })?
+        else {
+            return Ok(None);
+        };
+
+        Self::stream_compaction(
+            this,
+            event_stream,
+            cancellation_rx,
+            model,
+            request,
+            native_request,
+            CompactionInsertion::Auto { insertion_ix },
+            cx,
+        )
+        .await
+        .map(Some)
     }
 
     async fn perform_compaction_if_needed(
@@ -4913,19 +5030,31 @@ impl Thread {
             return None;
         }
 
-        // Even with usage (reported before the stream failed), a trailing prompt has no reply yet, so keep it out of the summary.
-        let insertion_ix = match self.messages.last().map(|message| &**message) {
-            Some(Message::User(_)) => self.messages.len().saturating_sub(1),
-            _ => self.messages.len(),
-        };
-        if insertion_ix == 0 {
-            return None;
-        }
+        let insertion_ix = self.compaction_target_ix_before_trailing_user_prompt()?;
         log::info!(
             "Auto-compacting thread {}: {active_tokens} tokens used, threshold is {compaction_threshold} of {max_input_tokens}",
             self.id
         );
         Some(insertion_ix)
+    }
+
+    /// Compaction boundary that leaves a trailing user prompt outside the
+    /// summary, so that prompt can still be answered after compaction.
+    fn compaction_target_ix_before_trailing_user_prompt(&self) -> Option<usize> {
+        // Even with usage (reported before the stream failed), a trailing
+        // prompt has no reply yet, so keep it out of the summary.
+        let insertion_ix = match self.messages.last().map(|message| &**message) {
+            Some(Message::User(_)) => self.messages.len().saturating_sub(1),
+            _ => self.messages.len(),
+        };
+        (insertion_ix > 0).then_some(insertion_ix)
+    }
+
+    /// Compaction boundary used when the provider rejected the prompt as too
+    /// large, regardless of the estimated threshold.
+    fn overflow_compaction_target_ix(&self) -> Option<usize> {
+        let end_index = self.compaction_target_ix_before_trailing_user_prompt()?;
+        self.forced_compaction_target_ix_before(end_index)
     }
 
     /// Insertion point for a manually-triggered compaction.
@@ -5022,6 +5151,9 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         });
+        if let Some(input_capacity) = self.input_token_capacity() {
+            request.messages = fit_compaction_messages(request.messages, input_capacity);
+        }
 
         request
     }
@@ -5234,6 +5366,115 @@ fn build_request_tools(
             )
         })
         .collect()
+}
+
+/// Fits a compaction request into 85% of the model's input capacity.
+///
+/// Compaction is the recovery path for oversized prompts, so failing the
+/// summary because the history is still too large would leave the thread
+/// stuck. The system prompt and the compaction instruction are always kept;
+/// older messages are dropped first, and the newest message is truncated as a
+/// last resort so the summary still sees recent context.
+fn fit_compaction_messages(
+    mut messages: Vec<LanguageModelRequestMessage>,
+    input_capacity: u64,
+) -> Vec<LanguageModelRequestMessage> {
+    if input_capacity == 0 || messages.len() <= 1 {
+        return messages;
+    }
+    let budget = (input_capacity as usize)
+        .saturating_mul(crate::harness::context::CHARS_PER_TOKEN as usize)
+        .saturating_mul(85)
+        / 100;
+    let total_bytes = messages
+        .iter()
+        .map(request_message_byte_len)
+        .fold(0usize, usize::saturating_add);
+    if total_bytes <= budget {
+        return messages;
+    }
+
+    let system = messages.remove(0);
+    let prompt = messages.pop();
+    let reserved = request_message_byte_len(&system)
+        .saturating_add(prompt.as_ref().map_or(0, request_message_byte_len));
+    let mut remaining = budget.saturating_sub(reserved);
+    let mut kept = Vec::new();
+    for message in messages.into_iter().rev() {
+        let bytes = request_message_byte_len(&message);
+        if bytes <= remaining {
+            remaining -= bytes;
+            kept.push(message);
+        } else if kept.is_empty() {
+            if let Some(truncated) = truncate_request_message_to_budget(message, remaining) {
+                kept.push(truncated);
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+
+    kept.reverse();
+    let mut fitted = Vec::with_capacity(kept.len() + 2);
+    fitted.push(system);
+    fitted.extend(kept);
+    fitted.extend(prompt);
+    fitted
+}
+
+fn request_message_byte_len(message: &LanguageModelRequestMessage) -> usize {
+    let mut bytes = message.string_contents().len();
+    for content in &message.content {
+        match content {
+            MessageContent::Image(image) => {
+                bytes = bytes.saturating_add(image.len());
+            }
+            MessageContent::ToolResult(result) => {
+                for part in &result.content {
+                    if let LanguageModelToolResultContent::Image(image) = part {
+                        bytes = bytes.saturating_add(image.len());
+                    }
+                }
+            }
+            MessageContent::Text(_)
+            | MessageContent::Thinking { .. }
+            | MessageContent::RedactedThinking(_)
+            | MessageContent::ToolUse(_)
+            | MessageContent::Compaction(_) => {}
+        }
+    }
+    bytes
+}
+
+fn truncate_request_message_to_budget(
+    message: LanguageModelRequestMessage,
+    budget: usize,
+) -> Option<LanguageModelRequestMessage> {
+    if budget == 0 {
+        return None;
+    }
+    let text = message.string_contents();
+    if text.is_empty() {
+        return None;
+    }
+    let marker = "[earlier content truncated]\n";
+    let max_chars = budget.saturating_sub(marker.len());
+    if max_chars == 0 {
+        return None;
+    }
+    let mut tail: Vec<char> = text.chars().rev().take(max_chars).collect();
+    tail.reverse();
+    let mut truncated =
+        String::with_capacity(marker.len() + tail.iter().map(|c| c.len_utf8()).sum::<usize>());
+    truncated.push_str(marker);
+    truncated.extend(tail);
+    Some(LanguageModelRequestMessage {
+        role: message.role,
+        content: vec![MessageContent::Text(truncated)],
+        cache: false,
+        reasoning_details: None,
+    })
 }
 
 /// Reserves output without subtracting it from an independent input ceiling.
@@ -7823,6 +8064,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compaction_fit_keeps_newest_history_and_prompt() {
+        let messages = vec![
+            request_text_message(Role::System, "system prompt"),
+            request_text_message(Role::User, "old ".repeat(2_000)),
+            request_text_message(Role::Assistant, "recent assistant work"),
+            request_text_message(Role::User, COMPACTION_PROMPT),
+        ];
+
+        let fitted = fit_compaction_messages(messages, 500);
+
+        assert_eq!(
+            fitted.first().map(|message| message.role),
+            Some(Role::System)
+        );
+        assert!(
+            fitted
+                .last()
+                .is_some_and(|message| message.string_contents().contains("handoff"))
+        );
+        let text = fitted
+            .iter()
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("recent assistant work"));
+        assert!(!text.contains("old old old"));
+        assert!(
+            fitted.iter().map(request_message_byte_len).sum::<usize>()
+                <= 500 * crate::harness::context::CHARS_PER_TOKEN as usize * 85 / 100
+        );
+    }
+
+    #[test]
+    fn compaction_fit_truncates_a_single_oversized_message() {
+        let messages = vec![
+            request_text_message(Role::System, "system prompt"),
+            request_text_message(Role::User, "x".repeat(20_000)),
+            request_text_message(Role::User, COMPACTION_PROMPT),
+        ];
+
+        let fitted = fit_compaction_messages(messages, 300);
+
+        assert_eq!(fitted.len(), 3);
+        assert!(
+            fitted
+                .last()
+                .is_some_and(|message| message.string_contents().contains("handoff"))
+        );
+        assert!(
+            fitted[1]
+                .string_contents()
+                .contains("[earlier content truncated]")
+        );
+        assert!(
+            fitted.iter().map(request_message_byte_len).sum::<usize>()
+                <= 300 * crate::harness::context::CHARS_PER_TOKEN as usize * 85 / 100
+        );
+    }
+
+    fn request_text_message(role: Role, text: impl Into<String>) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role,
+            content: vec![MessageContent::Text(text.into())],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
     #[gpui::test]
     async fn test_token_usage_updates_harness_ledger(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
@@ -8022,6 +8332,19 @@ mod tests {
         fake.send_last_text(model, summary);
         fake.end_last(model);
         cx.run_until_parked();
+    }
+
+    fn prompt_too_large_error() -> LanguageModelCompletionError {
+        LanguageModelCompletionError::from_provider_response(
+            LanguageModelProviderName::new("test"),
+            Some(http_client::StatusCode::BAD_REQUEST),
+            Some("context_length_exceeded".to_string()),
+            "prompt is too large".to_string(),
+            None,
+            ProviderErrorCategory::PromptTooLarge {
+                tokens: Some(900_000),
+            },
+        )
     }
 
     fn last_pending_intent(fake: &FakeLanguageModelProvider) -> Option<CompletionIntent> {
@@ -9447,6 +9770,133 @@ mod tests {
                     if summary.as_ref() == "fallback summary"
             )));
         });
+    }
+
+    #[gpui::test]
+    async fn test_overflow_rejection_compacts_and_retries(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        fake.send_last_error(&model, prompt_too_large_error());
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ThreadContextSummarization),
+            "an oversized prompt should trigger compaction before failing the turn"
+        );
+        finish_compaction(&fake, &model, "summary after overflow", cx);
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::UserPrompt),
+            "the turn should retry with the compacted history"
+        );
+        fake.send_last_text(&model, "recovered");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.messages.iter().any(|message| matches!(
+                &**message,
+                Message::Compaction(CompactionInfo::Summary(summary))
+                    if summary.as_ref() == "summary after overflow"
+            )));
+            assert!(thread.is_turn_complete());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_overflow_recovery_runs_at_most_once_per_turn(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        fake.send_last_error(&model, prompt_too_large_error());
+        fake.end_last(&model);
+        cx.run_until_parked();
+        finish_compaction(&fake, &model, "first recovery", cx);
+
+        fake.send_last_error(&model, prompt_too_large_error());
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        assert!(
+            fake.pending_completions()
+                .iter()
+                .all(|request| request.intent != Some(CompletionIntent::ThreadContextSummarization)),
+            "a second rejection should not compact again in the same turn"
+        );
+        thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+    }
+
+    #[gpui::test]
+    async fn test_overflow_recovery_respects_disabled_compaction(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+            thread
+                .harness_mut()
+                .set_settings(crate::harness::HarnessSettings {
+                    compaction: crate::harness::CompactionSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        fake.send_last_error(&model, prompt_too_large_error());
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        assert!(
+            fake.pending_completions()
+                .iter()
+                .all(|request| request.intent != Some(CompletionIntent::ThreadContextSummarization)),
+            "disabled compaction should leave the provider error untouched"
+        );
+        thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
     }
 
     #[gpui::test]
