@@ -355,7 +355,16 @@ impl AgentTool for TerminalTool {
         input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        terminal_initial_title(input.map(|input| input.command))
+        match input {
+            Ok(input) => match input.shell_id {
+                Some(shell_id) => format!("Background job {shell_id}").into(),
+                None if input.background => {
+                    format!("Starting background: {}", input.command).into()
+                }
+                None => terminal_initial_title(Ok(input.command)),
+            },
+            Err(value) => terminal_initial_title(Err(value)),
+        }
     }
 
     fn run(
@@ -398,7 +407,16 @@ impl AgentTool for SandboxedTerminalTool {
         input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        terminal_initial_title(input.map(|input| input.command))
+        match input {
+            Ok(input) => match input.shell_id {
+                Some(shell_id) => format!("Background job {shell_id}").into(),
+                None if input.background => {
+                    format!("Starting background: {}", input.command).into()
+                }
+                None => terminal_initial_title(Ok(input.command)),
+            },
+            Err(value) => terminal_initial_title(Err(value)),
+        }
     }
 
     fn run(
