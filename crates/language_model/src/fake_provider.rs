@@ -1,8 +1,8 @@
 use crate::{
-    AuthenticateError, LanguageModel, LanguageModelClient, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelCompletionStream, LanguageModelId,
-    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelProviderState, LanguageModelRequest,
+    AuthenticateError, CompactedContext, CompactionResult, LanguageModel, LanguageModelClient,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelCompletionStream,
+    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest, TokenUsage,
 };
 use anyhow::{Result, anyhow};
 use futures::{FutureExt, channel::mpsc, future::BoxFuture, stream::StreamExt};
@@ -27,6 +27,9 @@ struct FakeProviderState {
     forbid_requests: bool,
     input_token_counts: VecDeque<u64>,
     input_token_count_requests: Vec<LanguageModelRequest>,
+    compaction_requests: Vec<LanguageModelRequest>,
+    compaction_results: VecDeque<CompactionResult>,
+    next_compaction_error: Option<LanguageModelCompletionError>,
 }
 
 struct PendingCompletion {
@@ -122,6 +125,28 @@ impl LanguageModelClient for FakeLanguageModelProvider {
         let count = state.input_token_counts.pop_front();
         async move { Ok(count) }.boxed()
     }
+
+    fn compact(
+        &self,
+        _model: &LanguageModel,
+        request: LanguageModelRequest,
+        _: &AsyncApp,
+    ) -> BoxFuture<'static, Result<CompactionResult, LanguageModelCompletionError>> {
+        let mut state = self.state.lock();
+        state.compaction_requests.push(request);
+        if let Some(error) = state.next_compaction_error.take() {
+            return async move { Err(error) }.boxed();
+        }
+        match state.compaction_results.pop_front() {
+            Some(result) => async move { Ok(result) }.boxed(),
+            None => async {
+                Err(LanguageModelCompletionError::Other(anyhow!(
+                    "no queued compaction result"
+                )))
+            }
+            .boxed(),
+        }
+    }
 }
 
 impl FakeLanguageModelProvider {
@@ -187,6 +212,24 @@ impl FakeLanguageModelProvider {
 
     pub fn input_token_count_requests(&self) -> Vec<LanguageModelRequest> {
         self.state.lock().input_token_count_requests.clone()
+    }
+
+    /// Queues the replacement context returned by the next native compaction.
+    pub fn queue_compaction_result(&self, context: CompactedContext, usage: TokenUsage) {
+        self.state
+            .lock()
+            .compaction_results
+            .push_back(CompactionResult { context, usage });
+    }
+
+    /// Makes the next native compaction fail with `error`.
+    pub fn fail_next_compaction(&self, error: LanguageModelCompletionError) {
+        self.state.lock().next_compaction_error = Some(error);
+    }
+
+    /// Requests sent to the native compaction endpoint, oldest first.
+    pub fn compaction_requests(&self) -> Vec<LanguageModelRequest> {
+        self.state.lock().compaction_requests.clone()
     }
 
     /// Requests still streaming, to any model, oldest first.

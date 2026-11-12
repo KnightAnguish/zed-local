@@ -11,7 +11,7 @@ use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
-use crate::harness::{Harness, ShellJobId};
+use crate::harness::{Harness, MeasuredUsage, ShellJobId};
 
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
@@ -42,13 +42,13 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolChoice, LanguageModelToolResult, LanguageModelToolResultContent,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, PromptCompactionStrategy,
-    ProviderErrorCategory, Role, SelectedModel, Speed, StopReason, TokenUsage,
-    ZED_CLOUD_PROVIDER_ID,
+    CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolChoice, LanguageModelToolResult,
+    LanguageModelToolResultContent, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
+    PromptCompactionStrategy, ProviderErrorCategory, Role, SelectedModel, Speed, StopReason,
+    TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -229,6 +229,14 @@ pub enum CompactionInfo {
         provider: LanguageModelProviderId,
         items: Vec<serde_json::Value>,
     },
+    /// Replacement context produced by a provider's native compaction
+    /// endpoint. Unlike [`CompactionInfo::ProviderNative`], this carries the
+    /// structured context the provider can replay, including opaque state
+    /// that must be round-tripped to the same backend.
+    ProviderContext {
+        provider: LanguageModelProviderId,
+        context: CompactedContext,
+    },
 }
 
 impl CompactionInfo {
@@ -245,6 +253,27 @@ impl CompactionInfo {
                 reasoning_details: None,
             }],
             Self::ProviderNative { .. } => Vec::new(),
+            Self::ProviderContext { context, .. } => vec![LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![MessageContent::Compaction(context.clone())],
+                cache: false,
+                reasoning_details: None,
+            }],
+        }
+    }
+
+    fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Summary(summary) => Some(summary),
+            Self::ProviderContext {
+                context: CompactedContext::Summary { content, .. },
+                ..
+            } => Some(content),
+            Self::ProviderNative { .. }
+            | Self::ProviderContext {
+                context: CompactedContext::ProviderState(_),
+                ..
+            } => None,
         }
     }
 }
@@ -282,12 +311,12 @@ impl Message {
             Message::User(message) => message.to_markdown(),
             Message::Agent(message) => message.to_markdown(),
             Message::Resume => "[resume]\n".into(),
-            Message::Compaction(CompactionInfo::Summary(summary)) => {
-                format!("## Context Compaction (Completed)\n\n{summary}\n\n")
-            }
-            Message::Compaction(CompactionInfo::ProviderNative { .. }) => {
-                "## Context Compaction (Completed)\n\n".into()
-            }
+            Message::Compaction(info) => match info.summary() {
+                Some(summary) => {
+                    format!("## Context Compaction (Completed)\n\n{summary}\n\n")
+                }
+                None => "## Context Compaction (Completed)\n\n".into(),
+            },
         }
     }
 
@@ -1661,6 +1690,18 @@ impl Thread {
                                 acp_thread::ContextCompactionStatus::Completed,
                             );
                         }
+                        CompactionInfo::ProviderContext { context, .. } => {
+                            stream.send_context_compaction(
+                                compaction_id.clone(),
+                                acp_thread::ContextCompactionStatus::Completed,
+                            );
+                            if let CompactedContext::Summary { content, .. } = context {
+                                stream.send_context_compaction_update(
+                                    compaction_id,
+                                    content.as_ref(),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2134,6 +2175,9 @@ impl Thread {
     pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = ThreadModel::Ready(model.clone());
+        // Measured context belongs to the previous model's tokenizer and
+        // window; a new anchor is recorded on the next response.
+        self.harness.context_mut().reset();
         let new_caps = Self::prompt_capabilities(self.model.as_model());
         let new_usage = self.latest_token_usage();
         if old_usage != new_usage {
@@ -2505,6 +2549,20 @@ impl Thread {
     fn update_token_usage(&mut self, update: language_model::TokenUsage, cx: &mut Context<Self>) {
         self.accumulate_token_usage(update);
         self.record_request_usage(update, cx);
+        if let Some(model) = self.model().cloned() {
+            self.harness.context_mut().record_measured(
+                model.provider_id.to_string(),
+                model.id.0.to_string(),
+                None,
+                MeasuredUsage {
+                    input: update.input_tokens,
+                    cache_read: update.cache_read_input_tokens,
+                    cache_write: update.cache_creation_input_tokens,
+                    output: update.output_tokens,
+                    reasoning: 0,
+                },
+            );
+        }
     }
 
     /// Records that the last request overflowed the model's context window so
@@ -2785,8 +2843,9 @@ impl Thread {
         let compaction = target.map(|request_end_ix| {
             self.advance_prompt_id();
             let request = self.build_compaction_request(request_end_ix, &model, cx);
+            let native_request = self.native_compaction_request(&model, &request);
             self.current_request_token_usage = TokenUsage::default();
-            (model.clone(), request)
+            (model.clone(), request, native_request)
         });
 
         if compaction.is_some() {
@@ -2804,13 +2863,14 @@ impl Thread {
             let prompt_id = self.prompt_id.clone();
             let event_stream = event_stream.clone();
             async move |this, cx| {
-                let result = if let Some((model, request)) = compaction {
+                let result = if let Some((model, request, native_request)) = compaction {
                     Self::stream_compaction(
                         &this,
                         &event_stream,
                         cancellation_rx.clone(),
                         model,
                         request,
+                        native_request,
                         CompactionInsertion::Manual { marker_id: id },
                         cx,
                     )
@@ -3424,19 +3484,21 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
-            let insertion_ix = this.compaction_message_target_ix(cx)?;
-            let model = this.compaction_model(cx)?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx);
-            this.current_request_token_usage = TokenUsage::default();
-            // Preserve telemetry across retries so the retry count keeps
-            // accumulating rather than resetting on each attempt.
-            if this.pending_compaction_telemetry.is_none() {
-                this.pending_compaction_telemetry =
-                    this.build_compaction_telemetry("auto", &model, cx);
-            }
-            Some((model, request, insertion_ix))
-        })?
+        let Some((model, request, native_request, insertion_ix)) =
+            this.update(cx, |this, cx| {
+                let insertion_ix = this.compaction_message_target_ix(cx)?;
+                let model = this.compaction_model(cx)?;
+                let request = this.build_compaction_request(insertion_ix, &model, cx);
+                let native_request = this.native_compaction_request(&model, &request);
+                this.current_request_token_usage = TokenUsage::default();
+                // Preserve telemetry across retries so the retry count keeps
+                // accumulating rather than resetting on each attempt.
+                if this.pending_compaction_telemetry.is_none() {
+                    this.pending_compaction_telemetry =
+                        this.build_compaction_telemetry("auto", &model, cx);
+                }
+                Some((model, request, native_request, insertion_ix))
+            })?
         else {
             return Ok(ControlFlow::Continue(()));
         };
@@ -3447,6 +3509,7 @@ impl Thread {
             cancellation_rx,
             model,
             request,
+            native_request,
             CompactionInsertion::Auto { insertion_ix },
             cx,
         )
@@ -3459,6 +3522,7 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         model: LanguageModel,
         request: LanguageModelRequest,
+        native_request: Option<LanguageModelRequest>,
         insertion: CompactionInsertion,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
@@ -3473,6 +3537,47 @@ impl Thread {
             acp_thread::ContextCompactionStatus::InProgress,
         );
         let result: Result<ControlFlow<()>> = async {
+            if let Some(native_request) = native_request {
+                match Self::compact_natively(&model, native_request, &mut cancellation_rx, cx).await
+                {
+                    Ok(Some(context)) => {
+                        let summary = match &context {
+                            CompactedContext::Summary { content, .. } => Some(content.clone()),
+                            CompactedContext::ProviderState(_) => None,
+                        };
+                        let provider_id = model.provider_id.clone();
+                        this.update(cx, |this, cx| {
+                            let compaction =
+                                Arc::new(Message::Compaction(CompactionInfo::ProviderContext {
+                                    provider: provider_id,
+                                    context,
+                                }));
+                            this.insert_compaction(insertion, compaction, cx);
+                            this.context_usage = None;
+                            this.harness.context_mut().reset();
+                            cx.notify();
+                        })?;
+                        event_stream.update_context_compaction_status(
+                            compaction_id.clone(),
+                            acp_thread::ContextCompactionStatus::Completed,
+                        );
+                        if let Some(summary) = summary {
+                            event_stream.send_context_compaction_update(
+                                compaction_id.clone(),
+                                summary.as_ref(),
+                            );
+                        }
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    Ok(None) => return Ok(ControlFlow::Break(())),
+                    Err(error) => {
+                        log::warn!(
+                            "Native compaction failed; falling back to a prompt summary: {error:#}"
+                        );
+                    }
+                }
+            }
+
             let provider =
                 cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
             let stream = futures::select_biased! {
@@ -3550,20 +3655,9 @@ impl Thread {
             this.update(cx, |this, cx| {
                 let compaction =
                     Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
-                match insertion {
-                    CompactionInsertion::Auto { insertion_ix } => {
-                        if insertion_ix <= this.messages.len() {
-                            this.messages.insert(insertion_ix, compaction);
-                        } else {
-                            this.messages.push(compaction);
-                        }
-                    }
-                    CompactionInsertion::Manual { marker_id } => {
-                        this.upsert_user_message(marker_id, Arc::from([]), cx);
-                        this.messages.push(compaction);
-                    }
-                }
+                this.insert_compaction(insertion, compaction, cx);
                 this.context_usage = None;
+                this.harness.context_mut().reset();
                 cx.notify();
             })?;
 
@@ -3578,6 +3672,53 @@ impl Thread {
             );
         }
         result
+    }
+
+    fn insert_compaction(
+        &mut self,
+        insertion: CompactionInsertion,
+        compaction: Arc<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        match insertion {
+            CompactionInsertion::Auto { insertion_ix } => {
+                if insertion_ix <= self.messages.len() {
+                    self.messages.insert(insertion_ix, compaction);
+                } else {
+                    self.messages.push(compaction);
+                }
+            }
+            CompactionInsertion::Manual { marker_id } => {
+                self.upsert_user_message(marker_id, Arc::from([]), cx);
+                self.messages.push(compaction);
+            }
+        }
+    }
+
+    /// Runs a provider-native compaction request, returning `None` when the
+    /// turn was cancelled while it was in flight.
+    async fn compact_natively(
+        model: &LanguageModel,
+        request: LanguageModelRequest,
+        cancellation_rx: &mut watch::Receiver<bool>,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<CompactedContext>> {
+        let provider =
+            cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
+        let mut compact = provider.compact(model, request, cx).fuse();
+        loop {
+            futures::select_biased! {
+                _ = cancellation_rx.changed().fuse() => {
+                    if *cancellation_rx.borrow() {
+                        log::debug!("Native compaction cancelled");
+                        return Ok(None);
+                    }
+                }
+                result = &mut compact => {
+                    return Ok(result.map(|result| Some(result.context))?);
+                }
+            }
+        }
     }
 
     fn process_tool_result(
@@ -4706,7 +4847,13 @@ impl Thread {
         request_messages: &mut Vec<LanguageModelRequestMessage>,
         end_ix: usize,
     ) {
-        extend_request_history_until(&self.messages, request_messages, end_ix);
+        let provider_id = self.model().map(|model| model.provider_id.clone());
+        extend_request_history_until(
+            &self.messages,
+            request_messages,
+            end_ix,
+            provider_id.as_ref(),
+        );
     }
 
     fn build_compaction_telemetry(
@@ -4877,6 +5024,48 @@ impl Thread {
         });
 
         request
+    }
+
+    /// Builds the request for a provider-native compaction pass, if the
+    /// current model supports one and the harness prefers it.
+    ///
+    /// Native compaction is only safe for the thread's own model: the
+    /// replacement context and any opaque provider state belong to that
+    /// backend. A separately configured compaction model falls back to a
+    /// prompt summary.
+    fn native_compaction_request(
+        &self,
+        model: &LanguageModel,
+        prompt_request: &LanguageModelRequest,
+    ) -> Option<LanguageModelRequest> {
+        if !self.harness.settings().compaction.prefer_native {
+            return None;
+        }
+        if !model.supports_explicit_compaction() {
+            return None;
+        }
+        let uses_thread_model = self.model().is_some_and(|thread_model| {
+            thread_model.provider_id == model.provider_id && thread_model.id == model.id
+        });
+        if !uses_thread_model {
+            return None;
+        }
+        if let Some(minimum) = model.minimum_explicit_compaction_input_tokens() {
+            let active_tokens = self
+                .context_usage
+                .map(|usage| total_input_tokens(usage).saturating_add(usage.output_tokens))
+                .unwrap_or(0);
+            if active_tokens < minimum {
+                return None;
+            }
+        }
+
+        let mut request = prompt_request.clone();
+        // Providers append their own compaction instruction in
+        // `into_compact_request`; sending the prompt summary directive as well
+        // would duplicate it and change the cached prefix.
+        request.messages.pop();
+        Some(request)
     }
 
     pub fn to_markdown(&self) -> String {
@@ -5200,6 +5389,7 @@ fn take_text_within_byte_budget(text: String, remaining_bytes: &mut usize) -> Op
 
 /// Describes where a streamed compaction summary should land in the thread
 /// once it completes successfully.
+#[derive(Clone)]
 enum CompactionInsertion {
     /// Automatic compaction inserts the summary at an index computed up front
     /// (which may be before a trailing not-yet-answered user message).
@@ -5274,11 +5464,15 @@ fn extend_request_history_until(
     messages: &[Arc<Message>],
     request_messages: &mut Vec<LanguageModelRequestMessage>,
     end_ix: usize,
+    provider_id: Option<&LanguageModelProviderId>,
 ) {
     let end_ix = end_ix.min(messages.len());
-    let Some(compaction_ix) = latest_compaction_message_ix_before(messages, end_ix) else {
+    let Some(compaction_ix) = latest_compaction_message_ix_before(messages, end_ix, provider_id)
+    else {
         for message in &messages[..end_ix] {
-            request_messages.extend(message.to_request());
+            if compaction_applies_to_provider(message, provider_id) {
+                request_messages.extend(message.to_request());
+            }
         }
         return;
     };
@@ -5294,14 +5488,48 @@ fn extend_request_history_until(
     }
 
     for message in &messages[compaction_ix..end_ix] {
-        request_messages.extend(message.to_request());
+        if compaction_applies_to_provider(message, provider_id) {
+            request_messages.extend(message.to_request());
+        }
     }
 }
 
-fn latest_compaction_message_ix_before(messages: &[Arc<Message>], end_ix: usize) -> Option<usize> {
+/// Native provider state may only be replayed to the backend that produced it.
+fn compaction_applies_to_provider(
+    message: &Message,
+    provider_id: Option<&LanguageModelProviderId>,
+) -> bool {
+    match message {
+        Message::Compaction(CompactionInfo::ProviderContext {
+            provider,
+            context: CompactedContext::ProviderState(_),
+        }) => provider_id.is_none_or(|current| current == provider),
+        _ => true,
+    }
+}
+
+/// Finds the latest compaction boundary that can be replayed for `provider_id`.
+///
+/// Native provider state is only valid for the backend that produced it. When
+/// the thread model switched providers, an older boundary (or the full
+/// transcript) is used instead of silently dropping the conversation.
+fn latest_compaction_message_ix_before(
+    messages: &[Arc<Message>],
+    end_ix: usize,
+    provider_id: Option<&LanguageModelProviderId>,
+) -> Option<usize> {
     messages[..end_ix]
         .iter()
-        .rposition(|message| matches!(&**message, Message::Compaction(_)))
+        .enumerate()
+        .rev()
+        .find_map(|(ix, message)| match &**message {
+            Message::Compaction(CompactionInfo::ProviderContext {
+                provider,
+                context: CompactedContext::ProviderState(_),
+            }) if provider_id.is_some_and(|current| current != provider) => None,
+            Message::Compaction(_) => Some(ix),
+            _ => None,
+        })
 }
 
 /// Only for rebuilding `Thread::context_usage`. Checking this before every
@@ -5322,7 +5550,7 @@ fn context_usage_from_history(
                 .get(&user_message.id)
                 .map(|usage| (ix, *usage))
         })?;
-    if latest_compaction_message_ix_before(messages, messages.len())
+    if latest_compaction_message_ix_before(messages, messages.len(), None)
         .is_some_and(|compaction_ix| compaction_ix > usage_ix)
     {
         return None;
@@ -5376,7 +5604,7 @@ pub fn build_thread_title_request(
         temperature,
         ..Default::default()
     };
-    extend_request_history_until(messages, &mut request.messages, messages.len());
+    extend_request_history_until(messages, &mut request.messages, messages.len(), None);
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![SUMMARIZE_THREAD_PROMPT.into()],
@@ -7595,6 +7823,65 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    async fn test_token_usage_updates_harness_ledger(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    cache_creation_input_tokens: 300,
+                    cache_read_input_tokens: 4_000,
+                },
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let ledger = thread.harness().context();
+            assert_eq!(
+                ledger.estimate(),
+                crate::harness::ContextEstimate {
+                    measured: 5_500,
+                    estimated: 0,
+                }
+            );
+            let anchor = ledger.anchor().expect("measured usage has an anchor");
+            assert_eq!(anchor.provider, model.provider_id.to_string());
+            assert_eq!(anchor.model, model.id.0.to_string());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_model_switch_resets_measured_context(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let first = fake.model("first");
+        let second = fake.model("second");
+        thread.update(cx, |thread, cx| thread.set_model(first, cx));
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 1_000,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+
+        thread.update(cx, |thread, cx| thread.set_model(second, cx));
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.harness().context().estimate(),
+                crate::harness::ContextEstimate::default()
+            );
+        });
+    }
+
     #[test]
     fn compaction_capacity_respects_prompt_and_combined_limits() {
         assert_eq!(
@@ -7794,6 +8081,70 @@ mod tests {
         LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
             registry.set_compaction_model(model, cx);
         });
+    }
+
+    #[test]
+    fn test_provider_context_renders_as_compaction_block() {
+        let message = Message::Compaction(CompactionInfo::ProviderContext {
+            provider: LanguageModelProviderId::from("anthropic".to_string()),
+            context: CompactedContext::Summary {
+                content: "Native summary".into(),
+                provider_state: None,
+            },
+        });
+
+        assert_eq!(
+            message.to_markdown(),
+            "## Context Compaction (Completed)\n\nNative summary\n\n"
+        );
+
+        let request_messages = message.to_request();
+        assert_eq!(request_messages.len(), 1);
+        assert_eq!(request_messages[0].role, Role::Assistant);
+        let MessageContent::Compaction(CompactedContext::Summary { content, .. }) =
+            &request_messages[0].content[0]
+        else {
+            panic!("expected a native compaction block");
+        };
+        assert_eq!(content.as_ref(), "Native summary");
+    }
+
+    #[gpui::test]
+    async fn test_provider_context_is_ignored_after_a_provider_switch(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| thread.set_model(model, cx));
+
+        let request_messages = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "before"));
+                thread.messages.push(Arc::new(Message::Compaction(
+                    CompactionInfo::ProviderContext {
+                        provider: LanguageModelProviderId::from("other".to_string()),
+                        context: CompactedContext::ProviderState(
+                            language_model::ProviderCompactionState::new(
+                                LanguageModelProviderId::from("other".to_string()),
+                                "test",
+                                "{}",
+                            ),
+                        ),
+                    },
+                )));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "after"));
+
+                thread.build_request_messages(Vec::new(), cx)
+            })
+        });
+
+        assert_eq!(
+            request_texts_after_system(&request_messages),
+            vec!["before".to_string(), "after".to_string()],
+            "native context from another provider must not drop earlier history"
+        );
     }
 
     #[test]
@@ -9005,6 +9356,99 @@ mod tests {
 
     /// Auto-compaction triggered by the threshold also honors
     /// `agent.compaction_model`.
+    #[gpui::test]
+    async fn test_auto_compaction_uses_native_context(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.supports_explicit_compaction = true;
+            model.minimum_explicit_compaction_input_tokens = Some(50_000);
+        });
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        enable_echo_tool(&thread, cx);
+        fake.queue_compaction_result(
+            CompactedContext::Summary {
+                content: "native summary".into(),
+                provider_state: None,
+            },
+            TokenUsage::default(),
+        );
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        finish_tool_round(&fake, &model, Some(900_000), cx);
+
+        assert_eq!(fake.compaction_requests().len(), 1);
+        assert!(
+            fake.pending_completions()
+                .iter()
+                .all(|request| request.intent != Some(CompletionIntent::ThreadContextSummarization)),
+            "native compaction should not fall back to a prompt summary"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.messages.iter().any(|message| matches!(
+                &**message,
+                Message::Compaction(CompactionInfo::ProviderContext { .. })
+            )));
+        });
+
+        let request = fake
+            .pending_completions()
+            .pop()
+            .expect("the turn should continue after native compaction");
+        assert!(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|content| matches!(
+                    content,
+                    MessageContent::Compaction(CompactedContext::Summary { content, .. })
+                        if content.as_ref() == "native summary"
+                ))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_auto_compaction_falls_back_when_native_compaction_fails(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.supports_explicit_compaction = true;
+            model.minimum_explicit_compaction_input_tokens = Some(50_000);
+        });
+        thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        enable_echo_tool(&thread, cx);
+        fake.fail_next_compaction(LanguageModelCompletionError::Other(anyhow::anyhow!(
+            "native compaction unavailable"
+        )));
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        finish_tool_round(&fake, &model, Some(900_000), cx);
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+
+        finish_compaction(&fake, &model, "fallback summary", cx);
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.messages.iter().any(|message| matches!(
+                &**message,
+                Message::Compaction(CompactionInfo::Summary(summary))
+                    if summary.as_ref() == "fallback summary"
+            )));
+        });
+    }
+
     #[gpui::test]
     async fn test_auto_compaction_uses_compaction_model(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
