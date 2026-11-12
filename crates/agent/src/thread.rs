@@ -11,6 +11,8 @@ use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
+use crate::harness::Harness;
+
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
     sandbox_worktree_writable_paths, sandboxing_available_for_project,
@@ -1326,6 +1328,8 @@ pub struct Thread {
     /// Usage reported since the last summary. `request_token_usage` can't tell
     /// this apart from pre-summary usage within a turn.
     context_usage: Option<TokenUsage>,
+    /// Harness v2 state. Inert while `HarnessMode::Legacy` is active.
+    harness: Harness,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
@@ -1480,6 +1484,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             context_usage: None,
+            harness: Harness::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
@@ -1526,6 +1531,7 @@ impl Thread {
         self.profile_id = parent.profile_id.clone();
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
+        self.harness.set_settings(parent.harness.settings().clone());
     }
 
     fn apply_model_selection(
@@ -1859,6 +1865,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             context_usage,
+            harness: Harness::default(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
@@ -2036,6 +2043,15 @@ impl Thread {
 
     pub fn project_context(&self) -> &Entity<ProjectContext> {
         &self.project_context
+    }
+
+    /// Harness v2 state for this thread. Legacy mode does not read it yet.
+    pub fn harness(&self) -> &Harness {
+        &self.harness
+    }
+
+    pub fn harness_mut(&mut self) -> &mut Harness {
+        &mut self.harness
     }
 
     pub fn project(&self) -> &Entity<Project> {
