@@ -67,6 +67,7 @@ pub struct InstallReport {
     pub build: String,
     pub release: String,
     pub removed_builds: Vec<PathBuf>,
+    pub reused_running_build: bool,
 }
 
 pub fn default_install_root() -> PathBuf {
@@ -124,7 +125,17 @@ pub fn install_from_package(package_dir: &Path, options: InstallOptions) -> Resu
         path.is_dir().then_some(path)
     });
 
-    if build_dir.exists() {
+    // Windows locks the executable and DLLs of a running build. Reinstalling
+    // the same build (for example, a packaging-only release with a new
+    // launcher) must not try to remove that directory: keep its files and
+    // still refresh install.json, the launcher, and the shortcuts.
+    let build_exists = build_dir.exists();
+    let reuse_running_build = build_exists
+        && is_running_build(&build_dir)
+        && previous
+            .as_deref()
+            .is_none_or(|installed| same_path(installed, &build_dir));
+    if build_exists && !reuse_running_build {
         fs::remove_dir_all(&build_dir).with_context(|| {
             format!(
                 "Close Zed Local before reinstalling; could not replace {}",
@@ -132,32 +143,38 @@ pub fn install_from_package(package_dir: &Path, options: InstallOptions) -> Resu
             )
         })?;
     }
-    fs::create_dir_all(&build_dir).with_context(|| format!("create {}", build_dir.display()))?;
-    fs::create_dir_all(build_dir.join("x64"))?;
-    fs::create_dir_all(build_dir.join("bin"))?;
+    if !reuse_running_build {
+        fs::create_dir_all(&build_dir)
+            .with_context(|| format!("create {}", build_dir.display()))?;
+        fs::create_dir_all(build_dir.join("x64"))?;
+        fs::create_dir_all(build_dir.join("bin"))?;
+    }
     fs::create_dir_all(&user_data).with_context(|| format!("create {}", user_data.display()))?;
 
-    for file in &manifest.files {
-        let relative = safe_relative_path(&file.path)?;
-        let source = package_dir.join(&relative);
-        let destination = build_dir.join(&relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+    if !reuse_running_build {
+        for file in &manifest.files {
+            let relative = safe_relative_path(&file.path)?;
+            let source = package_dir.join(&relative);
+            let destination = build_dir.join(&relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &destination).with_context(|| {
+                format!("copy {} to {}", source.display(), destination.display())
+            })?;
         }
-        fs::copy(&source, &destination)
-            .with_context(|| format!("copy {} to {}", source.display(), destination.display()))?;
-    }
 
-    copy_if_exists(
-        &package_dir.join("OpenConsole.exe"),
-        &build_dir.join("x64").join("OpenConsole.exe"),
-    )?;
-    copy_if_exists(
-        &package_dir.join("cli.exe"),
-        &build_dir.join("bin").join("zed.exe"),
-    )?;
-    for name in ["README.txt", "LICENSE-GPL", "LICENSE-APACHE"] {
-        copy_if_exists(&package_dir.join(name), &build_dir.join(name))?;
+        copy_if_exists(
+            &package_dir.join("OpenConsole.exe"),
+            &build_dir.join("x64").join("OpenConsole.exe"),
+        )?;
+        copy_if_exists(
+            &package_dir.join("cli.exe"),
+            &build_dir.join("bin").join("zed.exe"),
+        )?;
+        for name in ["README.txt", "LICENSE-GPL", "LICENSE-APACHE"] {
+            copy_if_exists(&package_dir.join(name), &build_dir.join(name))?;
+        }
     }
 
     let launcher_source = package_dir.join(LAUNCHER_EXE);
@@ -205,6 +222,7 @@ pub fn install_from_package(package_dir: &Path, options: InstallOptions) -> Resu
         build: manifest.build,
         release: manifest.release,
         removed_builds,
+        reused_running_build: reuse_running_build,
     })
 }
 
@@ -498,6 +516,12 @@ fn same_path(left: &Path, right: &Path) -> bool {
     } else {
         left == right
     }
+}
+
+fn is_running_build(path: &Path) -> bool {
+    running_build_dirs()
+        .iter()
+        .any(|running| same_path(running, path))
 }
 
 fn running_build_dirs() -> Vec<PathBuf> {

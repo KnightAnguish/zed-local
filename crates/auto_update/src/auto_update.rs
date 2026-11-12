@@ -209,10 +209,37 @@ pub struct ReleaseAsset {
 struct ForkRelease {
     release: String,
     version: String,
+    #[serde(default)]
+    build: Option<String>,
     asset_url: String,
     sha256: String,
     #[serde(default)]
     published_at: Option<String>,
+}
+
+/// Compares app versions while ignoring the release channel that Zed stores
+/// in the semver build metadata. A release binary reports
+/// `1.28.1+stable.<sha>`, while the packaging script may write
+/// `1.28.1+dev.<sha>` into `latest.json`; those are the same build, not an
+/// update.
+fn versions_match_ignoring_channel(left: &Version, right: &Version) -> bool {
+    fn build_without_channel(version: &Version) -> &str {
+        let build = version.build.as_str();
+        match build.split_once('.') {
+            Some((channel, rest))
+                if matches!(channel, "dev" | "nightly" | "preview" | "stable") =>
+            {
+                rest
+            }
+            _ => build,
+        }
+    }
+
+    left.major == right.major
+        && left.minor == right.minor
+        && left.patch == right.patch
+        && left.pre == right.pre
+        && build_without_channel(left) == build_without_channel(right)
 }
 
 struct MacOsUnmounter<'a> {
@@ -393,7 +420,6 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
     None
 }
 
-#[cfg(not(target_os = "windows"))]
 const INSTALLER_DIR_PREFIX: &str = "zed-auto-update";
 
 #[cfg(not(target_os = "windows"))]
@@ -776,7 +802,7 @@ impl AutoUpdater {
         })
     }
 
-    fn installed_release() -> Option<(Option<String>, Option<String>)> {
+    fn installed_release() -> Option<(Option<String>, Option<String>, Option<String>)> {
         let current_exe = std::env::current_exe().ok()?;
         let install_root = current_exe.parent()?.parent()?.parent()?;
         let text = std::fs::read_to_string(install_root.join("install.json")).ok()?;
@@ -788,6 +814,10 @@ impl AutoUpdater {
                 .map(str::to_owned),
             value
                 .get("published_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            value
+                .get("build")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
         ))
@@ -845,14 +875,23 @@ impl AutoUpdater {
         let installed_release = Self::installed_release();
         let same_release = installed_release
             .as_ref()
-            .and_then(|(release, _)| release.as_deref())
+            .and_then(|(release, _, _)| release.as_deref())
             .is_some_and(|installed| installed == release.release);
+        let same_build = installed_release
+            .as_ref()
+            .and_then(|(_, _, build)| build.as_deref())
+            .zip(release.build.as_deref())
+            .is_some_and(|(installed, latest)| installed == latest);
         let not_newer = installed_release
             .as_ref()
-            .and_then(|(_, published_at)| published_at.as_deref())
+            .and_then(|(_, published_at, _)| published_at.as_deref())
             .zip(release.published_at.as_deref())
             .is_some_and(|(installed, latest)| latest <= installed);
-        if same_release || not_newer || version == current_version {
+        if same_release
+            || same_build
+            || not_newer
+            || versions_match_ignoring_channel(&version, &current_version)
+        {
             this.update(cx, |this, cx| {
                 this.fork_release = None;
                 this.status = AutoUpdateStatus::Idle;
@@ -913,8 +952,12 @@ impl AutoUpdater {
     ) -> Result<()> {
         let version: Version = release.version.parse()?;
         let client = this.read_with(cx, |this, _| this.client.http_client());
-        let installer_dir = InstallerDir::new()
-            .await
+        // Keep the downloaded archive outside the running build directory.
+        // Replacing or cleaning a directory that contains the running
+        // zedlocal.exe fails with "Access is denied" on Windows.
+        let installer_dir = tempfile::Builder::new()
+            .prefix(INSTALLER_DIR_PREFIX)
+            .tempdir()
             .context("Failed to create ZedLocal installer directory")?;
         let target_path = installer_dir.path().join("ZedLocal.zip");
 
@@ -1947,6 +1990,22 @@ mod tests {
 
         let downloaded_len = std::fs::metadata(&target_path).unwrap().len();
         assert_eq!(downloaded_len, content_length as u64);
+    }
+
+    #[test]
+    fn test_fork_version_comparison_ignores_release_channel() {
+        let runtime: Version = "1.28.1+stable.076fe5e19f7f54d9756f71f67528b37e276806b0"
+            .parse()
+            .unwrap();
+        let packaged: Version = "1.28.1+dev.076fe5e19f7f54d9756f71f67528b37e276806b0"
+            .parse()
+            .unwrap();
+        let newer: Version = "1.28.2+dev.076fe5e19f7f54d9756f71f67528b37e276806b0"
+            .parse()
+            .unwrap();
+
+        assert!(versions_match_ignoring_channel(&runtime, &packaged));
+        assert!(!versions_match_ignoring_channel(&runtime, &newer));
     }
 
     #[test]

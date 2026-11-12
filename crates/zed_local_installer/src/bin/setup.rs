@@ -56,6 +56,12 @@ fn run() -> anyhow::Result<()> {
     if !quiet {
         println!();
         println!("Zed Local installed successfully.");
+        if report.reused_running_build {
+            println!(
+                "Zed Local is running; its build files were kept and the launcher/shortcuts were refreshed."
+            );
+            println!("Close Zed Local and run Install.exe again to replace the build files.");
+        }
         println!("Application: {}", report.build_dir.display());
         println!("User data:   {}", report.user_data.display());
         if shortcuts {
