@@ -42,6 +42,7 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
 /// - Error results may also include a session_id if a session was already created.
+/// - With `background: true`, the call returns immediately with a session_id and status `running`; you will be notified when the agent finishes. Do not poll or duplicate its work.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
@@ -57,6 +58,14 @@ pub struct SpawnAgentToolInput {
     /// Omit to preserve default behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Run the subagent in the background and return immediately. You will be
+    /// notified when it finishes; do not poll or duplicate its work.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
@@ -88,6 +97,11 @@ pub enum SpawnAgentToolOutput {
         output: String,
         session_info: SubagentSessionInfo,
     },
+    Running {
+        session_id: acp_v2::SessionId,
+        status: String,
+        session_info: SubagentSessionInfo,
+    },
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
@@ -106,6 +120,15 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                 session_info: _, // Don't show this to the model
             } => serde_json::to_string(
                 &serde_json::json!({ "session_id": session_id, "output": output }),
+            )
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
+            SpawnAgentToolOutput::Running {
+                session_id,
+                status,
+                session_info: _,
+            } => serde_json::to_string(
+                &serde_json::json!({ "session_id": session_id, "status": status }),
             )
             .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
             .into(),
@@ -179,7 +202,9 @@ impl AgentTool for SpawnAgentTool {
                 message,
                 session_id,
                 model,
+                background,
             } = input;
+            let label_for_background = label.clone();
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = match (session_id, model) {
                     (Some(_), Some(_)) => Err(anyhow::anyhow!(
@@ -211,6 +236,35 @@ impl AgentTool for SpawnAgentTool {
 
                 Ok((subagent, session_info))
             })?;
+
+            if background {
+                let environment = self.environment.clone();
+                let session_id = session_info.session_id.clone();
+                cx.spawn(async move |cx| {
+                    let result = subagent.send(message, cx).await;
+                    let (output, error) = match result {
+                        Ok(output) => (output, None),
+                        Err(error) => (String::new(), Some(error.to_string())),
+                    };
+                    environment.notify_subagent_completed(
+                        &session_id,
+                        &label_for_background,
+                        &output,
+                        error.as_deref(),
+                        cx,
+                    );
+                })
+                .detach();
+
+                event_stream.update_fields(|update| {
+                    update.content(vec!["The subagent is working in the background. You will be notified when it finishes.".into()])
+                });
+                return Ok(SpawnAgentToolOutput::Running {
+                    session_id: session_info.session_id.clone(),
+                    status: "running".to_string(),
+                    session_info,
+                });
+            }
 
             let send_result = subagent.send(message, cx).await;
 
@@ -278,6 +332,14 @@ impl AgentTool for SpawnAgentTool {
                 session_info,
                 ..
             } => (output.into(), Some(session_info)),
+            SpawnAgentToolOutput::Running {
+                session_id,
+                status,
+                session_info,
+            } => (
+                format!("Subagent {session_id} is {status} in the background.").into(),
+                Some(session_info),
+            ),
             SpawnAgentToolOutput::Error {
                 error,
                 session_info,
@@ -352,6 +414,7 @@ mod tests {
         }))
         .unwrap();
         assert!(input.session_id.is_none());
+        assert!(!input.background);
 
         let input: SpawnAgentToolInput = serde_json::from_value(json!({
             "label": "label",
@@ -360,5 +423,34 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.session_id.unwrap().to_string(), "existing-session");
+    }
+
+    #[test]
+    fn background_flag_is_optional_and_omitted_when_false() {
+        let input: SpawnAgentToolInput = serde_json::from_value(json!({
+            "label": "label",
+            "message": "message",
+            "background": true,
+        }))
+        .unwrap();
+        assert!(input.background);
+        assert_eq!(
+            serde_json::to_value(input).unwrap()["background"],
+            json!(true)
+        );
+
+        let input: SpawnAgentToolInput = serde_json::from_value(json!({
+            "label": "label",
+            "message": "message",
+        }))
+        .unwrap();
+        assert!(!input.background);
+        assert!(
+            serde_json::to_value(input)
+                .unwrap()
+                .get("background")
+                .is_none(),
+            "false background should not be serialized"
+        );
     }
 }

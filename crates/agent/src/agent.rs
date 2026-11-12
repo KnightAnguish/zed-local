@@ -3926,6 +3926,61 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         task.detach();
     }
 
+    fn notify_subagent_completed(
+        &self,
+        session_id: &acp_v2::SessionId,
+        label: &str,
+        output: &str,
+        error: Option<&str>,
+        cx: &mut AsyncApp,
+    ) {
+        let Some(acp_thread) = self.acp_thread.upgrade() else {
+            return;
+        };
+        let Some(agent) = self.agent.upgrade() else {
+            return;
+        };
+        let thread = self.thread.clone();
+        let session_id = session_id.to_string();
+        let label = label.to_string();
+        let status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        let body = error.unwrap_or(output);
+        let body = tail_for_notification(body, 16 * 1024);
+        let content = format!(
+            "<subagent session_id=\"{session_id}\" label=\"{label}\" status=\"{status}\">\n\
+             {body}\n\
+             </subagent>\n\n\
+             The background subagent finished. Continue the task. Do not poll for its status; this result is already available."
+        );
+        cx.spawn(async move |cx| {
+            loop {
+                match thread.read_with(cx, |thread, _| thread.is_turn_running()) {
+                    Ok(true) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+            let task = cx.update(|cx| {
+                NativeAgentConnection(agent).send_and_wait_for_completion(
+                    acp_thread,
+                    vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        content,
+                    ))],
+                    cx,
+                )
+            });
+            task.detach();
+        })
+        .detach();
+    }
+
     fn create_subagent(
         &self,
         label: String,

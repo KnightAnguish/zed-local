@@ -814,6 +814,18 @@ pub trait ThreadEnvironment {
     ) {
     }
 
+    /// Called when a background subagent finishes. Implementations may wake
+    /// the parent agent with the result; the default does nothing.
+    fn notify_subagent_completed(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _label: &str,
+        _output: &str,
+        _error: Option<&str>,
+        _cx: &mut AsyncApp,
+    ) {
+    }
+
     fn create_subagent(
         &self,
         label: String,
