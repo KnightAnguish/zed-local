@@ -210,16 +210,27 @@ pub fn install_from_package(package_dir: &Path, options: InstallOptions) -> Resu
 
 pub fn launch(install_root: &Path) -> Result<()> {
     let install_root = absolute(install_root)?;
-    let (exe, user_data) = match read_install_state(&install_root) {
+    let (exe, user_data, build_dir, version) = match read_install_state(&install_root) {
         Ok(state) => {
-            let exe = PathBuf::from(&state.install_dir).join(ZED_EXE);
-            (exe, Some(PathBuf::from(state.user_data)))
+            let build_dir = PathBuf::from(&state.install_dir);
+            let exe = build_dir.join(ZED_EXE);
+            (
+                exe,
+                Some(PathBuf::from(state.user_data)),
+                Some(build_dir),
+                Some(state.version),
+            )
         }
         Err(_) => {
             let build_dir = newest_build(&install_root)?;
-            (build_dir.join(ZED_EXE), None)
+            (build_dir.join(ZED_EXE), None, Some(build_dir), None)
         }
     };
+    if let (Some(build_dir), Some(version)) = (&build_dir, &version) {
+        if let Err(error) = create_shortcuts(&install_root, build_dir, version) {
+            log_launcher_error(&format!("repair shortcuts: {error:#}"));
+        }
+    }
     ensure!(
         exe.is_file(),
         "Zed Local build not found: {}",
@@ -234,6 +245,18 @@ pub fn launch(install_root: &Path) -> Result<()> {
         .spawn()
         .with_context(|| format!("start {}", exe.display()))?;
     Ok(())
+}
+
+pub fn repair_shortcuts(install_root: &Path) -> Result<()> {
+    let install_root = absolute(install_root)?;
+    let state = read_install_state(&install_root)?;
+    let build_dir = PathBuf::from(&state.install_dir);
+    ensure!(
+        build_dir.join(ZED_EXE).is_file(),
+        "Zed Local build not found: {}",
+        build_dir.display()
+    );
+    create_shortcuts(&install_root, &build_dir, &state.version)
 }
 
 pub fn uninstall(install_root: &Path) -> Result<()> {
@@ -550,7 +573,7 @@ fn create_shortcut_file(
             shell_link.SetWorkingDirectory(&BSTR::from(
                 working_directory.to_string_lossy().to_string(),
             ))?;
-            shell_link.SetIconLocation(&BSTR::from(format!("{},0", icon.to_string_lossy())), 0)?;
+            shell_link.SetIconLocation(&BSTR::from(icon.to_string_lossy().to_string()), 0)?;
             shell_link.SetDescription(&BSTR::from(description.to_owned()))?;
             let persist: IPersistFile = shell_link.cast()?;
             persist.Save(&HSTRING::from(link.to_string_lossy().to_string()), true)?;
@@ -794,7 +817,14 @@ mod tests {
         .unwrap();
         assert_eq!(report.build, manifest.build);
         assert!(report.build_dir.join(ZED_EXE).is_file());
-        assert!(!temp.path().join("install").join("updates").join("staging").exists());
+        assert!(
+            !temp
+                .path()
+                .join("install")
+                .join("updates")
+                .join("staging")
+                .exists()
+        );
     }
 
     fn add_zip(
