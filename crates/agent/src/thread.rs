@@ -8640,6 +8640,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn long_histories_keep_a_bounded_tail(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, _cx| {
+            thread
+                .harness_mut()
+                .set_settings(crate::harness::HarnessSettings {
+                    compaction: crate::harness::CompactionSettings {
+                        keep_tokens: 15_000,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            for step in 0..20 {
+                let target_tokens = 100_000u64 + (step as u64) * 45_000;
+                thread.messages.clear();
+
+                let body_chars = 1_800usize;
+                let messages = (target_tokens as usize * 4 / body_chars).max(4);
+                for index in 0..messages {
+                    if index % 2 == 0 {
+                        thread.messages.push(user_text_message(
+                            ClientUserMessageId::new(),
+                            &format!("user {index} {}", "x".repeat(body_chars)),
+                        ));
+                    } else {
+                        thread.messages.push(agent_text_message(&format!(
+                            "assistant {index} {}",
+                            "y".repeat(body_chars)
+                        )));
+                    }
+                }
+
+                let end = thread.messages.len();
+                let boundary = thread.keep_tail_start_ix(end);
+                assert!(
+                    boundary > 0 && boundary < end,
+                    "expected a tail at {target_tokens} tokens, boundary {boundary} of {end}"
+                );
+                let tail_tokens: u64 = thread.messages[boundary..]
+                    .iter()
+                    .map(|message| {
+                        crate::harness::context::estimate_text_tokens(&message.to_markdown())
+                    })
+                    .sum();
+                assert!(
+                    tail_tokens <= 16_500,
+                    "tail must stay bounded at {target_tokens} tokens, got {tail_tokens}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn keep_tokens_keeps_the_newest_history_verbatim(cx: &mut TestAppContext) {
         let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
         thread.update(cx, |thread, _cx| {
