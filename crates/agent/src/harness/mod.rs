@@ -7,6 +7,7 @@
 //! the default.
 
 pub mod context;
+pub mod instructions;
 pub mod settings;
 pub mod shell;
 
@@ -14,6 +15,7 @@ pub use context::{
     ContextAnchor, ContextEstimate, ContextLedger, ContextReserve, MeasuredUsage,
     estimate_text_tokens,
 };
+pub use instructions::{Instruction, InstructionDelta, InstructionKey, InstructionSet};
 pub use settings::{CodeModeSettings, CompactionSettings, HarnessMode, HarnessSettings};
 pub use shell::{ShellJob, ShellJobId, ShellJobRegistry, ShellJobStatus};
 

@@ -1,4 +1,4 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use gpui::SharedString;
 use handlebars::Handlebars;
 use serde::Serialize;
@@ -61,6 +61,8 @@ pub struct SystemPromptTemplate<'a> {
     pub is_linux: bool,
     /// Whether sandboxed terminal commands run through WSL on Windows.
     pub is_windows: bool,
+    /// Tool-specific guidance rendered from the harness instruction set.
+    pub tool_guidance: String,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -97,6 +99,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_guidance_renders_verbatim() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["grep".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: false,
+            is_linux: false,
+            is_windows: false,
+            tool_guidance: "- use `grep` before guessing paths".to_string(),
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+        assert!(rendered.contains("- use `grep` before guessing paths"));
+    }
+
+    #[test]
     fn test_system_prompt_template() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
@@ -108,6 +129,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -141,6 +163,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -170,6 +193,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -203,6 +227,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -246,6 +271,7 @@ mod tests {
             sandboxing: true,
             is_linux: true,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -279,6 +305,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: true,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -309,6 +336,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -331,6 +359,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -351,6 +380,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -369,6 +399,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            tool_guidance: String::new(),
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

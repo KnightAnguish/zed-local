@@ -57,11 +57,7 @@ If you are unsure how to fulfill the user's request, gather more information wit
 - When providing paths to tools, the path should always start with the name of a project root directory listed above.
 - Before you read or edit a file, you must first know its full project-relative path. Do not guess file paths.
 - Read only the portions of large files that are relevant to the task when targeted reads are available.
-{{#if (contains available_tools 'grep') }}
-- When looking for symbols in the project, prefer the `grep` tool.
-- As you learn about the structure of the project, scope searches to targeted subtrees instead of repeatedly searching the whole repository.
-- If the user specifies a partial file path and you do not know the full path, use `find_path` rather than `grep` before reading or editing the file.
-{{/if}}
+{{{tool_guidance}}}
 
 ## Making Code Changes
 

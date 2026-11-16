@@ -5049,6 +5049,18 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
+        let mut instructions = crate::harness::InstructionSet::new();
+        if available_tools
+            .iter()
+            .any(|tool| tool.as_ref() == "grep")
+        {
+            instructions.insert(
+                crate::harness::InstructionKey::Tool("grep"),
+                true,
+                crate::harness::instructions::GREP_GUIDANCE,
+            );
+        }
+        let tool_guidance = instructions.render();
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
@@ -5061,6 +5073,7 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
+            tool_guidance,
         }
         .render(&self.templates)
         .context("failed to build system prompt")
