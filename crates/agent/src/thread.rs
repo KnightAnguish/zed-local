@@ -1452,6 +1452,26 @@ pub struct Thread {
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
 }
 
+/// Resolves the harness settings from the global agent settings.
+fn harness_settings_from_agent_settings(cx: &App) -> crate::harness::HarnessSettings {
+    let settings = AgentSettings::get_global(cx).harness.clone();
+    crate::harness::HarnessSettings {
+        mode: match settings.mode {
+            agent_settings::HarnessModeSetting::V2 => crate::harness::HarnessMode::V2,
+            agent_settings::HarnessModeSetting::Legacy => crate::harness::HarnessMode::Legacy,
+        },
+        background_shell: settings.background_shell,
+        max_background_jobs: settings.max_background_jobs,
+        compaction: crate::harness::CompactionSettings {
+            precompute: settings.precompute,
+            keep_tokens: settings.keep_tokens,
+            prefer_native: settings.prefer_native,
+            ..Default::default()
+        },
+        code_mode: Default::default(),
+    }
+}
+
 impl Thread {
     fn prompt_capabilities(model: Option<&LanguageModel>) -> acp_v2::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
@@ -1566,7 +1586,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             context_usage: None,
-            harness: Harness::default(),
+            harness: Harness::new(harness_settings_from_agent_settings(cx)),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
@@ -1963,7 +1983,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             context_usage,
-            harness: Harness::default(),
+            harness: Harness::new(harness_settings_from_agent_settings(cx)),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,

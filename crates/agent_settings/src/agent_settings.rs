@@ -16,10 +16,11 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    DockPosition, DockSide, HarnessSettingsContent, IntoGpui, LanguageModelParameters,
+    LanguageModelSelection, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting,
+    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
+    update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -178,6 +179,60 @@ pub struct AutoCompactSettings {
     pub threshold: AutoCompactThreshold,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HarnessModeSetting {
+    #[default]
+    Legacy,
+    V2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessAgentSettings {
+    pub mode: HarnessModeSetting,
+    pub background_shell: bool,
+    pub max_background_jobs: usize,
+    pub precompute: bool,
+    pub keep_tokens: usize,
+    pub prefer_native: bool,
+}
+
+impl Default for HarnessAgentSettings {
+    fn default() -> Self {
+        Self {
+            mode: HarnessModeSetting::Legacy,
+            background_shell: true,
+            max_background_jobs: 4,
+            precompute: false,
+            keep_tokens: 15_000,
+            prefer_native: true,
+        }
+    }
+}
+
+impl From<Option<HarnessSettingsContent>> for HarnessAgentSettings {
+    fn from(content: Option<HarnessSettingsContent>) -> Self {
+        let Some(content) = content else {
+            return Self::default();
+        };
+        let defaults = Self::default();
+        let mode = match content.mode.as_deref() {
+            Some("v2") | Some("V2") => HarnessModeSetting::V2,
+            _ => defaults.mode,
+        };
+        Self {
+            mode,
+            background_shell: content.background_shell.unwrap_or(defaults.background_shell),
+            max_background_jobs: content
+                .max_background_jobs
+                .unwrap_or(defaults.max_background_jobs)
+                .max(1),
+            precompute: content.precompute.unwrap_or(defaults.precompute),
+            keep_tokens: content.keep_tokens.unwrap_or(defaults.keep_tokens),
+            prefer_native: content.prefer_native.unwrap_or(defaults.prefer_native),
+        }
+    }
+}
+
 fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshold> {
     let trimmed = raw.trim();
     if let Some(percent) = trimmed.strip_suffix('%') {
@@ -238,6 +293,7 @@ pub struct AgentSettings {
     pub single_file_review: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
     pub auto_compact: AutoCompactSettings,
+    pub harness: HarnessAgentSettings,
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
@@ -832,6 +888,7 @@ impl Settings for AgentSettings {
                     threshold,
                 }
             },
+            harness: agent.harness.into(),
             enable_feedback: agent.enable_feedback.unwrap(),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
@@ -1021,6 +1078,32 @@ mod tests {
     use serde_json::json;
     use settings::{ToolPermissionMode, ToolPermissionsContent};
     use std::path::PathBuf;
+
+    #[test]
+    fn harness_settings_resolve_from_content() {
+        let defaults = HarnessAgentSettings::default();
+        assert_eq!(defaults.mode, HarnessModeSetting::Legacy);
+        assert!(defaults.background_shell);
+        assert_eq!(defaults.max_background_jobs, 4);
+        assert!(!defaults.precompute);
+        assert_eq!(defaults.keep_tokens, 15_000);
+        assert!(defaults.prefer_native);
+
+        let parsed = HarnessAgentSettings::from(Some(HarnessSettingsContent {
+            mode: Some("v2".to_string()),
+            background_shell: Some(false),
+            max_background_jobs: Some(0),
+            precompute: Some(true),
+            keep_tokens: Some(2_000),
+            prefer_native: Some(false),
+        }));
+        assert_eq!(parsed.mode, HarnessModeSetting::V2);
+        assert!(!parsed.background_shell);
+        assert_eq!(parsed.max_background_jobs, 1);
+        assert!(parsed.precompute);
+        assert_eq!(parsed.keep_tokens, 2_000);
+        assert!(!parsed.prefer_native);
+    }
 
     #[test]
     fn test_parse_auto_compact_threshold() {

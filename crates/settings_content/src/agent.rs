@@ -216,6 +216,37 @@ pub struct AutoCompactSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct HarnessSettingsContent {
+    /// Harness mode: `"legacy"` keeps the existing behavior, `"v2"` enables
+    /// the OpenCode-inspired instruction, shell and compaction layers.
+    ///
+    /// Default: "legacy"
+    pub mode: Option<String>,
+    /// Allow the `terminal` tool to start commands in the background.
+    ///
+    /// Default: true
+    pub background_shell: Option<bool>,
+    /// Maximum number of background shell jobs per thread.
+    ///
+    /// Default: 4
+    pub max_background_jobs: Option<usize>,
+    /// Summarize the conversation prefix between turns, before compaction is
+    /// actually due.
+    ///
+    /// Default: false
+    pub precompute: Option<bool>,
+    /// Number of recent tokens kept verbatim when the conversation is compacted.
+    ///
+    /// Default: 15000
+    pub keep_tokens: Option<usize>,
+    /// Prefer a provider-native compaction endpoint when the model supports it.
+    ///
+    /// Default: true
+    pub prefer_native: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
     /// Whether the Agent is enabled.
     ///
@@ -349,6 +380,9 @@ pub struct AgentSettingsContent {
     /// earlier messages to free up room in the model's context window once the
     /// context grows too large.
     pub auto_compact: Option<AutoCompactSettingsContent>,
+    /// Native agent harness settings (instruction set, background shell,
+    /// compaction tuning).
+    pub harness: Option<HarnessSettingsContent>,
     /// Whether to show thumb buttons for feedback in the agent panel.
     ///
     /// Default: true

@@ -597,6 +597,7 @@ mod tests {
                 enabled: false,
                 threshold: agent_settings::AutoCompactThreshold::DEFAULT,
             },
+            harness: Default::default(),
             enable_feedback: false,
             expand_edit_card: true,
             expand_terminal_card: true,
