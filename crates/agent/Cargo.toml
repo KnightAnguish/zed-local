@@ -52,6 +52,7 @@ language_model.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
+pdf-extract = "0.12.1"
 project.workspace = true
 prompt_store.workspace = true
 quick-xml.workspace = true

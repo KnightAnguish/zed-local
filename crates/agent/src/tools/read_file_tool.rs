@@ -2,7 +2,7 @@ use action_log::ActionLog;
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
-use gpui::{App, AsyncApp, Entity, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task, WeakEntity};
 use indoc::formatdoc;
 use language::Point;
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
@@ -61,6 +61,43 @@ fn format_with_line_numbers(text: &str, start_line: u32) -> String {
     let mut output = String::with_capacity(text.len() + text.len() / 4);
     write_lines_numbered(&mut output, std::iter::once(text), start_line);
     output
+}
+
+/// Maximum number of characters returned from a PDF before truncating the
+/// extraction. PDFs can be arbitrarily large and the model's context window is
+/// not; page images and long appendices are the common offenders.
+const MAX_PDF_TEXT_CHARS: usize = 1_000_000;
+
+/// Formats extracted PDF pages with page markers, applies the requested line
+/// range, and caps the result at [`MAX_PDF_TEXT_CHARS`].
+fn format_pdf_text(pages: &[String], start_line: Option<u32>, end_line: Option<u32>) -> String {
+    let mut text = String::new();
+    for (index, page) in pages.iter().enumerate() {
+        if index > 0 {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("--- page {} ---\n", index + 1));
+        text.push_str(page);
+    }
+
+    let (start, end) = resolve_line_range(start_line, end_line);
+    if start > 1 || end != u32::MAX {
+        let lines: Vec<&str> = text.lines().collect();
+        let start_index = (start as usize).saturating_sub(1).min(lines.len());
+        let end_index = (end as usize).min(lines.len());
+        text = lines[start_index..end_index.max(start_index)].join("\n");
+    }
+
+    if text.chars().count() > MAX_PDF_TEXT_CHARS {
+        let truncated = text
+            .char_indices()
+            .nth(MAX_PDF_TEXT_CHARS)
+            .map_or(text.len(), |(index, _)| index);
+        text.truncate(truncated);
+        text.push_str("\n\n... (PDF text truncated)");
+    }
+
+    text
 }
 
 fn append_line_segment(
@@ -205,6 +242,8 @@ use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput, outline};
 ///   Use `grep` or `terminal` to inspect the full content of very long lines.
 /// - This tool supports reading image files. Supported formats: PNG, JPEG, WebP, GIF, BMP, TIFF.
 ///   Image files are returned as visual content that you can analyze directly.
+/// - PDF files are converted to text page by page. Scanned PDFs without a text
+///   layer are reported as unsupported; OCR is not performed.
 ///
 /// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -451,6 +490,39 @@ impl AgentTool for ReadFileTool {
                 ]));
 
                 return Ok(language_model_image.into());
+            }
+
+            if file_path.to_ascii_lowercase().ends_with(".pdf") {
+                let bytes = fs.load_bytes(&abs_path).await.map_err(tool_content_err)?;
+                let pages = cx
+                    .background_spawn(async move {
+                        pdf_extract::extract_text_from_mem_by_pages(&bytes)
+                    })
+                    .await
+                    .map_err(|error| {
+                        tool_content_err(format!("Unable to extract text from PDF: {error}"))
+                    })?;
+
+                let text = format_pdf_text(&pages, input.start_line, input.end_line);
+                if text.trim().is_empty() {
+                    return Err(tool_content_err(format!(
+                        "{file_path} has no extractable PDF text. It may be a scanned document; \
+                         OCR is not supported."
+                    )));
+                }
+                let text = format_with_line_numbers(&text, input.start_line.unwrap_or(1).max(1));
+
+                let output = format!(
+                    "Contents of {file_path} (PDF, {} page{}):\n\n{text}",
+                    pages.len(),
+                    if pages.len() == 1 { "" } else { "s" }
+                );
+                event_stream.update_fields(|update| {
+                    update.content(vec![
+                        acp::ContentBlock::Text(acp::TextContent::new(output.clone())).into(),
+                    ])
+                });
+                return Ok(output.into());
             }
 
             let open_buffer_task = project.update(cx, |project, cx| {
@@ -1163,6 +1235,42 @@ mod test {
             })
             .await;
         assert_eq!(result.unwrap(), "     1\troot content".into());
+    }
+
+    #[gpui::test]
+    async fn test_read_file_extracts_pdf_text(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.create_dir(path!("/root").as_ref()).await.unwrap();
+        fs.insert_file(path!("/root/document.pdf"), minimal_pdf("Hello PDF"))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "root/document.pdf".into(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let LanguageModelToolResultContent::Text(text) = result else {
+            panic!("expected PDF text output");
+        };
+
+        assert!(text.contains("PDF, 1 page"), "{text}");
+        assert!(text.contains("--- page 1 ---"), "{text}");
+        assert!(text.contains("Hello PDF"), "{text}");
     }
 
     #[gpui::test]
@@ -2326,6 +2434,65 @@ mod test {
         let mut output = String::new();
         write_lines_numbered(&mut output, chunks.iter().copied(), start_line);
         output
+    }
+
+    #[test]
+    fn test_format_pdf_text_adds_page_markers_and_keeps_ranges() {
+        let pages = vec![
+            "First page line one\nFirst page line two".to_string(),
+            "Second page".to_string(),
+        ];
+        assert_eq!(
+            format_pdf_text(&pages, None, None),
+            "--- page 1 ---\nFirst page line one\nFirst page line two\n\n--- page 2 ---\nSecond page"
+        );
+        assert_eq!(
+            format_pdf_text(&pages, Some(2), Some(3)),
+            "First page line one\nFirst page line two"
+        );
+    }
+
+    #[test]
+    fn test_pdf_text_extraction_from_memory() {
+        let pdf = minimal_pdf("Hello PDF");
+        let pages = pdf_extract::extract_text_from_mem_by_pages(&pdf)
+            .expect("extract text from a minimal PDF");
+        let text = format_pdf_text(&pages, None, None);
+        assert!(text.contains("--- page 1 ---"), "{text}");
+        assert!(text.contains("Hello PDF"), "{text}");
+    }
+
+    fn minimal_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+        }
+
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            xref_offset
+        ));
+        pdf.into_bytes()
     }
 
     #[test]
