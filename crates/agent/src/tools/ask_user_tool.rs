@@ -1,9 +1,7 @@
 ﻿use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{
-    AgentTool, ClientUserMessageId, ToolCallEventStream, ToolInput, UserMessageContent,
-};
+use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::Result;
 use gpui::{App, SharedString, Task};
@@ -125,36 +123,36 @@ impl AgentTool for AskUserTool {
             }
 
             let schema = build_schema(&input.options, input.allow_free_text);
-
-            let prompt = cx
-                .update(|cx| event_stream.request_elicitation(input.question.clone(), schema, cx));
+            let tool_call_id = event_stream.tool_call_id().clone();
+            let question = input.question.clone();
 
             if input.background {
-                let question = input.question.clone();
+                if let Some(thread) = event_stream
+                    .thread_handle()
+                    .and_then(|thread| thread.upgrade())
+                {
+                    thread.update(cx, |thread, cx| {
+                        thread.add_pending_question(
+                            crate::DbPendingQuestion {
+                                tool_call_id: tool_call_id.clone(),
+                                question: question.clone(),
+                                schema: schema.clone(),
+                            },
+                            cx,
+                        );
+                    });
+                }
+
+                let prompt = cx.update(|cx| {
+                    event_stream.request_elicitation(question.clone(), schema, cx)
+                });
                 let answer_question = question.clone();
                 let thread = event_stream.thread_handle();
                 cx.spawn(async move |cx| {
                     let Ok(response) = prompt.await else {
                         return;
                     };
-                    let answer = match response.action {
-                        acp_v2::ElicitationAction::Accept(accept) => {
-                            let content = accept.content.unwrap_or_default();
-                            match string_field(&content, OTHER_FIELD)
-                                .or_else(|| string_field(&content, CHOICE_FIELD))
-                            {
-                                Some(answer) => answer,
-                                None => {
-                                    "The user submitted the form without providing an answer."
-                                        .to_string()
-                                }
-                            }
-                        }
-                        acp_v2::ElicitationAction::Decline => {
-                            "The user declined to answer the question.".to_string()
-                        }
-                        _ => "The user cancelled the question without answering.".to_string(),
-                    };
+                    let answer = background_answer(response);
 
                     let Some(thread) = thread.and_then(|thread| thread.upgrade()) else {
                         return;
@@ -164,23 +162,21 @@ impl AgentTool for AskUserTool {
                             .timer(std::time::Duration::from_millis(500))
                             .await;
                     }
-                    let content = format!(
-                        "<user-answer question=\"{}\">\n{}\n</user-answer>\n\n\
-                         The user answered the question you asked earlier. Continue the task with this answer.",
-                        escape_xml(&answer_question),
-                        escape_xml(&answer),
-                    );
-                    let id = ClientUserMessageId::new();
-                    let result = thread.update(cx, |thread, cx| {
-                        thread.send(id, vec![UserMessageContent::Text(content)], cx)
+                    thread.update(cx, |thread, cx| {
+                        thread.remove_pending_question(&tool_call_id, cx);
+                        thread.send_background_answer(
+                            vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                                background_answer_message(&answer_question, &answer),
+                            ))],
+                            cx,
+                        );
                     });
-                    if let Err(error) = result {
-                        log::warn!("Failed to deliver a background answer: {error:#}");
-                    }
                 })
                 .detach();
                 return Ok(AskUserToolOutput::Pending { question });
             }
+
+            let prompt = cx.update(|cx| event_stream.request_elicitation(question, schema, cx));
 
             let response = prompt.await.map_err(|error| AskUserToolOutput::Error {
                 error: error.to_string(),
@@ -219,6 +215,34 @@ impl AgentTool for AskUserTool {
             Ok(AskUserToolOutput::Answered { selected })
         })
     }
+}
+
+/// Converts a raw elicitation response into the text sent back to the model
+/// after a background question was answered.
+pub(crate) fn background_answer(response: acp_v2::CreateElicitationResponse) -> String {
+    match response.action {
+        acp_v2::ElicitationAction::Accept(accept) => {
+            let content = accept.content.unwrap_or_default();
+            string_field(&content, OTHER_FIELD)
+                .or_else(|| string_field(&content, CHOICE_FIELD))
+                .unwrap_or_else(|| {
+                    "The user submitted the form without providing an answer.".to_string()
+                })
+        }
+        acp_v2::ElicitationAction::Decline => "The user declined to answer the question.".to_string(),
+        _ => "The user cancelled the question without answering.".to_string(),
+    }
+}
+
+/// Builds the user-message envelope delivered when a background question is
+/// answered, including after a thread was reopened.
+pub(crate) fn background_answer_message(question: &str, answer: &str) -> String {
+    format!(
+        "<user-answer question=\"{}\">\n{}\n</user-answer>\n\n\
+         The user answered the question you asked earlier. Continue the task with this answer.",
+        escape_xml(question),
+        escape_xml(answer),
+    )
 }
 
 /// Escapes text embedded in the XML-ish background answer envelope.

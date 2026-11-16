@@ -944,6 +944,7 @@ impl NativeAgent {
         let weak = cx.weak_entity();
         let weak_thread = thread_handle.downgrade();
         thread_handle.update(cx, |thread, cx| {
+            thread.set_native_agent(weak.clone());
             thread.set_summarization_model(summarization_model, cx);
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
@@ -2479,6 +2480,27 @@ impl NativeAgentConnection {
             }
             completion.await?.map_err(|error| anyhow!("{error:#}"))
         })
+    }
+
+    fn submit_background_answer(
+        &self,
+        session_id: acp_v2::SessionId,
+        content: Vec<acp_v2::ContentBlock>,
+        cx: &mut App,
+    ) {
+        let (receipt, completion) = self.submit_native(session_id, Some(content), cx);
+        cx.spawn(async move |_cx| {
+            if let Err(error) = receipt.await {
+                log::warn!("Background answer was not accepted: {error:#}");
+                return;
+            }
+            match completion.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => log::warn!("Background answer turn failed: {error:#}"),
+                Err(error) => log::warn!("Background answer completion was dropped: {error:#}"),
+            }
+        })
+        .detach();
     }
 
     fn submit_native(
@@ -4831,6 +4853,51 @@ mod internal_tests {
             .skip(1)
             .map(language_model::LanguageModelRequestMessage::string_contents)
             .collect()
+    }
+
+    #[gpui::test]
+    async fn test_background_answer_uses_native_submission_path(cx: &mut TestAppContext) {
+        let fake = init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = fake.model("fake");
+
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_pending_question(
+                crate::DbPendingQuestion {
+                    tool_call_id: "call_pending".into(),
+                    question: "Pick an option".into(),
+                    schema: acp_v2::ElicitationSchema::new(),
+                },
+                cx,
+            );
+            thread.remove_pending_question(&"call_pending".into(), cx);
+            thread.send_background_answer(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    crate::background_answer_message("Pick an option", "A"),
+                ))],
+                cx,
+            );
+        });
+
+        cx.run_until_parked();
+        let request = fake
+            .pending_completions_for(&model)
+            .pop()
+            .expect("background answer reaches the model");
+        assert!(
+            request_texts_after_system(&request.messages)
+                .iter()
+                .any(|text| text.contains("user-answer") && text.contains("Pick an option")),
+            "background answer should be submitted as a user message"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.pending_questions().is_empty());
+        });
+
+        cx.update(|cx| connection.cancel(&session_id, cx)).ok();
     }
 
     #[gpui::test]

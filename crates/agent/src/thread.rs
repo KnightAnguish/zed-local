@@ -1,6 +1,7 @@
 use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
+    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbPendingQuestion, DbThread,
+    DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
@@ -1373,6 +1374,7 @@ pub(crate) struct StreamingSaveKey {
     thinking_effort: Option<String>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
+    pending_questions_revision: usize,
 }
 
 pub struct Thread {
@@ -1419,6 +1421,12 @@ pub struct Thread {
     pending_checkpoint: Option<PendingCheckpoint>,
     precompute_in_flight: bool,
     precompute_task: Option<Task<()>>,
+    /// Unanswered background `ask_user` questions, persisted with the thread.
+    pending_questions: Vec<DbPendingQuestion>,
+    pending_questions_revision: usize,
+    /// Set by `NativeAgent` so background answers can be submitted through the
+    /// same path as user prompts, keeping ACP/UI events connected.
+    native_agent: Option<WeakEntity<crate::NativeAgent>>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
@@ -1595,6 +1603,9 @@ impl Thread {
             pending_checkpoint: None,
             precompute_in_flight: false,
             precompute_task: None,
+            pending_questions: Vec::new(),
+            pending_questions_revision: 0,
+            native_agent: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
                 cx.foreground_executor()
@@ -1760,6 +1771,7 @@ impl Thread {
                 }
             }
         }
+        self.restore_pending_questions(&stream, cx);
         rx
     }
 
@@ -1992,6 +2004,9 @@ impl Thread {
             pending_checkpoint: None,
             precompute_in_flight: false,
             precompute_task: None,
+            pending_questions: db_thread.pending_questions,
+            pending_questions_revision: 0,
+            native_agent: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
             profile_id,
@@ -2118,6 +2133,7 @@ impl Thread {
                 }
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
+            pending_questions: self.pending_questions.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
         };
 
@@ -2145,6 +2161,7 @@ impl Thread {
             thinking_effort: self.thinking_effort.clone(),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            pending_questions_revision: self.pending_questions_revision,
         }
     }
 
@@ -2851,6 +2868,117 @@ impl Thread {
 
     pub(crate) fn last_user_message_id(&self) -> Option<ClientUserMessageId> {
         self.last_user_message().map(|message| message.id.clone())
+    }
+
+    pub(crate) fn set_native_agent(&mut self, agent: WeakEntity<crate::NativeAgent>) {
+        self.native_agent = Some(agent);
+    }
+
+    pub fn pending_questions(&self) -> &[DbPendingQuestion] {
+        &self.pending_questions
+    }
+
+    pub fn add_pending_question(
+        &mut self,
+        question: DbPendingQuestion,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_questions
+            .iter()
+            .any(|existing| existing.tool_call_id == question.tool_call_id)
+        {
+            return;
+        }
+        self.pending_questions.push(question);
+        self.pending_questions_revision += 1;
+        self.updated_at = Utc::now();
+        cx.notify();
+    }
+
+    pub fn remove_pending_question(
+        &mut self,
+        tool_call_id: &acp_v2::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_len = self.pending_questions.len();
+        self.pending_questions
+            .retain(|question| &question.tool_call_id != tool_call_id);
+        if self.pending_questions.len() != previous_len {
+            self.pending_questions_revision += 1;
+            self.updated_at = Utc::now();
+            cx.notify();
+        }
+    }
+
+    /// Sends an answer that arrived after the turn which asked the question had
+    /// already finished. Through `NativeAgent` this follows the same submission
+    /// path as a normal prompt, so ACP/UI events stay connected.
+    pub fn send_background_answer(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent) = self.native_agent.as_ref().and_then(|agent| agent.upgrade()) {
+            let session_id = self.id.clone();
+            let connection = crate::NativeAgentConnection(agent);
+            cx.spawn(async move |_thread, cx| {
+                cx.update(|cx| {
+                    connection.submit_background_answer(session_id, content, cx);
+                });
+            })
+            .detach();
+            return;
+        }
+
+        let text = content
+            .into_iter()
+            .find_map(|block| match block {
+                acp_v2::ContentBlock::Text(text) => Some(text.text),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Err(error) =
+            self.send(ClientUserMessageId::new(), vec![UserMessageContent::Text(text)], cx)
+        {
+            log::warn!("Failed to deliver a background answer: {error:#}");
+        }
+    }
+
+    fn restore_pending_questions(
+        &mut self,
+        stream: &ThreadEventStream,
+        cx: &mut Context<Self>,
+    ) {
+        for question in self.pending_questions.clone() {
+            let response = stream.request_elicitation(
+                question.tool_call_id.clone(),
+                question.question.clone(),
+                question.schema.clone(),
+                cx,
+            );
+            let tool_call_id = question.tool_call_id;
+            let question_text = question.question;
+
+            cx.spawn(async move |thread, cx| {
+                let Ok(response) = response.await else {
+                    return;
+                };
+                let answer = crate::background_answer(response);
+                thread
+                    .update(cx, |thread, cx| {
+                        thread.remove_pending_question(&tool_call_id, cx);
+                        thread.send_background_answer(
+                            vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                                crate::background_answer_message(&question_text, &answer),
+                            ))],
+                            cx,
+                        );
+                    })
+                    .ok();
+            })
+            .detach();
+        }
     }
 
     pub(crate) fn has_user_message(&self, id: &ClientUserMessageId) -> bool {
@@ -6738,6 +6866,34 @@ impl ThreadEventStream {
         self.sender
             .unbounded_send(Ok(ThreadEvent::UserMessage(message.clone())))
             .ok();
+    }
+
+    fn request_elicitation(
+        &self,
+        tool_call_id: acp_v2::ToolCallId,
+        message: String,
+        schema: acp_v2::ElicitationSchema,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::CreateElicitationResponse>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if let Err(error) =
+            self.sender
+                .unbounded_send(Ok(ThreadEvent::Elicitation(ElicitationRequest {
+                    tool_call_id,
+                    message,
+                    schema,
+                    response: response_tx,
+                })))
+        {
+            log::error!("Failed to send restored elicitation request: {error}");
+            return Task::ready(Err(anyhow!("Failed to send elicitation request: {error}")));
+        }
+
+        cx.spawn(async move |_cx| {
+            response_rx
+                .await
+                .map_err(|_| anyhow!("elicitation channel closed"))
+        })
     }
 
     fn send_text(&self, text: &str) {
@@ -11238,6 +11394,45 @@ mod tests {
             );
 
             assert_eq!(thread.compaction_message_target_ix(cx), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replay_restores_pending_question(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
+
+        let mut replay_events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.add_pending_question(
+                    DbPendingQuestion {
+                        tool_call_id: "call_pending".into(),
+                        question: "Pick an option".into(),
+                        schema: acp_v2::ElicitationSchema::new(),
+                    },
+                    cx,
+                );
+                thread.replay(cx)
+            })
+        });
+
+        let event = replay_events.next().await;
+        let request = match event {
+            Some(Ok(ThreadEvent::Elicitation(request))) => request,
+            _ => panic!("expected restored elicitation, got {event:?}"),
+        };
+        assert_eq!(request.message, "Pick an option");
+        assert_eq!(request.tool_call_id, "call_pending".into());
+
+        request
+            .response
+            .send(acp_v2::CreateElicitationResponse::new(
+                acp_v2::ElicitationAction::Cancel,
+            ))
+            .expect("restored question receiver");
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.pending_questions.is_empty());
         });
     }
 

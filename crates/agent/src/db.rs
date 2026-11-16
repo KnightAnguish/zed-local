@@ -81,11 +81,24 @@ pub struct DbThread {
     pub ui_scroll_position: Option<SerializedScrollPosition>,
     #[serde(default)]
     pub sandboxed_terminal_temp_dir: Option<PathBuf>,
+    /// Background `ask_user` questions that have not been answered yet. They are
+    /// restored as elicitation forms when the thread is reopened.
+    #[serde(default)]
+    pub pending_questions: Vec<DbPendingQuestion>,
     /// Sandbox escalations the user approved "for the rest of this thread".
     /// Persisted so reopening a thread keeps its grants. See
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+}
+
+/// One unanswered background `ask_user` question, persisted with the thread so
+/// reopening the conversation can render the form again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbPendingQuestion {
+    pub tool_call_id: acp_v2::ToolCallId,
+    pub question: String,
+    pub schema: acp_v2::ElicitationSchema,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -168,6 +181,7 @@ impl SharedThread {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            pending_questions: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         }
     }
@@ -355,6 +369,7 @@ impl DbThread {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            pending_questions: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         })
     }
@@ -953,6 +968,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_questions_roundtrip() {
+        let mut thread = make_thread(
+            "Pending",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.pending_questions.push(DbPendingQuestion {
+            tool_call_id: "call_pending".into(),
+            question: "Which option?".into(),
+            schema: acp_v2::ElicitationSchema::new(),
+        });
+
+        let json = serde_json::to_string(&thread).expect("serialize pending question");
+        let restored: DbThread = serde_json::from_str(&json).expect("deserialize pending question");
+        assert_eq!(restored.pending_questions.len(), 1);
+        assert_eq!(restored.pending_questions[0].question, "Which option?");
+    }
+
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
             title: title.to_string().into(),
@@ -971,6 +1004,7 @@ mod tests {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            pending_questions: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         }
     }

@@ -1115,6 +1115,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            harness: Default::default(),
         };
 
         cx.update(|cx| {
