@@ -119,8 +119,26 @@ impl UpdateVersion {
     }
 
     fn version_tooltip_message(version: &Version) -> String {
-        UpdateButton::version_tooltip_message(version)
+        UpdateButton::version_tooltip_message(display_version(version))
     }
+}
+
+/// A short version label for the title bar.
+///
+/// The full semver build metadata (`+stable.<sha>`, `+dev.<sha>`) is noise for
+/// users; local packages carry a readable `+local.<stamp>` part instead, which
+/// is the only build metadata worth showing.
+fn display_version(version: &Version) -> String {
+    let mut label = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    if !version.pre.is_empty() {
+        label.push('-');
+        label.push_str(version.pre.as_str());
+    }
+    if let Some(stamp) = version.build.as_str().strip_prefix("local.") {
+        label.push_str(" · ");
+        label.push_str(stamp);
+    }
+    label
 }
 
 impl Render for UpdateVersion {
@@ -138,7 +156,7 @@ impl Render for UpdateVersion {
                 let button = if is_fork {
                     UpdateButton::new(
                         IconName::Download,
-                        format!("ZedLocal {version} available"),
+                        format!("ZedLocal {} available", display_version(version)),
                     )
                     .tooltip("Download and install this ZedLocal release; it applies after a restart.")
                     .on_click(move |_, _, cx| {
@@ -147,7 +165,7 @@ impl Render for UpdateVersion {
                         }
                     })
                 } else {
-                    UpdateButton::new(IconName::Download, format!("Zed {version} available"))
+                    UpdateButton::new(IconName::Download, format!("Zed {} available", display_version(version)))
                         .tooltip("Official stable release available. Review and merge into Zed Local; this build will not be overwritten.")
                         .on_click(move |_, _, cx| cx.open_url(&url))
                 };
@@ -165,7 +183,10 @@ impl Render for UpdateVersion {
                     let status = AutoUpdater::get(cx).map(|updater| updater.read(cx).status());
                     let message = match &status {
                         Some(AutoUpdateStatus::Downloading { version, progress }) => {
-                            UpdateButton::downloading_tooltip_message(version, *progress)
+                            UpdateButton::downloading_tooltip_message(
+                                display_version(version),
+                                *progress,
+                            )
                         }
                         _ => Self::version_tooltip_message(&rendered_version),
                     };
@@ -222,6 +243,26 @@ mod tests {
         assert_eq!(
             message,
             "Update to Version: 1.0.0+nightly.14d9a4189f058d8736339b06ff2340101eaea5af"
+        );
+    }
+
+    #[test]
+    fn display_version_hides_build_hashes() {
+        assert_eq!(
+            display_version(&"1.28.1+stable.076fe5e19f7f54d9756f71f67528b37e276806b0".parse().unwrap()),
+            "1.28.1"
+        );
+        assert_eq!(
+            display_version(&"1.28.1+dev.1d35c814066c26bea893427d8b3eb5e4d8f0ba92".parse().unwrap()),
+            "1.28.1"
+        );
+        assert_eq!(
+            display_version(&"1.28.1+local.20261116.5".parse().unwrap()),
+            "1.28.1 · 20261116.5"
+        );
+        assert_eq!(
+            display_version(&"2.0.0-beta.3+nightly.abcdef".parse().unwrap()),
+            "2.0.0-beta.3"
         );
     }
 

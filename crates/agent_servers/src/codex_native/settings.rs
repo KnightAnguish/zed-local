@@ -1,4 +1,4 @@
-use super::transport::Rpc;
+﻿use super::transport::Rpc;
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{App, Task};
@@ -402,9 +402,9 @@ impl Quota {
             task: RefCell::new(None),
         })
     }
-    pub(super) fn option(&self) -> acp::SessionConfigOption {
+    pub(super) fn options(&self) -> Vec<acp::SessionConfigOption> {
         let state = self.state.borrow();
-        crate::codex_usage::usage_option(
+        crate::codex_usage::usage_options(
             state.response.as_ref(),
             state.error.as_deref(),
             chrono::Utc::now().timestamp(),
@@ -613,7 +613,7 @@ mod tests {
         peer.send(json!({"id":request["id"],"result":{"rateLimits":{"secondary":{"usedPercent":23,"windowDurationMins":10080,"resetsAt":resets}}}})).await;
         cx.run_until_parked();
         assert_eq!(
-            serde_json::to_value(quota.option()).unwrap()["options"][0]["name"],
+            serde_json::to_value(quota.options()).unwrap()[0]["options"][0]["name"],
             "77%"
         );
         let previous = quota.state.borrow().requested;
@@ -627,7 +627,7 @@ mod tests {
         peer.send(json!({"id":refresh["id"],"result":{}})).await;
         cx.run_until_parked();
         assert_eq!(
-            serde_json::to_value(quota.option()).unwrap()["options"][0]["name"],
+            serde_json::to_value(quota.options()).unwrap()[0]["options"][0]["name"],
             "—"
         );
     }
@@ -645,7 +645,8 @@ mod tests {
         peer.send(json!({"id":new["id"],"error":{"code":-1,"message":"offline"}}))
             .await;
         cx.run_until_parked();
-        let option = serde_json::to_value(quota.option()).unwrap();
+        let options = serde_json::to_value(quota.options()).unwrap();
+        let option = &options[0];
         assert_eq!(option["options"][0]["name"], "—");
         assert!(option["description"].as_str().unwrap().contains("offline"));
     }

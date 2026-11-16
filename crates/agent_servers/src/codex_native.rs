@@ -1,4 +1,4 @@
-//! Native Codex integration under construction. Not selected by production routing.
+﻿//! Native Codex integration under construction. Not selected by production routing.
 //! Keep the legacy connector until the parity gates in NATIVE_CODEX.md pass.
 mod events;
 mod forks;
@@ -2407,7 +2407,7 @@ impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
                 vec![acp_v2::SessionConfigSelectOption::new("local", "Локальная история"), acp_v2::SessionConfigSelectOption::new("connect", "Подключить агента")])
                 .description("Можно читать без связи. Подключите агента, чтобы выбрать модель и настройки до отправки сообщения."));
         }
-        options.push(self.quota.option());
+        options.extend(self.quota.options());
         options
     }
     fn set_config_option(
@@ -2467,12 +2467,12 @@ impl acp_thread::AgentSessionConfigOptions for ConfigOptions {
                 drop(guard);
                 sender.borrow_mut().send(()).log_err();
                 cx.update(|cx| quota.refresh(cx, false));
-                options.push(quota.option());
+                options.extend(quota.options());
                 Ok(options)
             });
         }
         let result = (|| {
-            if id.0.as_ref() == "weekly-usage" {
+            if crate::codex_usage::owns_usage(&id) {
                 ensure!(
                     value
                         .as_id()

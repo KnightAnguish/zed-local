@@ -18,6 +18,7 @@ use std::{
 use util::{ResultExt as _, process::Child};
 
 const USAGE_ID: &str = "opencode-usage";
+const USAGE_ID_PREFIX: &str = "opencode-usage-";
 const USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 #[derive(Default)]
@@ -124,7 +125,8 @@ impl OpenCodeUsage {
     }
 
     pub(crate) fn owns(config_id: &acp::SessionConfigId) -> bool {
-        config_id.0.as_ref() == USAGE_ID
+        let id = config_id.0.as_ref();
+        id == USAGE_ID || id.starts_with(USAGE_ID_PREFIX)
     }
 
     pub(crate) fn options(
@@ -133,7 +135,7 @@ impl OpenCodeUsage {
     ) -> Vec<acp::SessionConfigOption> {
         options.retain(|option| !Self::owns(&option.config_id));
         let state = self.state.borrow();
-        options.push(usage_option(
+        options.extend(usage_options(
             state.usage.as_ref(),
             state.error.as_deref(),
             chrono::Utc::now().timestamp_millis(),
@@ -251,48 +253,65 @@ fn parse_active_token(stdout: &[u8]) -> Result<String> {
     Ok(token.clone())
 }
 
-fn usage_option(
+fn usage_options(
     usage: Option<&GoUsage>,
     error: Option<&str>,
     now_ms: i64,
-) -> acp::SessionConfigOption {
-    let weekly = usage.map(|usage| &usage.weekly);
-    let reset = weekly
-        .and_then(|meter| meter.resets_at.as_deref())
-        .and_then(parse_reset);
-    let weekly_used = weekly
-        .map(|meter| meter.percent)
-        .filter(|percent| percent.is_finite() && (0.0..=100.0).contains(percent))
-        .filter(|_| reset.is_none_or(|reset| reset > now_ms));
-    let label = weekly_used
-        .map(|used| format!("{}%", remaining_percent(used)))
-        .unwrap_or_else(|| "—".into());
-    let description = if let Some(usage) = usage {
-        let reset = reset
-            .map(format_reset)
-            .unwrap_or_else(|| "неизвестно".into());
-        format!(
-            "OpenCode Go, осталось: 5ч — {}%, неделя — {}%, месяц — {}%. Сброс недели: {reset}.",
-            remaining(&usage.rolling),
-            remaining(&usage.weekly),
-            remaining(&usage.monthly),
+) -> Vec<acp::SessionConfigOption> {
+    let Some(usage) = usage else {
+        return vec![acp::SessionConfigOption::select(
+            USAGE_ID,
+            "Лимит OpenCode",
+            "status",
+            vec![
+                acp::SessionConfigSelectOption::new("status", "—"),
+                acp::SessionConfigSelectOption::new("refresh", "Обновить"),
+            ],
         )
-    } else {
-        format!(
+        .description(format!(
             "Лимит OpenCode недоступен. {}",
             error.unwrap_or("Нет данных от OpenCode Go.")
-        )
+        ))];
     };
-    acp::SessionConfigOption::select(
-        USAGE_ID,
-        "Лимит OpenCode",
-        "status",
-        vec![
-            acp::SessionConfigSelectOption::new("status", label),
-            acp::SessionConfigSelectOption::new("refresh", "Обновить"),
-        ],
-    )
-    .description(description)
+
+    [
+        ("5h", "5 ч", &usage.rolling),
+        ("week", "неделя", &usage.weekly),
+        ("month", "месяц", &usage.monthly),
+    ]
+    .into_iter()
+    .map(|(id, label, meter)| {
+        let reset = meter.resets_at.as_deref().and_then(parse_reset);
+        let available = meter.percent.is_finite()
+            && (0.0..=100.0).contains(&meter.percent)
+            && reset.is_none_or(|reset| reset > now_ms);
+        let remaining = remaining(meter);
+        let value = if available {
+            format!("{remaining}%")
+        } else {
+            "—".into()
+        };
+        let description = if available {
+            match reset.map(format_reset) {
+                Some(reset) => format!("Осталось {value}. Сброс: {reset}."),
+                None => format!("Осталось {value}. Время сброса неизвестно."),
+            }
+        } else {
+            format!("Данные лимита недоступны. {}", error.unwrap_or("Нет данных от OpenCode Go."))
+        };
+
+        acp::SessionConfigOption::select(
+            format!("{USAGE_ID_PREFIX}{id}"),
+            format!("Лимит OpenCode · {label}"),
+            "status",
+            vec![
+                acp::SessionConfigSelectOption::new("status", value),
+                acp::SessionConfigSelectOption::new("refresh", "Обновить"),
+            ],
+        )
+        .description(description)
+    })
+    .collect()
 }
 
 fn remaining(meter: &Meter) -> u8 {
@@ -349,21 +368,20 @@ mod tests {
     }
 
     #[test]
-    fn opencode_option_shows_remaining_weekly_allowance() {
+    fn opencode_options_show_every_allowance() {
         let usage: GoUsage = serde_json::from_value(json!({
             "rolling": {"status": "ok", "percent": 1, "resetsAt": "2030-01-01T03:00:00.000Z"},
             "weekly": {"status": "ok", "percent": 25, "resetsAt": "2030-01-09T00:00:00.000Z"},
             "monthly": {"status": "ok", "percent": 40, "resetsAt": "2030-02-05T19:00:00.000Z"}
         }))
         .expect("usage");
-        let option = serde_json::to_value(usage_option(Some(&usage), None, 0)).expect("option");
-        assert_eq!(option["options"][0]["name"], "75%");
-        assert!(
-            option["description"]
-                .as_str()
-                .expect("description")
-                .contains("неделя — 75%")
-        );
+        let options = serde_json::to_value(usage_options(Some(&usage), None, 0)).expect("options");
+        assert_eq!(options[0]["name"], "Лимит OpenCode · 5 ч");
+        assert_eq!(options[1]["name"], "Лимит OpenCode · неделя");
+        assert_eq!(options[2]["name"], "Лимит OpenCode · месяц");
+        assert_eq!(options[0]["options"][0]["name"], "99%");
+        assert_eq!(options[1]["options"][0]["name"], "75%");
+        assert_eq!(options[2]["options"][0]["name"], "60%");
     }
 
     #[test]
@@ -374,14 +392,8 @@ mod tests {
             "monthly": {"status": "ok", "percent": 0, "resetsAt": "2030-02-05T19:00:00.000Z"}
         }))
         .expect("usage");
-        let option = serde_json::to_value(usage_option(Some(&usage), None, 0)).expect("option");
-        assert_eq!(option["options"][0]["name"], "100%");
-        assert!(
-            option["description"]
-                .as_str()
-                .expect("description")
-                .contains("5ч — 0%")
-        );
+        let options = serde_json::to_value(usage_options(Some(&usage), None, 0)).expect("options");
+        assert_eq!(options[0]["options"][0]["name"], "0%");
     }
 
     #[gpui::test]
@@ -410,11 +422,11 @@ mod tests {
 
     #[test]
     fn opencode_option_without_data_is_explicit() {
-        let option =
-            serde_json::to_value(usage_option(None, Some("not signed in"), 0)).expect("option");
-        assert_eq!(option["options"][0]["name"], "—");
+        let options =
+            serde_json::to_value(usage_options(None, Some("not signed in"), 0)).expect("options");
+        assert_eq!(options[0]["options"][0]["name"], "—");
         assert!(
-            option["description"]
+            options[0]["description"]
                 .as_str()
                 .expect("description")
                 .contains("not signed in")
