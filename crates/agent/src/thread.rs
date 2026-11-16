@@ -5772,26 +5772,59 @@ fn truncate_request_message_to_budget(
     })
 }
 
-/// Placeholder for attachments dropped from a compaction request.
-const COMPACTION_MEDIA_STUB: &str = "[attachment omitted to fit the compaction budget]";
+/// Fallback placeholder when an attachment was dropped and its durable copy is
+/// not available.
+const COMPACTION_MEDIA_STUB: &str = "[image attachment omitted to reduce the request size]";
 
-/// Replaces images in a request message with a short text stub and reports
-/// whether anything was dropped. Tool-result images are stubbed too, so a
-/// screenshot returned by a tool cannot blow the compaction budget.
-fn stub_request_message_media(
+const ATTACHMENT_EXTENSIONS: [&str; 5] = ["png", "jpg", "gif", "webp", "bmp"];
+
+/// Finds the durable copy of an image under `root`.
+///
+/// Attachments are stored as `<sha256-of-bytes>.<extension>`, while a request
+/// only carries the base64 payload, so the hash is recomputed here. This runs
+/// only when a request is being shrunk, so the decode cost stays off the common
+/// path.
+fn stored_attachment_path(root: &Path, image: &LanguageModelImage) -> Option<PathBuf> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.source.as_bytes())
+        .ok()?;
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    ATTACHMENT_EXTENSIONS
+        .iter()
+        .map(|extension| root.join(format!("{digest}.{extension}")))
+        .find(|path| path.is_file())
+}
+
+/// Text that replaces an image: a local file reference the agent can open with
+/// `read_file`, or a neutral note when the file is gone.
+fn media_stub_text(root: &Path, image: &LanguageModelImage) -> String {
+    match stored_attachment_path(root, image) {
+        Some(path) => format!(
+            "[image attachment stored at {} — open it with read_file to view]",
+            path.display()
+        ),
+        None => COMPACTION_MEDIA_STUB.to_string(),
+    }
+}
+
+fn stub_request_message_media_in(
+    root: &Path,
     mut message: LanguageModelRequestMessage,
 ) -> (LanguageModelRequestMessage, bool) {
     let mut dropped = false;
     for content in &mut message.content {
         match content {
-            MessageContent::Image(_) => {
-                *content = MessageContent::Text(COMPACTION_MEDIA_STUB.to_string());
+            MessageContent::Image(image) => {
+                *content = MessageContent::Text(media_stub_text(root, image));
                 dropped = true;
             }
             MessageContent::ToolResult(result) => {
                 for part in &mut result.content {
-                    if matches!(part, LanguageModelToolResultContent::Image(_)) {
-                        *part = LanguageModelToolResultContent::Text(COMPACTION_MEDIA_STUB.into());
+                    if let LanguageModelToolResultContent::Image(image) = part {
+                        *part =
+                            LanguageModelToolResultContent::Text(media_stub_text(root, image).into());
                         dropped = true;
                     }
                 }
@@ -5804,6 +5837,16 @@ fn stub_request_message_media(
         }
     }
     (message, dropped)
+}
+
+/// Replaces images in a request message with a reference to the durable local
+/// copy, and reports whether anything was dropped. Tool-result images are
+/// handled too, so a screenshot returned by a tool cannot blow the request size
+/// without leaving the agent a way to reopen it.
+fn stub_request_message_media(
+    message: LanguageModelRequestMessage,
+) -> (LanguageModelRequestMessage, bool) {
+    stub_request_message_media_in(&acp_thread::attachment_store::root(), message)
 }
 
 /// Reports whether a request carries an image, either directly or inside a
@@ -8525,6 +8568,25 @@ mod tests {
                 .iter()
                 .any(|content| matches!(content, MessageContent::Image(_)))
         }));
+    }
+
+    #[test]
+    fn stripped_media_points_at_the_stored_attachment() {
+        let store = tempfile::tempdir().expect("store");
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        let path = acp_thread::attachment_store::save_image(store.path(), png, "image/png")
+            .expect("save attachment");
+        let mut message = request_text_message(Role::User, "look at this");
+        message.content.push(MessageContent::Image(LanguageModelImage {
+            source: png.into(),
+        }));
+
+        let (stripped, dropped) = stub_request_message_media_in(store.path(), message);
+
+        assert!(dropped);
+        let text = stripped.string_contents();
+        assert!(text.contains(path.to_string_lossy().as_ref()));
+        assert!(text.contains("read_file"));
     }
 
     #[gpui::test]
