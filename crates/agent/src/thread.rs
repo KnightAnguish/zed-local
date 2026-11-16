@@ -859,6 +859,7 @@ pub trait ThreadEnvironment {
         _job_id: &ShellJobId,
         _command: &str,
         _exit: Option<i32>,
+        _stopped_by_user: bool,
         _output: &str,
         _cx: &mut AsyncApp,
     ) {

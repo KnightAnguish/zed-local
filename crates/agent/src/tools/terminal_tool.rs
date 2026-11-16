@@ -1189,7 +1189,20 @@ async fn run_terminal_tool(
         let output_path_for_job = output_path.clone();
         let environment_for_job = environment.clone();
         let command_for_job = input.command.clone();
+        let event_stream_for_job = event_stream.clone();
         cx.spawn(async move |cx| {
+            // The tool result returns as soon as the job starts, so the regular
+            // tool-call update would show "completed" while the command is still
+            // running. Re-mark the card once that update has landed.
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            event_stream_for_job.update_fields(|update| {
+                update
+                    .title(format!("Background job running: {command_for_job}"))
+                    .status(acp_v2::ToolCallStatus::InProgress)
+            });
+
             let exit = wait.await.exit_code.map(|code| code as i32);
             let stopped = handle.was_stopped_by_user(cx).unwrap_or(false);
             let output_text = match handle.current_output(cx) {
@@ -1213,28 +1226,51 @@ async fn run_terminal_tool(
                     .shell_jobs_mut()
                     .set_status(&job_id_for_job, status);
             });
-            if !stopped {
-                // Wait for the current turn to finish before injecting the
-                // result. Starting a follow-up while the agent is still
-                // working would cancel its in-flight tool calls.
-                loop {
-                    match thread_for_job.read_with(cx, |thread, _| thread.is_turn_running()) {
-                        Ok(true) => {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(500))
-                                .await;
-                        }
-                        _ => break,
-                    }
+            let (title, tool_status) = if stopped {
+                (
+                    "Background job stopped".to_string(),
+                    acp_v2::ToolCallStatus::Failed,
+                )
+            } else {
+                match exit {
+                    Some(0) => (
+                        "Background job finished".to_string(),
+                        acp_v2::ToolCallStatus::Completed,
+                    ),
+                    Some(code) => (
+                        format!("Background job failed (exit code {code})"),
+                        acp_v2::ToolCallStatus::Failed,
+                    ),
+                    None => (
+                        "Background job exited unexpectedly".to_string(),
+                        acp_v2::ToolCallStatus::Failed,
+                    ),
                 }
-                environment_for_job.notify_background_shell_completed(
-                    &job_id_for_job,
-                    &command_for_job,
-                    exit,
-                    &output_text,
-                    cx,
-                );
+            };
+            event_stream_for_job
+                .update_fields(|update| update.title(title).status(tool_status));
+
+            // Wait for the current turn to finish before injecting the result.
+            // Starting a follow-up while the agent is still working would cancel
+            // its in-flight tool calls.
+            loop {
+                match thread_for_job.read_with(cx, |thread, _| thread.is_turn_running()) {
+                    Ok(true) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                    }
+                    _ => break,
+                }
             }
+            environment_for_job.notify_background_shell_completed(
+                &job_id_for_job,
+                &command_for_job,
+                exit,
+                stopped,
+                &output_text,
+                cx,
+            );
         })
         .detach();
 

@@ -3899,22 +3899,40 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         job_id: &ShellJobId,
         command: &str,
         exit: Option<i32>,
+        stopped_by_user: bool,
         output: &str,
         cx: &mut AsyncApp,
     ) {
         let Some(agent) = self.agent.upgrade() else {
             return;
         };
-        let exit = exit
-            .map(|code| format!("exit code {code}"))
-            .unwrap_or_else(|| "no exit code".to_string());
+        let (status, instruction) = if stopped_by_user {
+            (
+                "stopped by the user".to_string(),
+                "The user stopped the background command. Do not re-run it unless they ask.",
+            )
+        } else {
+            match exit {
+                Some(0) => (
+                    "succeeded (exit code 0)".to_string(),
+                    "The background command finished successfully. Continue the task. Do not poll or re-run the command; this result is already available.",
+                ),
+                Some(code) => (
+                    format!("FAILED (exit code {code})"),
+                    "The background command failed. Read its output, fix the failure, and only then continue. Do not re-run it blindly.",
+                ),
+                None => (
+                    "FAILED (no exit code)".to_string(),
+                    "The background command exited unexpectedly. Inspect the output and the process state before continuing.",
+                ),
+            }
+        };
         let output = tail_for_notification(output, 16 * 1024);
         let content = format!(
-            "<background-job id=\"{job_id}\" status=\"{exit}\">\n\
+            "<background-job id=\"{job_id}\" status=\"{status}\">\n\
              Command: {command}\n\
              Output:\n{output}\n\
-             </background-job>\n\n\
-             The background command finished. Continue the task. Do not poll or re-run the command; this result is already available."
+             </background-job>\n\n{instruction}"
         );
         let Some(acp_thread) = self.acp_thread.upgrade() else {
             // The chat view can be closed while the command is still running.
