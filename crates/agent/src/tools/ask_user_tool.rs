@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
+﻿use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, ClientUserMessageId, ToolCallEventStream, ToolInput, UserMessageContent,
+};
 use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::Result;
 use gpui::{App, SharedString, Task};
@@ -46,12 +48,18 @@ pub struct AskUserToolInput {
     /// be exhaustive, or when you want a free-form reply.
     #[serde(default)]
     pub allow_free_text: bool,
+    /// Show the question and continue working instead of waiting for the
+    /// answer. The answer arrives later as a new message, so this is useful for
+    /// long-running work where the user may be away.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AskUserToolOutput {
     Answered { selected: String },
+    Pending { question: String },
     Error { error: String },
 }
 
@@ -60,6 +68,10 @@ impl From<AskUserToolOutput> for LanguageModelToolResultContent {
         match value {
             AskUserToolOutput::Answered { selected } => {
                 format!("The user selected: {selected}").into()
+            }
+            AskUserToolOutput::Pending { .. } => {
+                "The question was sent to the user. Continue with other work; the answer will arrive as a later message. Do not repeat the question."
+                    .into()
             }
             AskUserToolOutput::Error { error } => error.into(),
         }
@@ -116,6 +128,60 @@ impl AgentTool for AskUserTool {
 
             let prompt = cx
                 .update(|cx| event_stream.request_elicitation(input.question.clone(), schema, cx));
+
+            if input.background {
+                let question = input.question.clone();
+                let answer_question = question.clone();
+                let thread = event_stream.thread_handle();
+                cx.spawn(async move |cx| {
+                    let Ok(response) = prompt.await else {
+                        return;
+                    };
+                    let answer = match response.action {
+                        acp_v2::ElicitationAction::Accept(accept) => {
+                            let content = accept.content.unwrap_or_default();
+                            match string_field(&content, OTHER_FIELD)
+                                .or_else(|| string_field(&content, CHOICE_FIELD))
+                            {
+                                Some(answer) => answer,
+                                None => {
+                                    "The user submitted the form without providing an answer."
+                                        .to_string()
+                                }
+                            }
+                        }
+                        acp_v2::ElicitationAction::Decline => {
+                            "The user declined to answer the question.".to_string()
+                        }
+                        _ => "The user cancelled the question without answering.".to_string(),
+                    };
+
+                    let Some(thread) = thread.and_then(|thread| thread.upgrade()) else {
+                        return;
+                    };
+                    while thread.read_with(cx, |thread, _| thread.is_turn_running()) {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(500))
+                            .await;
+                    }
+                    let content = format!(
+                        "<user-answer question=\"{}\">\n{}\n</user-answer>\n\n\
+                         The user answered the question you asked earlier. Continue the task with this answer.",
+                        escape_xml(&answer_question),
+                        escape_xml(&answer),
+                    );
+                    let id = ClientUserMessageId::new();
+                    let result = thread.update(cx, |thread, cx| {
+                        thread.send(id, vec![UserMessageContent::Text(content)], cx)
+                    });
+                    if let Err(error) = result {
+                        log::warn!("Failed to deliver a background answer: {error:#}");
+                    }
+                })
+                .detach();
+                return Ok(AskUserToolOutput::Pending { question });
+            }
+
             let response = prompt.await.map_err(|error| AskUserToolOutput::Error {
                 error: error.to_string(),
             })?;
@@ -153,6 +219,15 @@ impl AgentTool for AskUserTool {
             Ok(AskUserToolOutput::Answered { selected })
         })
     }
+}
+
+/// Escapes text embedded in the XML-ish background answer envelope.
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Builds the elicitation form schema for a question.
@@ -240,6 +315,7 @@ mod tests {
                     question: "Which approach?".into(),
                     options: vec!["Approach A".into(), "Approach B".into()],
                     allow_free_text: false,
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -274,6 +350,7 @@ mod tests {
                     question: "What should I name it?".into(),
                     options: vec![],
                     allow_free_text: true,
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -305,6 +382,7 @@ mod tests {
                     question: "Pick or type".into(),
                     options: vec!["A".into(), "B".into()],
                     allow_free_text: true,
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -336,6 +414,7 @@ mod tests {
                     question: "Proceed?".into(),
                     options: vec!["Yes".into(), "No".into()],
                     allow_free_text: false,
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -369,6 +448,7 @@ mod tests {
                         question: "Proceed?".into(),
                         options: vec!["Only one".into()],
                         allow_free_text: false,
+                        background: false,
                     }),
                     event_stream,
                     cx,

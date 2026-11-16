@@ -6907,6 +6907,11 @@ pub struct ToolCallEventStream {
 }
 
 impl ToolCallEventStream {
+    /// The owning thread, when this stream belongs to a live thread.
+    pub(crate) fn thread_handle(&self) -> Option<WeakEntity<Thread>> {
+        self.thread.clone()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test() -> (Self, ToolCallEventStreamReceiver) {
         let (stream, receiver, _cancellation_tx) = Self::test_with_cancellation();

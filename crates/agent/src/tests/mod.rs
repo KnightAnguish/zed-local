@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 use acp_thread::{
     AgentConnection, AgentModelGroupName, AgentModelId, AgentModelList, AgentThreadEntry,
     ClientUserMessageId, PermissionOptions, ProcessOutput, ThreadStatus,
@@ -5888,6 +5888,7 @@ async fn test_ask_user_elicitation_references_scoped_tool_call_id(cx: &mut TestA
         question: "Which directory should we explore?".to_string(),
         options: Vec::new(),
         allow_free_text: true,
+        background: false,
     };
     fake.send_last_event(
         &model,
