@@ -350,6 +350,9 @@ impl Message {
 pub struct UserMessage {
     pub id: ClientUserMessageId,
     pub content: Arc<[UserMessageContent]>,
+    /// When the user sent this message. Older stored threads have no value.
+    #[serde(default)]
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2799,9 +2802,18 @@ impl Thread {
         content: Arc<[UserMessageContent]>,
         cx: &mut Context<Self>,
     ) {
+        let sent_at = self
+            .messages
+            .iter()
+            .find_map(|message| match message.as_ref() {
+                Message::User(user) if user.id == id => user.sent_at,
+                _ => None,
+            })
+            .or_else(|| Some(Utc::now()));
         let message = Arc::new(Message::User(UserMessage {
             id: id.clone(),
             content,
+            sent_at,
         }));
         if let Some(existing) = self
             .messages
@@ -9051,6 +9063,7 @@ mod tests {
         Arc::new(Message::User(UserMessage {
             id,
             content: vec![UserMessageContent::Text(text.to_string())].into(),
+            sent_at: None,
         }))
     }
 
@@ -9723,7 +9736,7 @@ mod tests {
                 assert!(matches!(&*thread.messages[1], Message::Agent(_)));
                 assert!(matches!(
                     &*thread.messages[2],
-                    Message::User(UserMessage { id, content }) if id == &compact_message_id && content.is_empty()
+                    Message::User(UserMessage { id, content, .. }) if id == &compact_message_id && content.is_empty()
                 ));
                 assert!(matches!(
                     &*thread.messages[3],
@@ -9873,6 +9886,7 @@ mod tests {
                 thread.messages.push(Arc::new(Message::User(UserMessage {
                     id: marker_id.clone(),
                     content: Arc::from([]),
+                    sent_at: None,
                 })));
                 thread.messages.push(summary_compaction("summary"));
                 thread.replay(cx)
@@ -10454,6 +10468,47 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn user_messages_record_the_send_time(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
+        let id = ClientUserMessageId::new();
+        thread.update(cx, |thread, cx| {
+            thread.upsert_user_message(
+                id.clone(),
+                vec![UserMessageContent::Text("hi".into())].into(),
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            let message = thread
+                .messages
+                .iter()
+                .find_map(|message| match message.as_ref() {
+                    Message::User(user) if user.id == id => Some(user),
+                    _ => None,
+                })
+                .expect("user message");
+            assert!(message.sent_at.is_some());
+        });
+    }
+
+    #[test]
+    fn user_message_send_time_survives_serialization() {
+        let message = UserMessage {
+            id: ClientUserMessageId::new(),
+            content: Arc::from([UserMessageContent::Text("hi".into())]),
+            sent_at: Some(Utc::now()),
+        };
+        let json = serde_json::to_value(&message).expect("serialize");
+        let parsed: UserMessage = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.sent_at, message.sent_at);
+
+        let mut legacy = serde_json::to_value(&message).expect("serialize");
+        legacy.as_object_mut().expect("object").remove("sent_at");
+        let parsed: UserMessage = serde_json::from_value(legacy).expect("legacy");
+        assert_eq!(parsed.sent_at, None);
+    }
+
+    #[gpui::test]
     async fn oversized_request_retries_without_media(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let model = fake.model("fake");
@@ -10465,6 +10520,7 @@ mod tests {
                     source: "A".repeat(4_000).into(),
                 })]
                 .into(),
+                sent_at: None,
             })));
         });
 

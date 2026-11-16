@@ -7837,6 +7837,23 @@ impl ThreadView {
                                             .map(|path| crate::chat_image_previews::ChatImagePreview::new(path.to_string_lossy().into_owned(), Vec::new()).attachment().into_any_element()),
                                         _ => None,
                                     })))
+                                    .when_some(message.timestamp, |this, timestamp| {
+                                        let timestamp = timestamp.with_timezone(&chrono::Local);
+                                        let label = if timestamp.date_naive()
+                                            == chrono::Local::now().date_naive()
+                                        {
+                                            timestamp.format("%H:%M").to_string()
+                                        } else {
+                                            timestamp.format("%d.%m.%Y %H:%M").to_string()
+                                        };
+                                        this.child(
+                                            h_flex().justify_end().pt_1().child(
+                                                Label::new(label)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                        )
+                                    })
                             )
                             .when(native_edit || (editor_focus && !self.thread.read(cx).connection().supports_message_fork()), |this| {
                                 let base_container = h_flex()

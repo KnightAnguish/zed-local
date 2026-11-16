@@ -340,6 +340,8 @@ pub struct UserMessage {
     pub is_optimistic: bool,
     pub content: MessageContent,
     pub indented: bool,
+    /// Wall-clock time the message was sent, when the caller knows it.
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4416,6 +4418,7 @@ impl AcpThread {
                     is_optimistic: false,
                     content: block,
                     indented: false,
+                    timestamp: None,
                 }));
             } else {
                 entries.push(AgentThreadEntry::AssistantMessage(AssistantMessage {
@@ -5777,6 +5780,7 @@ impl AcpThread {
                         is_optimistic: false,
                         content: MessageContent::default(),
                         indented: false,
+                        timestamp: None,
                     }));
                 Ok(MessageLocation::User { entry_index })
             }
@@ -5940,6 +5944,7 @@ impl AcpThread {
                     is_optimistic,
                     content,
                     indented,
+                    timestamp: None,
                 }),
                 cx,
             );
@@ -7572,6 +7577,16 @@ impl AcpThread {
         content: Vec<acp_v2::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        self.upsert_local_user_message_at(id, content, None, cx)
+    }
+
+    pub fn upsert_local_user_message_at(
+        &mut self,
+        id: ClientUserMessageId,
+        content: Vec<acp_v2::ContentBlock>,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
         let previous_entry_count = self.entries.len();
         let location = self.keyed_message_location(MessageKind::User, id.message_id(), cx)?;
         let language_registry = self.project.read(cx).languages().clone();
@@ -7583,6 +7598,7 @@ impl AcpThread {
         };
         message.client_id = Some(id);
         message.is_optimistic = false;
+        message.timestamp = timestamp;
         message
             .content
             .replace_prompt(content, &language_registry, path_style, cx);
@@ -7637,6 +7653,7 @@ impl AcpThread {
                             is_optimistic: true,
                             content: block,
                             indented: false,
+                            timestamp: None,
                         }),
                         cx,
                     );

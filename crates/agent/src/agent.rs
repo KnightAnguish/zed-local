@@ -2800,7 +2800,12 @@ impl NativeAgentConnection {
                                     .map(acp_v2::ContentBlock::from)
                                     .collect::<Vec<_>>();
                                 acp_thread.update(cx, |thread, cx| {
-                                    thread.upsert_local_user_message(message.id, content, cx)
+                                    thread.upsert_local_user_message_at(
+                                        message.id,
+                                        content,
+                                        message.sent_at,
+                                        cx,
+                                    )
                                 })??;
                             }
                             ThreadEvent::AgentText(text) => {
