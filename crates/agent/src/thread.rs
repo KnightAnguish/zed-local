@@ -5129,7 +5129,58 @@ impl Thread {
             Some(Message::User(_)) => self.messages.len().saturating_sub(1),
             _ => self.messages.len(),
         };
-        (insertion_ix > 0).then_some(insertion_ix)
+        (insertion_ix > 0).then(|| self.keep_tail_start_ix(insertion_ix))
+    }
+
+    /// Moves a compaction boundary earlier so the newest `keep_tokens` worth of
+    /// history stays verbatim after the summary.
+    ///
+    /// The summary then covers the older head only, and the tail messages remain
+    /// in the request exactly as they were written. When the whole prefix fits
+    /// the budget nothing moves: summarizing nothing would only add noise.
+    fn keep_tail_start_ix(&self, end_index: usize) -> usize {
+        let keep_tokens = self.harness.settings().compaction.keep_tokens as u64;
+        if keep_tokens == 0 || end_index == 0 {
+            return end_index;
+        }
+        let token_estimate = |message: &Arc<Message>| {
+            crate::harness::context::estimate_text_tokens(&message.to_markdown())
+        };
+        let total = self.messages[..end_index]
+            .iter()
+            .map(token_estimate)
+            .fold(0u64, u64::saturating_add);
+        if total <= keep_tokens {
+            return end_index;
+        }
+
+        let mut kept = 0u64;
+        let mut start = end_index;
+        while start > 0 {
+            let tokens = token_estimate(&self.messages[start - 1]);
+            if start < end_index && kept.saturating_add(tokens) > keep_tokens {
+                break;
+            }
+            kept = kept.saturating_add(tokens);
+            start -= 1;
+            if kept >= keep_tokens {
+                break;
+            }
+        }
+        if start == 0 {
+            return end_index;
+        }
+        // A new summary has to supersede the previous one instead of hiding
+        // before it in the history.
+        if let Some(previous) = self.messages[..end_index]
+            .iter()
+            .rposition(|message| matches!(message.as_ref(), Message::Compaction(_)))
+        {
+            if start <= previous {
+                start = previous + 1;
+            }
+        }
+        start.min(end_index)
     }
 
     /// Compaction boundary used when the provider rejected the prompt as too
@@ -5158,6 +5209,7 @@ impl Thread {
 
     fn forced_compaction_target_ix_before(&self, mut end_index: usize) -> Option<usize> {
         end_index = self.trim_compaction_boundary(end_index);
+        end_index = self.keep_tail_start_ix(end_index);
         if matches!(
             end_index
                 .checked_sub(1)
@@ -8429,6 +8481,62 @@ mod tests {
                 .iter()
                 .any(|content| matches!(content, MessageContent::Image(_)))
         }));
+    }
+
+    #[gpui::test]
+    async fn keep_tokens_keeps_the_newest_history_verbatim(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, _cx| {
+            thread
+                .harness_mut()
+                .set_settings(crate::harness::HarnessSettings {
+                    compaction: crate::harness::CompactionSettings {
+                        keep_tokens: 100,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            for index in 0..12 {
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    &format!("user {index} {}", "x".repeat(600)),
+                ));
+                thread.messages.push(agent_text_message(&format!(
+                    "assistant {index} {}",
+                    "y".repeat(600)
+                )));
+            }
+
+            let end = thread.messages.len();
+            let boundary = thread.keep_tail_start_ix(end);
+            assert!(
+                boundary > 0 && boundary < end,
+                "the tail should stay outside the summary, boundary {boundary}"
+            );
+            let tail_tokens: u64 = thread.messages[boundary..]
+                .iter()
+                .map(|message| {
+                    crate::harness::context::estimate_text_tokens(&message.to_markdown())
+                })
+                .sum();
+            assert!(
+                tail_tokens <= 200,
+                "tail should be bounded by keep_tokens plus one message, got {tail_tokens}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn keep_tokens_leaves_short_histories_alone(cx: &mut TestAppContext) {
+        let (thread, _event_stream, _fake) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, _cx| {
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+            let end = thread.messages.len();
+            assert_eq!(thread.keep_tail_start_ix(end), end);
+        });
     }
 
     #[test]
