@@ -1407,6 +1407,11 @@ pub struct Thread {
     /// the start of each request.
     current_request_token_usage: TokenUsage,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
+    /// Summary of the conversation prefix produced ahead of time, ready to be
+    /// inserted when the thread actually needs compaction.
+    pending_checkpoint: Option<PendingCheckpoint>,
+    precompute_in_flight: bool,
+    precompute_task: Option<Task<()>>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
@@ -1559,6 +1564,9 @@ impl Thread {
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
+            pending_checkpoint: None,
+            precompute_in_flight: false,
+            precompute_task: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
                 cx.foreground_executor()
@@ -1952,6 +1960,9 @@ impl Thread {
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
+            pending_checkpoint: None,
+            precompute_in_flight: false,
+            precompute_task: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
             profile_id,
@@ -3041,6 +3052,7 @@ impl Thread {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
                         event_stream.send_stop(acp_v2::StopReason::EndTurn);
+                        _ = this.update(cx, |this, cx| this.maybe_start_precompute(cx));
                     }
                     Err(error) => {
                         log::error!("Turn execution failed: {:?}", error);
@@ -3623,6 +3635,46 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
+        let precomputed = this.update(cx, |this, cx| {
+            let checkpoint = this.pending_checkpoint.take()?;
+            let model = this.compaction_model(cx)?;
+            if !checkpoint.is_valid_for(this, &model) {
+                return None;
+            }
+            log::debug!("Using the precomputed checkpoint instead of summarizing again");
+            let summary = checkpoint.summary.clone();
+            let compaction =
+                Arc::new(Message::Compaction(CompactionInfo::Summary(summary.clone())));
+            this.insert_compaction(
+                CompactionInsertion::Auto {
+                    insertion_ix: checkpoint.end_ix,
+                },
+                compaction,
+                cx,
+            );
+            this.context_usage = None;
+            this.harness.context_mut().reset();
+            if this.pending_compaction_telemetry.is_none() {
+                this.pending_compaction_telemetry =
+                    this.build_compaction_telemetry("auto", &model, cx);
+            }
+            cx.notify();
+            Some(summary)
+        })?;
+        if let Some(summary) = precomputed {
+            let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
+            event_stream.send_context_compaction(
+                compaction_id.clone(),
+                acp_thread::ContextCompactionStatus::InProgress,
+            );
+            event_stream.update_context_compaction_status(
+                compaction_id.clone(),
+                acp_thread::ContextCompactionStatus::Completed,
+            );
+            event_stream.send_context_compaction_update(compaction_id, &summary);
+            return Ok(ControlFlow::Continue(()));
+        }
+
         let Some((model, request, native_request, insertion_ix)) =
             this.update(cx, |this, cx| {
                 let insertion_ix = this.compaction_message_target_ix(cx)?;
@@ -3824,6 +3876,9 @@ impl Thread {
         compaction: Arc<Message>,
         cx: &mut Context<Self>,
     ) {
+        // Any compaction supersedes a checkpoint that was summarized before it.
+        self.pending_checkpoint = None;
+        self.retained_history_revision += 1;
         match insertion {
             CompactionInsertion::Auto { insertion_ix } => {
                 if insertion_ix <= self.messages.len() {
@@ -5134,6 +5189,111 @@ impl Thread {
             .or_else(|| self.model().cloned())
     }
 
+    /// Returns the compaction boundary that should be summarized in the
+    /// background once the context approaches the auto-compaction threshold
+    /// but is not due yet.
+    fn precompute_target(&self, cx: &App) -> Option<usize> {
+        let settings = &self.harness.settings().compaction;
+        if !settings.enabled || !settings.precompute {
+            return None;
+        }
+        if self.pending_checkpoint.is_some() || self.precompute_in_flight {
+            return None;
+        }
+        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        if !auto_compact.enabled {
+            return None;
+        }
+        let max_input_tokens = self.input_token_capacity()?;
+        let usage = self.context_usage?;
+        let active_tokens = total_input_tokens(usage).saturating_add(usage.output_tokens);
+        let due_tokens = auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
+        let precompute_threshold = if settings.precompute_threshold.is_finite() {
+            settings.precompute_threshold.clamp(0.0, 1.0)
+        } else {
+            0.70
+        };
+        let precompute_tokens = ((max_input_tokens as f64) * precompute_threshold).ceil() as u64;
+        if active_tokens < precompute_tokens || active_tokens >= due_tokens {
+            return None;
+        }
+
+        let end_index = self.compaction_target_ix_before_trailing_user_prompt()?;
+        let has_history = self.messages[..end_index]
+            .iter()
+            .any(|message| !matches!(message.as_ref(), Message::Compaction(_)));
+        has_history.then_some(end_index)
+    }
+
+    /// Starts a background summary of the conversation prefix so the next
+    /// compaction does not have to wait for one.
+    ///
+    /// The request is built exactly like a regular compaction request, so the
+    /// provider can reuse its cached prompt prefix. It runs between turns, when
+    /// no other completion is streaming, and the result is dropped if the
+    /// summarized history or the compaction model changed in the meantime.
+    fn maybe_start_precompute(&mut self, cx: &mut Context<Self>) {
+        let Some(end_ix) = self.precompute_target(cx) else {
+            return;
+        };
+        let Some(model) = self.compaction_model(cx) else {
+            return;
+        };
+        let Ok(provider) = LanguageModelRegistry::read_global(cx).provider_for_model(&model) else {
+            return;
+        };
+        let request =
+            self.build_compaction_request(end_ix, &model, COMPACTION_SHRINK_PERCENTS[0], cx);
+        let last_message = self.messages[end_ix - 1].clone();
+        let revision = self.retained_history_revision;
+        let provider_id = model.provider_id.clone();
+        let model_id = model.id.clone();
+
+        log::debug!("Precomputing a checkpoint for the next compaction");
+        self.precompute_in_flight = true;
+        self.precompute_task = Some(cx.spawn(async move |this, cx| {
+            let outcome: Option<String> = 'precompute: {
+                let mut stream = match provider.stream_completion(&model, request, cx).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        log::debug!("Precompute request failed: {error:#}");
+                        break 'precompute None;
+                    }
+                };
+                let mut summary = String::new();
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(LanguageModelCompletionEvent::Text(text)) => summary.push_str(&text),
+                        Ok(_) => {}
+                        Err(error) => {
+                            log::debug!("Precompute stream failed: {error:#}");
+                            break 'precompute None;
+                        }
+                    }
+                }
+                let summary = summary.trim();
+                if summary.is_empty() {
+                    break 'precompute None;
+                }
+                Some(summary.to_string())
+            };
+
+            let _ = this.update(cx, |this, _cx| {
+                this.precompute_in_flight = false;
+                if let Some(summary) = outcome {
+                    this.pending_checkpoint = Some(PendingCheckpoint {
+                        provider: provider_id,
+                        model: model_id,
+                        end_ix,
+                        revision,
+                        last_message,
+                        summary: summary.into(),
+                    });
+                }
+            });
+        }));
+    }
+
     fn build_compaction_request(
         &self,
         insertion_ix: usize,
@@ -5716,6 +5876,32 @@ fn take_text_within_byte_budget(text: String, remaining_bytes: &mut usize) -> Op
     let text = text[..end].to_string();
 
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// A summary of the conversation prefix that was produced while the thread was
+/// below the compaction threshold.
+///
+/// It is only usable while the summarized prefix is still the same conversation
+/// and the compaction model has not changed; otherwise it is discarded and a
+/// fresh summary is streamed when compaction becomes due.
+struct PendingCheckpoint {
+    provider: LanguageModelProviderId,
+    model: LanguageModelId,
+    end_ix: usize,
+    revision: usize,
+    last_message: Arc<Message>,
+    summary: SharedString,
+}
+
+impl PendingCheckpoint {
+    fn is_valid_for(&self, thread: &Thread, model: &LanguageModel) -> bool {
+        self.provider == model.provider_id
+            && self.model == model.id
+            && self.end_ix > 0
+            && self.end_ix <= thread.messages.len()
+            && thread.retained_history_revision == self.revision
+            && Arc::ptr_eq(&thread.messages[self.end_ix - 1], &self.last_message)
+    }
 }
 
 /// Describes where a streamed compaction summary should land in the thread
@@ -10051,6 +10237,155 @@ mod tests {
             "disabled compaction should leave the provider error untouched"
         );
         thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+    }
+
+    #[gpui::test]
+    async fn precompute_warms_a_checkpoint_between_turns(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let old_user_id = ClientUserMessageId::new();
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .harness_mut()
+                .set_settings(crate::harness::HarnessSettings {
+                    compaction: crate::harness::CompactionSettings {
+                        precompute: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            thread
+                .messages
+                .push(user_text_message(old_user_id.clone(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+            insert_request_token_usage(
+                thread,
+                old_user_id,
+                TokenUsage {
+                    input_tokens: 750_000,
+                    ..Default::default()
+                },
+            );
+        });
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: agent_settings::AutoCompactThreshold::Percentage(0.8),
+                },
+            )
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::UserPrompt)
+        );
+
+        fake.send_last_text(&model, "reply");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ThreadContextSummarization),
+            "a context close to the threshold should be summarized in the background"
+        );
+        finish_compaction(&fake, &model, "precomputed summary", cx);
+
+        thread.update(cx, |thread, _cx| {
+            assert!(thread.pending_checkpoint.is_some());
+            thread.context_usage = Some(TokenUsage {
+                input_tokens: 850_000,
+                ..Default::default()
+            });
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["next prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::UserPrompt),
+            "the precomputed checkpoint should be reused instead of summarizing again"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.pending_checkpoint.is_none());
+            assert!(thread.messages.iter().any(|message| {
+                matches!(
+                    message.as_ref(),
+                    Message::Compaction(CompactionInfo::Summary(summary))
+                        if summary.to_string() == "precomputed summary"
+                )
+            }));
+        });
+    }
+
+    #[gpui::test]
+    async fn precomputed_checkpoint_is_dropped_after_a_model_switch(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let first = fake.model("first");
+        let second = fake.model("second");
+        let old_user_id = ClientUserMessageId::new();
+
+        thread.update(cx, |thread, cx| {
+            thread.set_model(first.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(old_user_id.clone(), "old prompt"));
+            thread.messages.push(agent_text_message("old reply"));
+            thread.pending_checkpoint = Some(PendingCheckpoint {
+                provider: first.provider_id.clone(),
+                model: first.id.clone(),
+                end_ix: thread.messages.len(),
+                revision: thread.retained_history_revision,
+                last_message: thread.messages.last().unwrap().clone(),
+                summary: "stale summary".into(),
+            });
+            thread.set_model(second, cx);
+            insert_request_token_usage(
+                thread,
+                old_user_id,
+                TokenUsage {
+                    input_tokens: u64::MAX,
+                    ..Default::default()
+                },
+            );
+        });
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
+                },
+            )
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ThreadContextSummarization),
+            "a checkpoint summarized for another model must not be reused"
+        );
+        thread.read_with(cx, |thread, _| assert!(thread.pending_checkpoint.is_none()));
     }
 
     #[gpui::test]
