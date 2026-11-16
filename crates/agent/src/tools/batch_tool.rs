@@ -86,7 +86,10 @@ impl AgentTool for BatchTool {
                 .thread
                 .upgrade()
                 .ok_or_else(|| "The thread is no longer available.".to_string())?;
-            let tools = thread.read_with(cx, |thread, _cx| thread.tools.clone());
+            // Only run tools exposed to the model for this turn. Reading the
+            // registry directly would bypass profile choices, restricted
+            // workspace rules, provider compatibility, and feature flags.
+            let tools = thread.read_with(cx, |thread, cx| thread.enabled_tools(cx));
             let mut output = String::new();
 
             for (index, call) in input.calls.iter_mut().enumerate() {
@@ -109,7 +112,7 @@ impl AgentTool for BatchTool {
 
                 let Some(tool) = tools.get(call.tool.as_str()).cloned() else {
                     output.push_str(&format!(
-                        "### {}. {}\nerror: unknown tool\n\n",
+                        "### {}. {}\nerror: tool is not available in this turn (unknown, disabled by the profile, or blocked in a restricted workspace)\n\n",
                         index + 1,
                         call.tool
                     ));

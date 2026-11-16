@@ -4983,7 +4983,7 @@ impl Thread {
         Ok(request)
     }
 
-    fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+    pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -11466,11 +11466,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_batch_tool_runs_child_tools(cx: &mut TestAppContext) {
-        use crate::tests::test_tools::EchoTool;
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
 
-        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
+        enable_echo_tool(&thread, cx);
         thread.update(cx, |thread, cx| {
-            thread.add_tool(EchoTool);
+            thread.set_model(model.clone(), cx);
             thread.add_tool(BatchTool::new(cx.weak_entity()));
         });
 
@@ -11512,6 +11513,52 @@ mod tests {
 
         assert!(text.contains("first"), "{text}");
         assert!(text.contains("second"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn test_batch_tool_skips_tools_disabled_in_profile(cx: &mut TestAppContext) {
+        use crate::tests::test_tools::EchoTool;
+
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_tool(EchoTool);
+            thread.add_tool(BatchTool::new(cx.weak_entity()));
+        });
+
+        let tool = thread.read_with(cx, |thread, _| {
+            thread.tools.get(BatchTool::NAME).cloned().unwrap()
+        });
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::ready(serde_json::json!({
+                        "calls": [{
+                            "tool": "echo",
+                            "input": { "text": "should not run" }
+                        }]
+                    })),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        let output = match result {
+            Ok(output) => output,
+            Err(_) => panic!("batch itself should succeed"),
+        };
+        let text = output
+            .llm_output
+            .into_iter()
+            .filter_map(|content| match content {
+                LanguageModelToolResultContent::Text(text) => Some(text.to_string()),
+                LanguageModelToolResultContent::Image(_) => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("not available in this turn"), "{text}");
+        assert!(!text.contains("should not run"), "{text}");
     }
 
     #[gpui::test]
