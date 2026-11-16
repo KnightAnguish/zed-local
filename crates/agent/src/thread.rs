@@ -11421,6 +11421,50 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_legacy_and_v2_harness_complete_a_simple_turn(cx: &mut TestAppContext) {
+        for mode in [
+            crate::harness::HarnessMode::Legacy,
+            crate::harness::HarnessMode::V2,
+        ] {
+            let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+            let model = fake.model("fake");
+            let events = cx.update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    let mut settings = thread.harness().settings().clone();
+                    settings.mode = mode;
+                    thread.harness_mut().set_settings(settings);
+                    thread.set_model(model.clone(), cx);
+                    thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+                })
+            });
+            assert!(events.is_ok(), "mode {mode:?} should start a turn");
+            cx.run_until_parked();
+
+            assert!(
+                !fake.pending_completions_for(&model).is_empty(),
+                "mode {mode:?} should reach the model"
+            );
+            fake.send_last_text(&model, "reply");
+            fake.end_last(&model);
+            cx.run_until_parked();
+
+            thread.read_with(cx, |thread, _| {
+                assert!(
+                    thread.messages.iter().any(|message| matches!(
+                        &**message,
+                        Message::Agent(agent)
+                            if agent.content.iter().any(|content| matches!(
+                                content,
+                                AgentMessageContent::Text(text) if text == "reply"
+                            ))
+                    )),
+                    "mode {mode:?} should store the reply"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_batch_tool_runs_child_tools(cx: &mut TestAppContext) {
         use crate::tests::test_tools::EchoTool;
 
