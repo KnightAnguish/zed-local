@@ -3902,9 +3902,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         output: &str,
         cx: &mut AsyncApp,
     ) {
-        let Some(acp_thread) = self.acp_thread.upgrade() else {
-            return;
-        };
         let Some(agent) = self.agent.upgrade() else {
             return;
         };
@@ -3919,6 +3916,30 @@ impl ThreadEnvironment for NativeThreadEnvironment {
              </background-job>\n\n\
              The background command finished. Continue the task. Do not poll or re-run the command; this result is already available."
         );
+        let Some(acp_thread) = self.acp_thread.upgrade() else {
+            // The chat view can be closed while the command is still running.
+            // Resume the native session anyway so the result is processed and
+            // persisted; the transcript catches up when the view reopens.
+            let Some(thread) = self.thread.upgrade() else {
+                return;
+            };
+            let session_id = thread.read_with(cx, |thread, _| thread.id().clone());
+            log::info!(
+                "Background job {job_id} finished while its chat view was closed; resuming session {session_id}"
+            );
+            let task = cx.update(|cx| {
+                NativeAgentConnection(agent).submit_native(
+                    session_id,
+                    Some(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        content,
+                    ))]),
+                    cx,
+                )
+            });
+            task.0.detach();
+            return;
+        };
+        log::info!("Background job {job_id} finished; waking the agent");
         let task = cx.update(|cx| {
             NativeAgentConnection(agent).send_and_wait_for_completion(
                 acp_thread,
