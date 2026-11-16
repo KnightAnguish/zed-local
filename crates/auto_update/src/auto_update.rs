@@ -242,6 +242,32 @@ fn versions_match_ignoring_channel(left: &Version, right: &Version) -> bool {
         && build_without_channel(left) == build_without_channel(right)
 }
 
+/// Reads the release identity from the launcher's `install.json`.
+///
+/// The file is written by tooling that may prepend a UTF-8 BOM; a BOM makes
+/// `serde_json` reject the document, which used to make the updater think no
+/// build was installed and offer an older release.
+fn parse_install_json(
+    text: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    Some((
+        value
+            .get("release")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        value
+            .get("published_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        value
+            .get("build")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    ))
+}
+
 struct MacOsUnmounter<'a> {
     mount_path: PathBuf,
     background_executor: &'a BackgroundExecutor,
@@ -806,21 +832,7 @@ impl AutoUpdater {
         let current_exe = std::env::current_exe().ok()?;
         let install_root = current_exe.parent()?.parent()?.parent()?;
         let text = std::fs::read_to_string(install_root.join("install.json")).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        Some((
-            value
-                .get("release")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            value
-                .get("published_at")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            value
-                .get("build")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-        ))
+        parse_install_json(&text)
     }
 
     async fn get_fork_release(this: &Entity<Self>, cx: &mut AsyncApp) -> Result<ForkRelease> {
@@ -2006,6 +2018,15 @@ mod tests {
 
         assert!(versions_match_ignoring_channel(&runtime, &packaged));
         assert!(!versions_match_ignoring_channel(&runtime, &newer));
+    }
+
+    #[test]
+    fn install_json_with_bom_still_reports_the_installed_release() {
+        let text = "\u{feff}{\"release\":\"v1.28.1-local.20261116.7\",\"published_at\":\"2026-11-16T13:01:29Z\",\"build\":\"1.28.1-b9c00e43\"}";
+        let parsed = parse_install_json(text).expect("parse install.json with BOM");
+        assert_eq!(parsed.0.as_deref(), Some("v1.28.1-local.20261116.7"));
+        assert_eq!(parsed.1.as_deref(), Some("2026-11-16T13:01:29Z"));
+        assert_eq!(parsed.2.as_deref(), Some("1.28.1-b9c00e43"));
     }
 
     #[test]
