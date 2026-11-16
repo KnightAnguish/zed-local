@@ -194,6 +194,7 @@ pub struct HarnessAgentSettings {
     pub precompute: bool,
     pub keep_tokens: usize,
     pub prefer_native: bool,
+    pub code_mode: bool,
 }
 
 impl Default for HarnessAgentSettings {
@@ -205,6 +206,7 @@ impl Default for HarnessAgentSettings {
             precompute: false,
             keep_tokens: 15_000,
             prefer_native: true,
+            code_mode: false,
         }
     }
 }
@@ -229,6 +231,7 @@ impl From<Option<HarnessSettingsContent>> for HarnessAgentSettings {
             precompute: content.precompute.unwrap_or(defaults.precompute),
             keep_tokens: content.keep_tokens.unwrap_or(defaults.keep_tokens),
             prefer_native: content.prefer_native.unwrap_or(defaults.prefer_native),
+            code_mode: content.code_mode.unwrap_or(defaults.code_mode),
         }
     }
 }
@@ -1088,6 +1091,7 @@ mod tests {
         assert!(!defaults.precompute);
         assert_eq!(defaults.keep_tokens, 15_000);
         assert!(defaults.prefer_native);
+        assert!(!defaults.code_mode);
 
         let parsed = HarnessAgentSettings::from(Some(HarnessSettingsContent {
             mode: Some("v2".to_string()),
@@ -1096,6 +1100,7 @@ mod tests {
             precompute: Some(true),
             keep_tokens: Some(2_000),
             prefer_native: Some(false),
+            code_mode: Some(true),
         }));
         assert_eq!(parsed.mode, HarnessModeSetting::V2);
         assert!(!parsed.background_shell);
@@ -1103,6 +1108,7 @@ mod tests {
         assert!(parsed.precompute);
         assert_eq!(parsed.keep_tokens, 2_000);
         assert!(!parsed.prefer_native);
+        assert!(parsed.code_mode);
     }
 
     #[test]

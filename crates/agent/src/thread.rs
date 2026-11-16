@@ -1,5 +1,5 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
+    ApplyCodeActionTool, AskUserTool, BatchTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbPendingQuestion, DbThread,
     DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
@@ -1477,7 +1477,9 @@ fn harness_settings_from_agent_settings(cx: &App) -> crate::harness::HarnessSett
             prefer_native: settings.prefer_native,
             ..Default::default()
         },
-        code_mode: Default::default(),
+        code_mode: crate::harness::CodeModeSettings {
+            enabled: settings.code_mode,
+        },
     }
 }
 
@@ -2442,6 +2444,10 @@ impl Thread {
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
+
+        if self.harness.settings().code_mode.enabled {
+            self.add_tool(BatchTool::new(cx.weak_entity()));
+        }
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -4988,6 +4994,7 @@ impl Thread {
         // `terminal` name. Expose the one matching the current sandbox state
         // to the model under that name.
         let use_sandboxed_terminal = sandboxing_enabled_for_project(self.project.read(cx), cx);
+        let code_mode = self.harness.settings().code_mode.enabled;
 
         // Tools that aren't allowed in restricted workspaces must never be
         // provided to the model while the workspace is restricted, regardless
@@ -5011,7 +5018,8 @@ impl Thread {
                 };
 
                 if tool.supports_provider(&model.provider_id())
-                    && profile.is_tool_enabled(profile_tool_name)
+                    && (profile.is_tool_enabled(profile_tool_name)
+                        || (code_mode && tool_name.as_ref() == BatchTool::NAME))
                 {
                     match (tool_name.as_ref(), use_sandboxed_terminal) {
                         (TerminalTool::NAME, false) | (SandboxedTerminalTool::NAME, true) => {
@@ -7087,6 +7095,21 @@ impl ToolCallEventStream {
     /// The owning thread, when this stream belongs to a live thread.
     pub(crate) fn thread_handle(&self) -> Option<WeakEntity<Thread>> {
         self.thread.clone()
+    }
+
+    /// Creates the event stream for one child tool inside a batch. The child
+    /// keeps the batch's cancellation, filesystem, sandbox grants, and thread
+    /// ownership, while getting its own unique tool-call identity.
+    pub(crate) fn child(&self, index: usize) -> Self {
+        Self {
+            tool_use_id: format!("{}-{index}", self.tool_use_id).into(),
+            tool_call_id: format!("{}:{index}", self.tool_call_id).into(),
+            stream: self.stream.clone(),
+            fs: self.fs.clone(),
+            cancellation_rx: self.cancellation_rx.clone(),
+            sandbox_grants: self.sandbox_grants.clone(),
+            thread: self.thread.clone(),
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -11395,6 +11418,56 @@ mod tests {
 
             assert_eq!(thread.compaction_message_target_ix(cx), None);
         });
+    }
+
+    #[gpui::test]
+    async fn test_batch_tool_runs_child_tools(cx: &mut TestAppContext) {
+        use crate::tests::test_tools::EchoTool;
+
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.add_tool(EchoTool);
+            thread.add_tool(BatchTool::new(cx.weak_entity()));
+        });
+
+        let tool = thread.read_with(cx, |thread, _| {
+            thread.tools.get(BatchTool::NAME).cloned().unwrap()
+        });
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(crate::BatchToolInput {
+                        calls: vec![
+                            crate::BatchCall {
+                                tool: "echo".into(),
+                                input: serde_json::json!({ "text": "first" }),
+                            },
+                            crate::BatchCall {
+                                tool: "echo".into(),
+                                input: serde_json::json!({ "text": "second" }),
+                            },
+                        ],
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        let output = match result {
+            Ok(output) => output,
+            Err(_) => panic!("batch failed"),
+        };
+        let text = output
+            .llm_output
+            .into_iter()
+            .filter_map(|content| match content {
+                LanguageModelToolResultContent::Text(text) => Some(text.to_string()),
+                LanguageModelToolResultContent::Image(_) => None,
+            })
+            .collect::<String>();
+
+        assert!(text.contains("first"), "{text}");
+        assert!(text.contains("second"), "{text}");
     }
 
     #[gpui::test]

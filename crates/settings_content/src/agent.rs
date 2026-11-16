@@ -243,6 +243,10 @@ pub struct HarnessSettingsContent {
     ///
     /// Default: true
     pub prefer_native: Option<bool>,
+    /// Expose the `batch` tool, which runs several tool calls in one step.
+    ///
+    /// Default: false
+    pub code_mode: Option<bool>,
 }
 
 #[with_fallible_options]
