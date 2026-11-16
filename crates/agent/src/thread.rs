@@ -1407,6 +1407,9 @@ pub struct Thread {
     /// the start of each request.
     current_request_token_usage: TokenUsage,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
+    /// Set after a provider rejected the prompt as too large: the next request
+    /// drops attachments instead of resending the same payload.
+    strip_media_for_next_request: bool,
     /// Summary of the conversation prefix produced ahead of time, ready to be
     /// inserted when the thread actually needs compaction.
     pending_checkpoint: Option<PendingCheckpoint>,
@@ -1564,6 +1567,7 @@ impl Thread {
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
+            strip_media_for_next_request: false,
             pending_checkpoint: None,
             precompute_in_flight: false,
             precompute_task: None,
@@ -1960,6 +1964,7 @@ impl Thread {
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
+            strip_media_for_next_request: false,
             pending_checkpoint: None,
             precompute_in_flight: false,
             precompute_task: None,
@@ -2831,6 +2836,7 @@ impl Thread {
 
         log::info!("Thread::send called with model: {}", model.name().0);
         self.advance_prompt_id();
+        self.strip_media_for_next_request = false;
 
         log::debug!("Total messages in thread: {}", self.messages.len());
         self.run_turn(cx)
@@ -3101,6 +3107,9 @@ impl Thread {
         // attempt before the turn fails, even if the estimate was below the
         // auto-compaction threshold.
         let mut overflow_recoveries = 0;
+        // Attachments are retried without before giving up context: dropping a
+        // screenshot is cheaper than summarizing the conversation.
+        let mut media_retry_attempted = false;
         loop {
             if *cancellation_rx.borrow() {
                 return Ok(());
@@ -3209,6 +3218,7 @@ impl Thread {
             // A mid-stream overflow after visible output is not safe to retry:
             // the model may already have committed to part of an answer.
             let mut request_had_output = false;
+            let request_had_media = request.messages.iter().any(request_message_has_media);
 
             telemetry::event!(
                 "Agent Thread Completion",
@@ -3464,6 +3474,17 @@ impl Thread {
                 } else {
                     Self::prompt_too_large_tokens(&error)
                 };
+                if prompt_too_large_tokens.is_some()
+                    && !media_retry_attempted
+                    && request_had_media
+                {
+                    media_retry_attempted = true;
+                    this.update(cx, |this, _cx| this.strip_media_for_next_request = true)?;
+                    log::info!(
+                        "Provider rejected an oversized prompt; retrying without attachments"
+                    );
+                    continue;
+                }
                 if overflow_recoveries < MAX_OVERFLOW_RECOVERIES
                     && prompt_too_large_tokens.is_some()
                 {
@@ -4761,7 +4782,13 @@ impl Thread {
             .unwrap_or_default();
 
         log::debug!("Request includes {} tools", available_tools.len());
-        let messages = self.build_request_messages(available_tools, cx);
+        let mut messages = self.build_request_messages(available_tools, cx);
+        if self.strip_media_for_next_request {
+            messages = messages
+                .into_iter()
+                .map(|message| stub_request_message_media(message).0)
+                .collect();
+        }
         log::debug!("Request will include {} messages", messages.len());
 
         let request = LanguageModelRequest {
@@ -5777,6 +5804,23 @@ fn stub_request_message_media(
         }
     }
     (message, dropped)
+}
+
+/// Reports whether a request carries an image, either directly or inside a
+/// tool result.
+fn request_message_has_media(message: &LanguageModelRequestMessage) -> bool {
+    message.content.iter().any(|content| match content {
+        MessageContent::Image(_) => true,
+        MessageContent::ToolResult(result) => result
+            .content
+            .iter()
+            .any(|part| matches!(part, LanguageModelToolResultContent::Image(_))),
+        MessageContent::Text(_)
+        | MessageContent::Thinking { .. }
+        | MessageContent::RedactedThinking(_)
+        | MessageContent::ToolUse(_)
+        | MessageContent::Compaction(_) => false,
+    })
 }
 
 /// Reserves output without subtracting it from an independent input ceiling.
@@ -10345,6 +10389,107 @@ mod tests {
             "disabled compaction should leave the provider error untouched"
         );
         thread.read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+    }
+
+    #[gpui::test]
+    async fn oversized_request_retries_without_media(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.messages.push(Arc::new(Message::User(UserMessage {
+                id: ClientUserMessageId::new(),
+                content: vec![UserMessageContent::Image(LanguageModelImage {
+                    source: "A".repeat(4_000).into(),
+                })]
+                .into(),
+            })));
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request = fake.pending_completions().pop().expect("initial request");
+        assert!(request.messages.iter().any(request_message_has_media));
+
+        fake.send_last_error(&model, prompt_too_large_error());
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        let retried = fake
+            .pending_completions()
+            .pop()
+            .expect("the oversized request should be retried");
+        assert!(
+            !retried.messages.iter().any(request_message_has_media),
+            "the retry must not resend attachments"
+        );
+        let text = retried
+            .messages
+            .iter()
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(super::COMPACTION_MEDIA_STUB));
+    }
+
+    #[gpui::test]
+    async fn long_session_recovers_through_shrink_steps(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            for index in 0..60 {
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    &format!("question {index} {}", "q".repeat(1_800)),
+                ));
+                thread.messages.push(agent_text_message(&format!(
+                    "answer {index} {}",
+                    "a".repeat(1_800)
+                )));
+            }
+        });
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["final prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        for step in 0..3 {
+            fake.send_last_error(&model, prompt_too_large_error());
+            fake.end_last(&model);
+            cx.run_until_parked();
+            finish_compaction(&fake, &model, &format!("summary {step}"), cx);
+        }
+        fake.send_last_text(&model, "done");
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.is_turn_complete());
+            let compactions = thread
+                .messages
+                .iter()
+                .filter(|message| matches!(message.as_ref(), Message::Compaction(_)))
+                .count();
+            assert_eq!(compactions, 3, "each overflow adds one checkpoint");
+            let first_compaction = thread
+                .messages
+                .iter()
+                .position(|message| matches!(message.as_ref(), Message::Compaction(_)))
+                .expect("a checkpoint was inserted");
+            assert!(
+                first_compaction > 0,
+                "the newest history should stay verbatim"
+            );
+            assert!(thread.messages.len() > first_compaction + 1);
+        });
     }
 
     #[gpui::test]
