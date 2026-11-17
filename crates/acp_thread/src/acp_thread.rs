@@ -4645,6 +4645,14 @@ impl AcpThread {
         }
     }
 
+    /// Whether a new prompt would interrupt live work. Queue input while this
+    /// is true instead of starting another turn.
+    pub fn is_turn_in_flight(&self) -> bool {
+        self.status() != ThreadStatus::Idle
+            || self.has_unsettled_submissions()
+            || self.is_waiting_for_confirmation()
+    }
+
     /// Whether the agent reports this session's foreground state, rather than Zed
     /// deriving it from its own prompt turns.
     pub fn uses_reported_activity(&self) -> bool {

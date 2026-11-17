@@ -2503,9 +2503,7 @@ impl ThreadView {
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
-        let is_busy = thread.read(cx).status() == ThreadStatus::Generating
-            || thread.read(cx).has_unsettled_submissions()
-            || thread.read(cx).is_waiting_for_confirmation();
+        let is_busy = thread.read(cx).is_turn_in_flight();
 
         if is_editor_empty {
             if self.message_queue.can_fast_track()
@@ -5815,6 +5813,9 @@ impl ThreadView {
         if thread.pending_permission_requests().next().is_some() {
             return Some("Waiting for your approval".into());
         }
+        if thread.background_work().is_some_and(|work| !work.is_empty()) {
+            return Some("Waiting for background work".into());
+        }
         for entry in thread.entries().iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(_) => break,
@@ -7022,11 +7023,8 @@ impl ThreadView {
         let is_editor_empty = message_editor.is_empty(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
-        let is_busy = is_generating
-            || self.thread.read(cx).has_unsettled_submissions()
-            || self.thread.read(cx).is_waiting_for_confirmation();
+        let is_busy = self.thread.read(cx).is_turn_in_flight();
 
         if self.is_loading_contents {
             div()
