@@ -796,6 +796,8 @@ pub struct ThreadView {
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
+    /// Entries that arrived while the user was scrolled away from the tail.
+    pub unseen_entries: usize,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
     pub turn_fields: TurnFields,
@@ -1079,13 +1081,17 @@ impl ThreadView {
                 this.list_state
                     .remeasure_items(0..this.list_state.item_count());
                 cx.notify();
-            } else if matches!(event, AcpThreadEvent::NewEntry)
-                && this.list_state.is_following_tail()
-            {
-                // Keep a reader who is at the tail pinned to new tool/thought
-                // entries; this avoids work appearing to be "hidden" until the
-                // next prompt.
-                this.list_state.scroll_to_end();
+            } else if matches!(event, AcpThreadEvent::NewEntry) {
+                if this.list_state.is_following_tail() {
+                    // Keep a reader who is at the tail pinned to new tool/thought
+                    // entries; this avoids work appearing to be "hidden" until the
+                    // next prompt.
+                    this.list_state.scroll_to_end();
+                    this.unseen_entries = 0;
+                } else {
+                    this.unseen_entries = this.unseen_entries.saturating_add(1);
+                    cx.notify();
+                }
             }
         }));
 
@@ -1341,6 +1347,7 @@ impl ThreadView {
             queue_expanded: true,
             editor_expanded: false,
             should_be_following: false,
+            unseen_entries: 0,
             editing_message: None,
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
@@ -14838,6 +14845,10 @@ impl Render for ThreadView {
         self.sync_local_commands(cx);
 
         let has_messages = self.has_visible_conversation(cx);
+        if self.list_state.is_following_tail() {
+            self.unseen_entries = 0;
+        }
+        let unseen_entries = self.unseen_entries;
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
@@ -14872,10 +14883,37 @@ impl Render for ThreadView {
             })
             .map(|this| {
                 if has_messages {
-                    this.flex_1()
+                    this.relative()
+                        .flex_1()
                         .size_full()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
+                        .when(unseen_entries > 0, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .bottom_3()
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .debug_selector(|| "jump-to-new-messages".into())
+                                    .child(
+                                        Button::new(
+                                            "jump-to-new-messages",
+                                            if unseen_entries == 1 {
+                                                "1 new message".to_string()
+                                            } else {
+                                                format!("{unseen_entries} new messages")
+                                            },
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.unseen_entries = 0;
+                                            this.scroll_to_end(cx);
+                                        })),
+                                    ),
+                            )
+                        })
                         .into_any()
                 } else {
                     this.into_any()

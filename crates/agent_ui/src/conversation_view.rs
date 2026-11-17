@@ -5686,6 +5686,52 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_new_message_badge_tracks_entries_while_scrolled_up(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation.clone(), cx);
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+
+        view.update(cx, |view, _| {
+            view.list_state.set_follow_mode(gpui::FollowMode::Normal);
+        });
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("first")
+                        .title("read_file")
+                        .status(acp_v2::ToolCallStatus::InProgress),
+                    cx,
+                )
+                .expect("first entry");
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.unseen_entries),
+            1,
+            "NewEntry should be counted before the next render"
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.unseen_entries),
+            1
+        );
+        let badge = cx
+            .debug_bounds("jump-to-new-messages")
+            .expect("new messages badge should render");
+        cx.simulate_click(badge.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.unseen_entries),
+            0
+        );
+        assert!(cx.debug_bounds("jump-to-new-messages").is_none());
+    }
+
+    #[gpui::test]
     async fn test_unconfirmed_stop_and_send_waits_for_confirmed_idle(cx: &mut TestAppContext) {
         init_test(cx);
         let connection = StubAgentConnection::new().with_receipt_submissions(true);
