@@ -725,6 +725,7 @@ async fn run_agent(
                     "language_models": {language_models_settings},
                     "agent": {{
                         "tool_permissions": {{"default": "allow"}},
+                        "sandbox_permissions": {{"allow_unsandboxed": true}},
                         "default_model": {{
                             "provider": "{provider_id}",
                             "model": "{model_id}",
