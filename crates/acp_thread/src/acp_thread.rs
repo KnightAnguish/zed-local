@@ -5415,6 +5415,11 @@ impl AcpThread {
             }
             _ => {}
         }
+        // Entry mutations emit events but do not notify the entity itself. The
+        // thread view observes this entity for repaints, so a tool card or
+        // thought appended during a turn would otherwise stay invisible until
+        // some unrelated notify arrives.
+        cx.notify();
         Ok(())
     }
 
@@ -20222,6 +20227,43 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    struct NotificationCounter {
+        count: usize,
+        _subscription: Subscription,
+    }
+
+    #[gpui::test]
+    async fn test_session_update_notifies_thread_observers(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let counter = cx.new(|cx| {
+            let subscription = cx.observe(&thread, |this: &mut NotificationCounter, _, cx| {
+                this.count += 1;
+                cx.notify();
+            });
+            NotificationCounter {
+                count: 0,
+                _subscription: subscription,
+            }
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("notify-tool", "Notify tool")
+                            .kind(acp_v1::ToolKind::Fetch)
+                            .status(acp_v1::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+                .expect("tool call update");
+        });
+        cx.run_until_parked();
+
+        counter.read_with(cx, |counter, _| assert!(counter.count > 0));
     }
 
     fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
