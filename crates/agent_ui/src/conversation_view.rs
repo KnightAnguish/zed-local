@@ -111,6 +111,7 @@ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis
 
 pub(crate) mod elicitation;
 mod message_queue;
+mod queued_prompt_store;
 mod subagent_card;
 mod thread_search_bar;
 mod thread_view;
@@ -1614,6 +1615,10 @@ impl ConversationView {
                                 view.message_editor.update(cx, |editor, cx| {
                                     editor.set_source_message(input.draft, window, cx);
                                 });
+                                // The new view restored the persisted queue; the reconnect
+                                // snapshot is authoritative, so replace it instead of
+                                // appending a duplicate.
+                                view.clear_queue(cx);
                                 for (content, buffers, steer) in input.queue {
                                     view.add_to_queue(content, buffers, window, cx);
                                     if steer && let Some(id) = view.message_queue.last_id() {

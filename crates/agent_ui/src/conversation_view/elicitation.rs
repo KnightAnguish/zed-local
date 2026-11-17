@@ -139,6 +139,32 @@ impl ElicitationFormState {
         }
     }
 
+    /// Fill the first text or single-select field from the main composer.
+    /// Returns false when the form has no field that accepts free text.
+    pub(crate) fn fill_from_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        for field in self.fields.values_mut() {
+            match field {
+                ElicitationFieldState::Text(editor) => {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_text(text.to_string(), window, cx);
+                    });
+                    return true;
+                }
+                ElicitationFieldState::SingleSelect { value } => {
+                    *value = Some(text.to_string());
+                    return true;
+                }
+                ElicitationFieldState::Boolean(_) | ElicitationFieldState::MultiSelect(_) => {}
+            }
+        }
+        false
+    }
+
     fn snapshot(&self, cx: &App) -> ElicitationFormSubmission {
         ElicitationFormSubmission {
             fields: self
@@ -991,6 +1017,25 @@ mod tests {
             assert_eq!(form.collect(&schema, cx).unwrap()["answer"], acp::ElicitationContentValue::from("First"));
             form.select_value("answer", "My own answer".into(), window, cx);
             assert_eq!(form.collect(&schema, cx).unwrap()["answer"], acp::ElicitationContentValue::from("My own answer"));
+        });
+    }
+
+    #[gpui::test]
+    fn fill_from_text_populates_string_field(cx: &mut TestAppContext) {
+        crate::conversation_view::tests::init_test(cx);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let schema = acp::ElicitationSchema::new().property(
+                "answer",
+                acp::StringPropertySchema::new(),
+                true,
+            );
+            let mut form = ElicitationFormState::new(&schema, window, cx);
+            assert!(form.fill_from_text("hello", window, cx));
+            assert_eq!(
+                form.collect(&schema, cx).unwrap()["answer"],
+                acp::ElicitationContentValue::from("hello")
+            );
         });
     }
 

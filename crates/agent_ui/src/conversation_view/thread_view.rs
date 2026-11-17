@@ -1017,6 +1017,9 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The new view restored the persisted queue; recovery is the
+        // authoritative snapshot, so replace it instead of duplicating.
+        self.clear_queue(cx);
         for queued in &recovery.queued {
             self.add_to_queue(
                 queued.content.clone(),
@@ -1362,6 +1365,7 @@ impl ThreadView {
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
+        this.restore_queued_messages(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -2484,6 +2488,25 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn pending_elicitation_for_composer(&self, cx: &App) -> Option<ElicitationEntryId> {
+        let thread = self.thread.read(cx);
+        for entry in thread.entries().iter().rev() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => return None,
+                AgentThreadEntry::Elicitation(id) => {
+                    if let Some((_, elicitation)) = thread.elicitation(id)
+                        && elicitation.is_blocking()
+                        && matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                    {
+                        return Some(id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
@@ -2516,6 +2539,20 @@ impl ThreadView {
                 self.dispatch_queued_entry(entry, window, cx);
             }
             return;
+        }
+
+        if let Some(elicitation_id) = self.pending_elicitation_for_composer(cx) {
+            let text = message_editor.read(cx).text(cx);
+            let text = text.trim();
+            if !text.is_empty() && !text.starts_with('/') {
+                if let Some(form) = self.elicitation_form_states.get_mut(&elicitation_id) {
+                    if form.fill_from_text(text, window, cx) {
+                        message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+                        self.submit_elicitation(elicitation_id, window, cx);
+                        return;
+                    }
+                }
+            }
         }
 
         if is_busy {
@@ -2885,6 +2922,22 @@ impl ThreadView {
         let thread = self.thread.clone();
         self.message_queue.pause();
 
+        if thread
+            .read(cx)
+            .background_work()
+            .is_some_and(|work| !work.is_empty())
+        {
+            thread.update(cx, |thread, cx| {
+                thread.push_notice(
+                    acp_v2::Notice::new(
+                        acp_v2::NoticeSeverity::Warning,
+                        "The previous turn was interrupted while background work was running. Check that work's status before assuming it stopped.",
+                    ),
+                    cx,
+                );
+            });
+        }
+
         let cancelled = thread.update(cx, |thread, cx| thread.cancel(cx));
 
         cx.spawn_in(window, async move |this, cx| {
@@ -3253,6 +3306,54 @@ impl ThreadView {
         .detach_and_log_err(cx);
     }
 
+    fn restore_queued_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompts) = super::queued_prompt_store::read(self.root_thread_id, cx) else {
+            return;
+        };
+        for prompt in prompts {
+            let id = self.message_queue.next_id();
+            let content = prompt.content;
+            let editor = cx.new(|cx| {
+                let mut editor = MessageEditor::new(
+                    self.workspace.clone(),
+                    self.project.clone(),
+                    None,
+                    self.session_capabilities.clone(),
+                    self.agent_id.clone(),
+                    "",
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: Some(10),
+                    },
+                    window,
+                    cx,
+                );
+                editor.set_read_only(true, cx);
+                editor.set_source_message(content.clone(), window, cx);
+                editor
+            });
+            let subscription =
+                cx.subscribe_in(&editor, window, move |this, _editor, event, window, cx| {
+                    this.handle_queue_editor_event(id, event, window, cx);
+                });
+            self.message_queue.enqueue(QueueEntry {
+                id,
+                content,
+                tracked_buffers: Vec::new(),
+                steer: prompt.steer,
+                editor,
+                _subscription: subscription,
+            });
+        }
+        if !self.message_queue.is_empty() {
+            // A restored queue waited for the previous process; don't fire it
+            // automatically until the user re-engages.
+            self.message_queue.pause();
+            self.sync_queue_flag_to_native_thread(cx);
+            cx.notify();
+        }
+    }
+
     pub fn add_to_queue(
         &mut self,
         content: Vec<acp_v2::ContentBlock>,
@@ -3298,6 +3399,7 @@ impl ThreadView {
             _subscription: subscription,
         });
         self.sync_queue_flag_to_native_thread(cx);
+        self.persist_queue(cx);
         cx.notify();
     }
 
@@ -3364,6 +3466,7 @@ impl ThreadView {
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
                 }
+                this.persist_queue(cx);
                 cx.notify();
             })?;
 
@@ -3380,6 +3483,7 @@ impl ThreadView {
         let removed = self.message_queue.remove(id);
         if removed.is_some() {
             self.sync_queue_flag_to_native_thread(cx);
+            self.persist_queue(cx);
         }
         removed
     }
@@ -3387,6 +3491,7 @@ impl ThreadView {
     fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
         self.message_queue.toggle_steer(id);
         self.sync_queue_flag_to_native_thread(cx);
+        self.persist_queue(cx);
         cx.notify();
     }
 
@@ -3405,6 +3510,23 @@ impl ThreadView {
                 thread.set_end_turn_at_next_boundary(end_at_boundary);
             });
         }
+    }
+
+    fn persist_queue(&self, cx: &App) {
+        let prompts = self
+            .message_queue
+            .iter()
+            .map(|entry| super::queued_prompt_store::QueuedPrompt {
+                content: entry.content.clone(),
+                steer: entry.steer,
+            })
+            .collect::<Vec<_>>();
+        let task = if prompts.is_empty() {
+            super::queued_prompt_store::delete(self.root_thread_id, cx)
+        } else {
+            super::queued_prompt_store::write(self.root_thread_id, &prompts, cx)
+        };
+        task.detach_and_log_err(cx);
     }
 
     fn validate_queued_entry(&mut self, id: QueueEntryId, cx: &mut Context<Self>) -> bool {
@@ -3473,6 +3595,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         self.sync_queue_flag_to_native_thread(cx);
+        self.persist_queue(cx);
 
         cx.emit(AcpThreadViewEvent::Interacted);
 
@@ -3504,6 +3627,7 @@ impl ThreadView {
                 this.update(cx, |this, cx| {
                     this.message_queue.restore_after_failed_send(entry);
                     this.sync_queue_flag_to_native_thread(cx);
+                    this.persist_queue(cx);
                     cx.notify();
                 })
                 .log_err();
@@ -5194,9 +5318,10 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn clear_queue(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_queue(&mut self, cx: &mut Context<Self>) {
         self.message_queue.clear();
         self.sync_queue_flag_to_native_thread(cx);
+        self.persist_queue(cx);
         cx.notify();
     }
 

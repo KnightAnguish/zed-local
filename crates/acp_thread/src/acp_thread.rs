@@ -4646,9 +4646,11 @@ impl AcpThread {
     }
 
     /// Whether a new prompt would interrupt live work. Queue input while this
-    /// is true instead of starting another turn.
+    /// is true instead of starting another turn. Unconfirmed activity is not
+    /// treated as in-flight: the user may still send manually while automatic
+    /// queueing waits for a confirmed idle.
     pub fn is_turn_in_flight(&self) -> bool {
-        self.status() != ThreadStatus::Idle
+        self.status() == ThreadStatus::Generating
             || self.has_unsettled_submissions()
             || self.is_waiting_for_confirmation()
     }
