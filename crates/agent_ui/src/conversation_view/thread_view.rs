@@ -6001,6 +6001,13 @@ impl ThreadView {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.has_visible_conversation(cx);
         let fills_container = !has_messages || editor_expanded;
+        let waiting_status = self.waiting_status(cx).map(|status| {
+            if let Some(started) = self.turn_fields.turn_started_at {
+                format!("{status} · {}", duration_alt_display(started.elapsed())).into()
+            } else {
+                status
+            }
+        });
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
             div()
@@ -6045,7 +6052,7 @@ impl ThreadView {
                     .flex_grow_0()
                     .justify_between()
                     .gap_2()
-                    .when_some(self.waiting_status(cx), |this, status| {
+                    .when_some(waiting_status, |this, status| {
                         this.child(
                             h_flex()
                                 .px_1()
