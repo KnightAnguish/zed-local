@@ -105,6 +105,12 @@ struct Args {
     /// Enable or disable extended thinking. Defaults to model auto-detection if omitted.
     #[arg(long)]
     thinking: Option<bool>,
+
+    /// Agent harness settings as a JSON object, e.g.
+    /// `{"mode":"v2","background_shell":true,"precompute":true}`.
+    /// Merged into `agent.harness` for this run.
+    #[arg(long)]
+    harness_settings: Option<String>,
 }
 
 enum AgentOutcome {
@@ -225,6 +231,11 @@ fn main() {
         let timeout = args.timeout;
         let thinking_override = args.thinking;
         let reasoning_effort = args.reasoning_effort.clone();
+        let harness_settings = args.harness_settings.clone().or_else(|| {
+            std::env::var("ZED_EVAL_HARNESS_SETTINGS")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
 
         cx.spawn(async move |cx| {
             // Each settings change below is applied in its own `cx.update` call (rather than
@@ -275,6 +286,7 @@ fn main() {
                 Some(&output_dir),
                 openai_compatible_providers_json.as_deref(),
                 anthropic_available_models_json.as_deref(),
+                harness_settings.as_deref(),
                 cx,
             )
             .await;
@@ -601,6 +613,7 @@ async fn run_agent(
     output_dir: Option<&std::path::Path>,
     openai_compatible_providers_json: Option<&str>,
     anthropic_available_models_json: Option<&str>,
+    harness_settings_json: Option<&str>,
     cx: &mut AsyncApp,
 ) -> (Result<AgentOutcome>, RunStats) {
     let selected = match SelectedModel::from_str(model_name).map_err(|e| anyhow::anyhow!("{e}")) {
@@ -702,6 +715,10 @@ async fn run_agent(
                 )
             }
         };
+        let harness_field = match harness_settings_json {
+            Some(json) if !json.trim().is_empty() => format!(r#","harness": {json}"#),
+            _ => String::new(),
+        };
         SettingsStore::update_global(cx, |store, cx| {
             let settings = format!(
                 r#"{{
@@ -713,12 +730,11 @@ async fn run_agent(
                             "model": "{model_id}",
                             "enable_thinking": {enable_thinking},
                             "effort": {effort}
-                        }}{profile_field}
+                        }}{profile_field}{harness_field}
                     }},
                     "autosave": "off",
                     "format_on_save": "off"
-                }}"
-                "#
+                }}"#
             );
             store.set_user_settings(&settings, cx).result()
         })
