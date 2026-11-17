@@ -12,10 +12,10 @@ mod history_window;
 mod local_html_links;
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
-    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    SessionMessageSide, SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation,
-    decode_path_escapes,
+    AgentThreadEntry, Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
+    OutputTokensUpdate, SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails,
+    SandboxNotAppliedReason, SessionMessageSide, SubmissionId, SubmissionResponse, SubmissionState,
+    ThreadStatus, ToolCallLocation, ToolCallStatus, decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -2503,7 +2503,9 @@ impl ThreadView {
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
-        let is_generating = thread.read(cx).status() == ThreadStatus::Generating;
+        let is_busy = thread.read(cx).status() == ThreadStatus::Generating
+            || thread.read(cx).has_unsettled_submissions()
+            || thread.read(cx).is_waiting_for_confirmation();
 
         if is_editor_empty {
             if self.message_queue.can_fast_track()
@@ -2512,13 +2514,13 @@ impl ThreadView {
             {
                 return;
             }
-            if let Some(entry) = self.message_queue.try_fast_track(is_generating) {
+            if let Some(entry) = self.message_queue.try_fast_track(is_busy) {
                 self.dispatch_queued_entry(entry, window, cx);
             }
             return;
         }
 
-        if is_generating {
+        if is_busy {
             cx.emit(AcpThreadViewEvent::Interacted);
             self.queue_message(message_editor, window, cx);
             return;
@@ -5805,6 +5807,44 @@ impl ThreadView {
         )
     }
 
+    fn waiting_status(&self, cx: &App) -> Option<SharedString> {
+        let thread = self.thread.read(cx);
+        if thread.status() == ThreadStatus::Idle && !thread.has_unsettled_submissions() {
+            return None;
+        }
+        if thread.pending_permission_requests().next().is_some() {
+            return Some("Waiting for your approval".into());
+        }
+        for entry in thread.entries().iter().rev() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => break,
+                AgentThreadEntry::Elicitation(id) => {
+                    if let Some((_, elicitation)) = thread.elicitation(id)
+                        && elicitation.is_blocking()
+                        && matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                    {
+                        return Some("Waiting for your answer".into());
+                    }
+                }
+                AgentThreadEntry::ToolCall(call) => match call.status() {
+                    ToolCallStatus::WaitingForConfirmation => {
+                        return Some("Waiting for your approval".into());
+                    }
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress => {
+                        return Some(
+                            format!("Waiting for: {}", call.label.read(cx).source()).into(),
+                        );
+                    }
+                    _ => {}
+                },
+                AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::SessionMessage(_)
+                | AgentThreadEntry::ContextCompaction(_) => {}
+            }
+        }
+        Some("Waiting for agent".into())
+    }
+
     pub(crate) fn render_message_editor(
         &mut self,
         window: &mut Window,
@@ -5879,6 +5919,19 @@ impl ThreadView {
                     .flex_grow_0()
                     .justify_between()
                     .gap_2()
+                    .when_some(self.waiting_status(cx), |this, status| {
+                        this.child(
+                            h_flex()
+                                .px_1()
+                                .gap_1()
+                                .child(SpinnerLabel::new().size(LabelSize::Small))
+                                .child(
+                                    Label::new(status)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .child(
                         v_flex()
                             .relative()
@@ -6971,6 +7024,9 @@ impl ThreadView {
 
         let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
+        let is_busy = is_generating
+            || self.thread.read(cx).has_unsettled_submissions()
+            || self.thread.read(cx).is_waiting_for_confirmation();
 
         if self.is_loading_contents {
             div()
@@ -6979,7 +7035,7 @@ impl ThreadView {
                 .tooltip(Tooltip::text("Loading Added Context…"))
                 .child(loading_contents_spinner(IconSize::default()))
                 .into_any_element()
-        } else if (is_generating || is_unconfirmed) && is_editor_empty {
+        } else if (is_busy || is_unconfirmed) && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(TintColor::Error))
@@ -6997,7 +7053,7 @@ impl ThreadView {
                 .on_click(cx.listener(|this, _event, _, cx| this.cancel_generation(cx)))
                 .into_any_element()
         } else {
-            let send_icon = if is_generating {
+            let send_icon = if is_busy {
                 IconName::QueueMessage
             } else {
                 IconName::Send
@@ -7005,16 +7061,16 @@ impl ThreadView {
             IconButton::new("send-message", send_icon)
                 .style(ButtonStyle::Filled)
                 .map(|this| {
-                    if is_editor_empty && !is_generating {
+                    if is_editor_empty && !is_busy {
                         this.disabled(true).icon_color(Color::Muted)
                     } else {
                         this.icon_color(Color::Accent)
                     }
                 })
                 .tooltip(move |_window, cx| {
-                    if is_editor_empty && !is_generating {
+                    if is_editor_empty && !is_busy {
                         Tooltip::for_action("Type to Send", &Chat, cx)
-                    } else if is_generating {
+                    } else if is_busy {
                         let focus_handle = focus_handle.clone();
 
                         Tooltip::element(move |_window, cx| {

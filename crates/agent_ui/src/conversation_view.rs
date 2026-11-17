@@ -3,7 +3,7 @@ use acp_thread::{
     AuthRequired, ElicitationEntryId, ElicitationStatus, ElicitationStore, ForegroundActivity,
     LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
     PermissionPattern, PermissionRequest, PermissionRequestId, ProtocolErrorInfo, RetryStatus,
-    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
+    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};

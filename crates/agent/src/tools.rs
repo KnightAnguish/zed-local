@@ -1,6 +1,7 @@
 mod apply_code_action_tool;
 mod ask_user_tool;
 mod batch_tool;
+mod catalog_tool;
 mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
@@ -74,6 +75,7 @@ where
 pub use apply_code_action_tool::*;
 pub use ask_user_tool::*;
 pub use batch_tool::*;
+pub use catalog_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;

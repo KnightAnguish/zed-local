@@ -9096,6 +9096,199 @@ fn ai_page(cx: &App) -> SettingsPage {
         ]);
 
         items.extend([
+            SettingsPageItem::SectionHeader("Agent Harness"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Harness Mode",
+                description: "Use the legacy agent loop or the harness v2 loop. Values: legacy or v2.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.mode"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .mode
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .mode = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Allow Background Shell",
+                description: "Let the agent move long-running terminal commands into background jobs.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.background_shell"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .background_shell
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .background_shell = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Max Background Jobs",
+                description: "Maximum number of background shell jobs per thread.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.max_background_jobs"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .max_background_jobs
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .max_background_jobs = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Precompute Compaction",
+                description: "Summarize the conversation prefix between turns, before compaction is due.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.precompute"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .precompute
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .precompute = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Keep Recent Tokens",
+                description: "Tokens kept verbatim at the end of a compacted conversation.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.keep_tokens"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .keep_tokens
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .keep_tokens = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Prefer Native Compaction",
+                description: "Use the provider-native compaction endpoint when the model supports it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.prefer_native"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .prefer_native
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .prefer_native = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Enable Batch Tool",
+                description: "Expose the opt-in batch tool for running several tool calls in one step.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.harness.code_mode"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .harness
+                            .as_ref()?
+                            .code_mode
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .harness
+                            .get_or_insert_default()
+                            .code_mode = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]);
+
+        items.extend([
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Single File Review",
                 description: "When enabled, agent edits will also be displayed in single-file buffers for review.",

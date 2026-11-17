@@ -89,7 +89,7 @@ impl AgentTool for BatchTool {
             // Only run tools exposed to the model for this turn. Reading the
             // registry directly would bypass profile choices, restricted
             // workspace rules, provider compatibility, and feature flags.
-            let tools = thread.read_with(cx, |thread, cx| thread.enabled_tools(cx));
+            let tools = thread.read_with(cx, |thread, cx| thread.executable_tools(cx));
             let mut output = String::new();
 
             for (index, call) in input.calls.iter_mut().enumerate() {

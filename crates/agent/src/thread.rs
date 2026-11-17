@@ -1,5 +1,5 @@
 use crate::{
-    ApplyCodeActionTool, AskUserTool, BatchTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
+    ApplyCodeActionTool, AskUserTool, BatchTool, CatalogTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbPendingQuestion, DbThread,
     DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
@@ -2447,6 +2447,7 @@ impl Thread {
 
         if self.harness.settings().code_mode.enabled {
             self.add_tool(BatchTool::new(cx.weak_entity()));
+            self.add_tool(CatalogTool::new(cx.weak_entity()));
         }
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
@@ -3006,6 +3007,10 @@ impl Thread {
         self.strip_media_for_next_request = false;
 
         log::debug!("Total messages in thread: {}", self.messages.len());
+        // Start the summary before the turn so it can overlap the first model
+        // request. The checkpoint is accepted only if the retained history and
+        // compaction model still match when it finishes.
+        self.maybe_start_precompute(cx);
         self.run_turn(cx)
     }
 
@@ -4984,6 +4989,20 @@ impl Thread {
     }
 
     pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+        self.enabled_tools_inner(cx, true)
+    }
+
+    /// Tools the agent may execute, including ones hidden from the model while
+    /// Code Mode exposes only the catalog and batch entry points.
+    pub(crate) fn executable_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+        self.enabled_tools_inner(cx, false)
+    }
+
+    fn enabled_tools_inner(
+        &self,
+        cx: &App,
+        code_mode_filter: bool,
+    ) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -5017,9 +5036,23 @@ impl Thread {
                     tool_name.as_ref()
                 };
 
+                if code_mode_filter
+                    && code_mode
+                    && !matches!(
+                        tool_name.as_ref(),
+                        BatchTool::NAME | CatalogTool::NAME | AskUserTool::NAME
+                    )
+                {
+                    return None;
+                }
+
                 if tool.supports_provider(&model.provider_id())
                     && (profile.is_tool_enabled(profile_tool_name)
-                        || (code_mode && tool_name.as_ref() == BatchTool::NAME))
+                        || (code_mode
+                            && matches!(
+                                tool_name.as_ref(),
+                                BatchTool::NAME | CatalogTool::NAME
+                            )))
                 {
                     match (tool_name.as_ref(), use_sandboxed_terminal) {
                         (TerminalTool::NAME, false) | (SandboxedTerminalTool::NAME, true) => {
@@ -5074,6 +5107,15 @@ impl Thread {
             } else {
                 tools.insert(tool_name, tool.clone());
             }
+        }
+
+        if code_mode && code_mode_filter {
+            tools.retain(|name, _| {
+                matches!(
+                    name.as_ref(),
+                    BatchTool::NAME | CatalogTool::NAME | AskUserTool::NAME
+                )
+            });
         }
 
         tools
@@ -5490,9 +5532,9 @@ impl Thread {
     /// compaction does not have to wait for one.
     ///
     /// The request is built exactly like a regular compaction request, so the
-    /// provider can reuse its cached prompt prefix. It runs between turns, when
-    /// no other completion is streaming, and the result is dropped if the
-    /// summarized history or the compaction model changed in the meantime.
+    /// provider can reuse its cached prompt prefix. It may overlap an active
+    /// turn; the result is dropped if the summarized history or the compaction
+    /// model changed in the meantime.
     fn maybe_start_precompute(&mut self, cx: &mut Context<Self>) {
         let Some(end_ix) = self.precompute_target(cx) else {
             return;
@@ -11559,6 +11601,74 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("not available in this turn"), "{text}");
         assert!(!text.contains("should not run"), "{text}");
+    }
+
+    #[gpui::test]
+    async fn test_code_mode_hides_direct_tools_but_keeps_them_executable(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        enable_echo_tool(&thread, cx);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_tool(BatchTool::new(cx.weak_entity()));
+            thread.add_tool(CatalogTool::new(cx.weak_entity()));
+            let mut settings = thread.harness().settings().clone();
+            settings.code_mode.enabled = true;
+            thread.harness_mut().set_settings(settings);
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let model_tools = thread.enabled_tools(cx);
+            assert!(model_tools.contains_key(BatchTool::NAME));
+            assert!(model_tools.contains_key(CatalogTool::NAME));
+            assert!(!model_tools.contains_key("echo"));
+
+            let executable = thread.executable_tools(cx);
+            assert!(executable.contains_key("echo"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_catalog_describes_tools_hidden_by_code_mode(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+
+        enable_echo_tool(&thread, cx);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_tool(CatalogTool::new(cx.weak_entity()));
+            let mut settings = thread.harness().settings().clone();
+            settings.code_mode.enabled = true;
+            thread.harness_mut().set_settings(settings);
+        });
+
+        let tool = thread.read_with(cx, |thread, _| {
+            thread.tools.get(CatalogTool::NAME).cloned().unwrap()
+        });
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::ready(serde_json::json!({ "tools": ["echo"] })),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        let output = match result {
+            Ok(output) => output,
+            Err(_) => panic!("catalog should succeed"),
+        };
+        let text = output
+            .llm_output
+            .into_iter()
+            .filter_map(|content| match content {
+                LanguageModelToolResultContent::Text(text) => Some(text.to_string()),
+                LanguageModelToolResultContent::Image(_) => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("## echo"), "{text}");
+        assert!(text.contains("\"text\""), "{text}");
     }
 
     #[gpui::test]
