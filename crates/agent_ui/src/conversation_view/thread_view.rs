@@ -1072,6 +1072,13 @@ impl ThreadView {
                 this.list_state
                     .remeasure_items(0..this.list_state.item_count());
                 cx.notify();
+            } else if matches!(event, AcpThreadEvent::NewEntry)
+                && this.list_state.is_following_tail()
+            {
+                // Keep a reader who is at the tail pinned to new tool/thought
+                // entries; this avoids work appearing to be "hidden" until the
+                // next prompt.
+                this.list_state.scroll_to_end();
             }
         }));
 
