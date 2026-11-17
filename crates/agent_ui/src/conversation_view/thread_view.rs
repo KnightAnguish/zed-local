@@ -5930,6 +5930,16 @@ impl ThreadView {
         )
     }
 
+    fn truncate_wait_label(value: &str) -> String {
+        const MAX_CHARS: usize = 32;
+        let mut chars = value.chars();
+        let mut label = chars.by_ref().take(MAX_CHARS).collect::<String>();
+        if chars.next().is_some() {
+            label.push('…');
+        }
+        label
+    }
+
     fn waiting_status(&self, cx: &App) -> Option<SharedString> {
         let thread = self.thread.read(cx);
         if thread.status() == ThreadStatus::Idle && !thread.has_unsettled_submissions() {
@@ -5957,9 +5967,16 @@ impl ThreadView {
                         return Some("Waiting for your approval".into());
                     }
                     ToolCallStatus::Pending | ToolCallStatus::InProgress => {
-                        return Some(
-                            format!("Waiting for: {}", call.label.read(cx).source()).into(),
-                        );
+                        let label = if call.kind() == &acp_v2::ToolKind::Execute
+                            || call.name.as_deref() == Some("shell")
+                        {
+                            "Waiting for process to finish".to_string()
+                        } else if let Some(name) = call.name.as_ref().filter(|name| !name.is_empty()) {
+                            format!("Waiting for {}", Self::truncate_wait_label(name))
+                        } else {
+                            "Waiting for tool".to_string()
+                        };
+                        return Some(label.into());
                     }
                     _ => {}
                 },
