@@ -3848,7 +3848,6 @@ mod tests {
     /// headless hosts (e.g. the eval CLI) where PTY allocation fails with
     /// `ENOTTY`. The command runs as a plain subprocess whose piped output is
     /// pumped into the emulator.
-    #[cfg(not(target_os = "windows"))]
     async fn build_test_subprocess_terminal(
         cx: &mut TestAppContext,
         program: String,
@@ -3913,7 +3912,6 @@ mod tests {
     /// Regression test for the agent terminal failing with `Not a tty (os error
     /// 25)` in headless/eval sandboxes: a `no_pty` task terminal must run
     /// without a PTY, capture stdout, and report its exit status.
-    #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_no_pty_task_terminal_captures_output(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
