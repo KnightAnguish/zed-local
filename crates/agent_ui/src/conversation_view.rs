@@ -5607,6 +5607,85 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_waiting_timer_tracks_current_wait_not_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation.clone(), cx);
+        let view = active_thread(&conversation, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("running");
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("first")
+                        .title("read_file")
+                        .status(acp_v2::ToolCallStatus::InProgress),
+                    cx,
+                )
+                .expect("first tool call");
+        });
+        cx.run_until_parked();
+
+        let label = view
+            .update(cx, |view, cx| view.sync_waiting_timer(cx))
+            .expect("waiting label");
+        assert!(label.starts_with("Waiting for"));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.turn_fields.waiting_key.clone())
+                .as_deref(),
+            Some("tool:first")
+        );
+
+        // A long turn and a long current wait: the composer must show the wait,
+        // not the turn duration.
+        view.update(cx, |view, _| {
+            view.turn_fields.turn_started_at =
+                Some(std::time::Instant::now() - Duration::from_secs(3600));
+            view.turn_fields.waiting_started_at =
+                Some(std::time::Instant::now() - Duration::from_secs(90));
+        });
+        let label = view
+            .update(cx, |view, cx| view.sync_waiting_timer(cx))
+            .expect("waiting label");
+        assert!(label.contains(&duration_alt_display(Duration::from_secs(90))));
+        assert!(!label.contains(&duration_alt_display(Duration::from_secs(3600))));
+
+        // Moving to a different tool call starts a new waiting phase.
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("second")
+                        .title("read_file")
+                        .status(acp_v2::ToolCallStatus::InProgress),
+                    cx,
+                )
+                .expect("second tool call");
+        });
+        cx.run_until_parked();
+        let _ = view.update(cx, |view, cx| view.sync_waiting_timer(cx));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.turn_fields.waiting_key.clone())
+                .as_deref(),
+            Some("tool:second")
+        );
+        let elapsed = view.read_with(cx, |view, _| {
+            view.turn_fields
+                .waiting_started_at
+                .expect("waiting start")
+                .elapsed()
+        });
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[gpui::test]
     async fn test_unconfirmed_stop_and_send_waits_for_confirmed_idle(cx: &mut TestAppContext) {
         init_test(cx);
         let connection = StubAgentConnection::new().with_receipt_submissions(true);

@@ -858,12 +858,19 @@ impl ThreadView {
 #[derive(Default)]
 pub struct TurnFields {
     pub _turn_timer_task: Option<Task<()>>,
+    pub _waiting_timer_task: Option<Task<()>>,
     pub last_turn_duration: Option<Duration>,
     pub last_turn_tokens: Option<u64>,
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
     pub reported_activity_generation: Option<u64>,
+    /// When the current waiting phase began. Unlike `turn_started_at`, this
+    /// resets whenever the agent starts waiting on a different tool, process,
+    /// question, or approval, so the composer timer measures the current wait.
+    pub waiting_started_at: Option<Instant>,
+    /// Stable identity of the current waiting phase.
+    pub waiting_key: Option<String>,
 }
 
 /// How a tool call is rendered relative to its surroundings.
@@ -1981,6 +1988,9 @@ impl ThreadView {
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
+        self.turn_fields.waiting_started_at = None;
+        self.turn_fields.waiting_key = None;
+        self.turn_fields._waiting_timer_task = None;
     }
 
     pub(crate) fn sync_reported_activity(&mut self, cx: &mut Context<Self>) {
@@ -5947,16 +5957,19 @@ impl ThreadView {
         label
     }
 
-    fn waiting_status(&self, cx: &App) -> Option<SharedString> {
+    fn waiting_status(&self, cx: &App) -> Option<(SharedString, String)> {
         let thread = self.thread.read(cx);
         if thread.status() == ThreadStatus::Idle && !thread.has_unsettled_submissions() {
             return None;
         }
-        if thread.pending_permission_requests().next().is_some() {
-            return Some("Waiting for your approval".into());
+        if let Some(request) = thread.pending_permission_requests().next() {
+            return Some((
+                "Waiting for your approval".into(),
+                format!("permission:{:?}", request.id),
+            ));
         }
         if thread.background_work().is_some_and(|work| !work.is_empty()) {
-            return Some("Waiting for background work".into());
+            return Some(("Waiting for background work".into(), "background".into()));
         }
         for entry in thread.entries().iter().rev() {
             match entry {
@@ -5966,12 +5979,18 @@ impl ThreadView {
                         && elicitation.is_blocking()
                         && matches!(elicitation.status, ElicitationStatus::Pending { .. })
                     {
-                        return Some("Waiting for your answer".into());
+                        return Some((
+                            "Waiting for your answer".into(),
+                            format!("elicitation:{}", id.0),
+                        ));
                     }
                 }
                 AgentThreadEntry::ToolCall(call) => match call.status() {
                     ToolCallStatus::WaitingForConfirmation => {
-                        return Some("Waiting for your approval".into());
+                        return Some((
+                            "Waiting for your approval".into(),
+                            format!("tool-approval:{}", call.id.0),
+                        ));
                     }
                     ToolCallStatus::Pending | ToolCallStatus::InProgress => {
                         let label = if call.kind() == &acp_v2::ToolKind::Execute
@@ -5983,7 +6002,7 @@ impl ThreadView {
                         } else {
                             "Waiting for tool".to_string()
                         };
-                        return Some(label.into());
+                        return Some((label.into(), format!("tool:{}", call.id.0)));
                     }
                     _ => {}
                 },
@@ -5992,7 +6011,53 @@ impl ThreadView {
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
-        Some("Waiting for agent".into())
+        let agent_key = if thread.uses_reported_activity() {
+            format!("agent:{}", thread.activity_generation())
+        } else {
+            format!("agent:{}", self.turn_fields.turn_generation)
+        };
+        Some(("Waiting for agent".into(), agent_key))
+    }
+
+    /// Keeps the composer's waiting timer scoped to the current wait instead of
+    /// the whole turn. The timer resets when the agent moves to a different
+    /// tool call, process, question, or approval.
+    pub(crate) fn sync_waiting_timer(&mut self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let next = self.waiting_status(cx);
+        match next {
+            Some((label, key)) => {
+                if self.turn_fields.waiting_key.as_deref() != Some(key.as_str()) {
+                    self.turn_fields.waiting_key = Some(key);
+                    self.turn_fields.waiting_started_at = Some(Instant::now());
+                    self.ensure_waiting_timer(cx);
+                }
+                let started = self
+                    .turn_fields
+                    .waiting_started_at
+                    .unwrap_or_else(Instant::now);
+                Some(format!("{label} · {}", duration_alt_display(started.elapsed())).into())
+            }
+            None => {
+                self.turn_fields.waiting_key = None;
+                self.turn_fields.waiting_started_at = None;
+                self.turn_fields._waiting_timer_task = None;
+                None
+            }
+        }
+    }
+
+    fn ensure_waiting_timer(&mut self, cx: &mut Context<Self>) {
+        if self.turn_fields._waiting_timer_task.is_some() {
+            return;
+        }
+        self.turn_fields._waiting_timer_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     pub(crate) fn render_message_editor(
@@ -6025,13 +6090,7 @@ impl ThreadView {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.has_visible_conversation(cx);
         let fills_container = !has_messages || editor_expanded;
-        let waiting_status = self.waiting_status(cx).map(|status| {
-            if let Some(started) = self.turn_fields.turn_started_at {
-                format!("{status} · {}", duration_alt_display(started.elapsed())).into()
-            } else {
-                status
-            }
-        });
+        let waiting_status = self.sync_waiting_timer(cx);
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
             div()
