@@ -4923,6 +4923,34 @@ impl Thread {
         cx.notify()
     }
 
+    /// Lists background shell jobs that are still running so a new turn does
+    /// not assume an interrupted turn stopped its OS processes.
+    fn running_background_jobs_context(&self) -> Option<String> {
+        let jobs = self
+            .harness
+            .shell_jobs()
+            .list()
+            .filter(|job| job.status.is_running())
+            .collect::<Vec<_>>();
+        if jobs.is_empty() {
+            return None;
+        }
+
+        let mut note = String::from(
+            "<background-jobs>\n\
+             These background shell jobs are still running. Do not assume they stopped. \
+             Use the terminal tool with `shell_id` to inspect their output or kill them before starting a conflicting command.\n",
+        );
+        for job in jobs {
+            note.push_str(&format!(
+                "- shell_id: {}\n  command: {}\n  status: {:?}\n",
+                job.id, job.command, job.status,
+            ));
+        }
+        note.push_str("</background-jobs>");
+        Some(note)
+    }
+
     pub(crate) fn build_completion_request(
         &self,
         completion_intent: CompletionIntent,
@@ -4955,6 +4983,14 @@ impl Thread {
 
         log::debug!("Request includes {} tools", available_tools.len());
         let mut messages = self.build_request_messages(available_tools, cx);
+        if let Some(note) = self.running_background_jobs_context() {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![note.into()],
+                cache: false,
+                reasoning_details: None,
+            });
+        }
         if self.strip_media_for_next_request {
             messages = messages
                 .into_iter()
@@ -9345,6 +9381,55 @@ mod tests {
             vec!["before".to_string(), "after".to_string()],
             "native context from another provider must not drop earlier history"
         );
+    }
+
+    #[gpui::test]
+    async fn test_completion_request_lists_running_background_jobs(cx: &mut TestAppContext) {
+        let (thread, _events, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let job_id = crate::harness::ShellJobId::new("shell-1");
+
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model, cx);
+            thread
+                .harness_mut()
+                .shell_jobs_mut()
+                .insert(crate::harness::ShellJob::new(
+                    job_id.clone(),
+                    "cargo run --bin server",
+                    None,
+                    PathBuf::from("/tmp/shell-1.out"),
+                    None,
+                ));
+        });
+
+        let request = thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .expect("completion request");
+        let note = request.messages.last().expect("background note").string_contents();
+        assert!(note.contains("<background-jobs>"));
+        assert!(note.contains("shell-1"));
+        assert!(note.contains("cargo run --bin server"));
+
+        thread.update(cx, |thread, _| {
+            thread.harness_mut().shell_jobs_mut().set_status(
+                &job_id,
+                crate::harness::ShellJobStatus::Completed { exit: Some(0) },
+            );
+        });
+        let request = thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .expect("completion request");
+        assert!(!request
+            .messages
+            .last()
+            .expect("last message")
+            .string_contents()
+            .contains("<background-jobs>"));
     }
 
     #[test]
