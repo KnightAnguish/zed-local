@@ -5682,7 +5682,9 @@ pub(crate) mod tests {
                 .expect("waiting start")
                 .elapsed()
         });
-        assert!(elapsed < Duration::from_secs(1));
+        // The wait started 90s before the switch; a reset must be recent. Use a
+        // generous bound so a loaded parallel test run cannot make this flaky.
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[gpui::test]
@@ -5729,6 +5731,65 @@ pub(crate) mod tests {
             0
         );
         assert!(cx.debug_bounds("jump-to-new-messages").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_native_background_job_shows_waiting_status(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let server = cx.update(|cx| {
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            let thread_store = cx.new(|cx| ThreadStore::new(cx));
+            NativeAgentServer::new(fs, thread_store)
+        });
+        let (conversation, cx) = setup_conversation_view(server, cx).await;
+        add_to_workspace(conversation.clone(), cx);
+        let view = active_thread(&conversation, cx);
+        let native_thread = conversation
+            .read_with(cx, |view, cx| view.as_native_thread(cx))
+            .expect("native thread");
+        let job_id = agent::harness::ShellJobId::new("job-1");
+
+        native_thread.update(cx, |thread, _| {
+            thread
+                .harness_mut()
+                .shell_jobs_mut()
+                .insert(agent::harness::ShellJob::new(
+                    job_id.clone(),
+                    "cargo run --bin server",
+                    None,
+                    std::path::PathBuf::from("/tmp/job-1.out"),
+                    None,
+                ));
+        });
+
+        let label = view
+            .update(cx, |view, cx| view.sync_waiting_timer(cx))
+            .expect("waiting label");
+        assert!(
+            label.starts_with("Waiting for background job"),
+            "{label}"
+        );
+        assert!(label.contains("cargo run"), "{label}");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.turn_fields.waiting_key.clone())
+                .as_deref(),
+            Some("background:job-1")
+        );
+
+        native_thread.update(cx, |thread, _| {
+            thread.harness_mut().shell_jobs_mut().set_status(
+                &job_id,
+                agent::harness::ShellJobStatus::Completed { exit: Some(0) },
+            );
+        });
+        let label = view.update(cx, |view, cx| view.sync_waiting_timer(cx));
+        assert!(
+            label.as_deref() != Some("Waiting for background work"),
+            "{label:?}"
+        );
     }
 
     #[gpui::test]

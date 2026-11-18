@@ -5965,6 +5965,31 @@ impl ThreadView {
     }
 
     fn waiting_status(&self, cx: &App) -> Option<(SharedString, String)> {
+        if let Some(native_thread) = self.as_native_thread(cx) {
+            let jobs = native_thread.read_with(cx, |thread, _| {
+                thread
+                    .harness()
+                    .shell_jobs()
+                    .list()
+                    .filter(|job| job.status.is_running())
+                    .map(|job| (job.id.to_string(), job.command.clone()))
+                    .collect::<Vec<_>>()
+            });
+            if !jobs.is_empty() {
+                let mut job_ids = jobs.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                job_ids.sort();
+                let label = if let [(_, command)] = jobs.as_slice() {
+                    format!(
+                        "Waiting for background job: {}",
+                        Self::truncate_wait_label(command)
+                    )
+                } else {
+                    format!("Waiting for {} background jobs", jobs.len())
+                };
+                return Some((label.into(), format!("background:{}", job_ids.join(","))));
+            }
+        }
+
         let thread = self.thread.read(cx);
         if thread.status() == ThreadStatus::Idle && !thread.has_unsettled_submissions() {
             return None;
